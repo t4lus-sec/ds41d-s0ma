@@ -30,7 +30,7 @@
         "tests/vision_probe.cpp"
       ],
       "files": 74,
-      "tree_sha256": "c31582cc706ddcd7984296a329d8c8d2b5b7b4f154f8f9c4273bb598df718ca7"
+      "tree_sha256": "6a114c81625e58e8680cb60d59dee29f1e3b37a133492ef184b1d3e037442ef4"
     },
     {
       "path": "components/moe",
@@ -56,7 +56,7 @@
         "CMakeLists.txt"
       ],
       "files": 14,
-      "tree_sha256": "4a93603af1ecfb5c2467b7487b74a06130ce7560f518b7fd48b66f579317075a"
+      "tree_sha256": "55296f6df6c53e1e37c969a2f0bf9284c1ca910c9000e91537df1ee9c31470b6"
     },
     {
       "path": "components/attn",

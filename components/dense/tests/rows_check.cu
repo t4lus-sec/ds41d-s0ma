@@ -1,5 +1,7 @@
 // s0ma leg 26: the batched-row paths against the per-row ones they replace, bit for bit, on random data at the
-// verify step's shapes (DS41_ROWS_BATCHED=1 is exact only if every row's bits are the same).
+// verify step's shapes. The hyper-connection mixes with their GEMV kept one call a row must match exactly (that path
+// is always used); whether one batched cuBLAS call matches is reported for information: the engine tests every shape
+// of the checkpoint at load and batches only those that match (cuBLAS picks its kernel by shape and batch count).
 //
 //   nvcc -O2 -std=c++17 -arch=sm_120a -Icomponents/dense/include components/dense/tests/rows_check.cu \
 //        components/dense/src/ops.cu -lcublas -o /tmp/rows_check && /tmp/rows_check
@@ -11,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 #define CK(x) do { int e_ = int(x); if (e_) { std::printf("error %d at %s:%d\n", e_, __FILE__, __LINE__); std::exit(2); } } while (0)
@@ -52,14 +55,14 @@ int main() {
       CK(cudaDeviceSynchronize());
       auto a = download((char *)y1, rows * sh.N * el), b = download((char *)y2, rows * sh.N * el);
       bool ok = same(a.data(), b.data(), a.size());
-      fail += !ok;
-      std::printf("%s cuBLAS rows: %s, %d rows: %s\n", ok ? "ok  " : "FAIL", sh.what, rows,
-                  ok ? "bit-identical to one call a row" : "DIFFERS from one call a row");
+      std::printf("info cuBLAS batched: %s, %d rows: %s\n", sh.what, rows,
+                  ok ? "bit-identical to one call a row (the engine will batch it)" : "differs (the engine keeps one call a row)");
       cudaFree(w); cudaFree(x); cudaFree(y1); cudaFree(y2);
     }
   }
   // the hyper-connection mixes, whole: promote + stats, the mixes, Sinkhorn
   const int H = 5120, HC = 4;
+  for (int batched = 0; batched <= 1; ++batched)
   for (int rows = 2; rows <= 6; ++rows) {
     std::vector<__nv_bfloat16> h(size_t(rows) * HC * H);
     for (auto &v : h) v = __float2bfloat16(nd(rng));
@@ -76,20 +79,27 @@ int main() {
                              out[0][2] + r * 16, out[0][3] + size_t(r) * HC * H, out[0][4] + r * 24, out[0][5] + r,
                              1, H, 1e-20f, 1e-6f, 0));
     CK(ds41_dense_hc_mixes_rows(blas, dh, dfn, ds, db, out[1][0], out[1][1], out[1][2], out[1][3], out[1][4], out[1][5],
-                                rows, H, 1e-20f, 1e-6f, 0));
+                                rows, H, 1e-20f, 1e-6f, batched, 0));
     CK(cudaDeviceSynchronize());
     bool ok = true;
     const char *names[6] = {"pre", "post", "comb", "promoted", "mixes", "rstd"};
+    std::string bad;
     for (int i = 0; i < 6; ++i) {
       auto a = download(out[0][i], sizes[i]), b = download(out[1][i], sizes[i]);
-      if (!same(a.data(), b.data(), a.size() * 4)) { ok = false; std::printf("     %s differs\n", names[i]); }
+      if (!same(a.data(), b.data(), a.size() * 4)) { ok = false; bad += std::string(" ") + names[i]; }
     }
-    fail += !ok;
-    std::printf("%s hyper-connection mixes, %d rows: %s\n", ok ? "ok  " : "FAIL", rows,
-                ok ? "every output bit-identical to one call a row" : "DIFFERS");
+    if (batched) {
+      std::printf("info hyper-connection mixes, the GEMV batched, %d rows: %s\n", rows,
+                  ok ? "bit-identical (the engine will batch it)" : ("differs in" + bad + " (the engine keeps the GEMV one call a row)").c_str());
+    } else {
+      fail += !ok;
+      std::printf("%s hyper-connection mixes, the GEMV one call a row, promotion and Sinkhorn batched, %d rows: %s\n",
+                  ok ? "ok  " : "FAIL", rows, ok ? "every output bit-identical" : ("differs in" + bad).c_str());
+    }
     for (int v = 0; v < 2; ++v) for (int i = 0; i < 6; ++i) cudaFree(out[v][i]);
     cudaFree(dh); cudaFree(dfn); cudaFree(ds); cudaFree(db);
   }
-  std::printf(fail ? "%d FAILED: DS41_ROWS_BATCHED=1 would change tokens; leave it off\n" : "all passed: DS41_ROWS_BATCHED=1 keeps every row's bits\n", fail);
+  std::printf(fail ? "%d FAILED: DS41_ROWS_BATCHED=1 would change tokens; leave it off\n"
+                    : "all passed: DS41_ROWS_BATCHED=1 keeps every row's bits (batching only what matched)\n", fail);
   return fail ? 1 : 0;
 }

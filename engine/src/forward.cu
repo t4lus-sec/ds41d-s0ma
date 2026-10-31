@@ -34,6 +34,8 @@
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <tuple>
+#include <random>
 namespace ds41e {
 namespace {
 // Zero-copy byte copy on the SMs. The GPU has one copy engine per direction, so small per-layer
@@ -277,6 +279,50 @@ class Native final : public Forward, public hotpath::GateEvidence {
   // s0ma leg 26: a verify step's per-row cuBLAS rows, hyper-connection mixes and route weights in one launch each,
   // every row computed as on its own (DS41_ROWS_BATCHED=1; tokens checked identical by the lab's benchmark).
   const bool rows_batched = [] { const char *v = std::getenv("DS41_ROWS_BATCHED"); return v && std::string(v) == "1"; }();
+  // (N, K, F32?, rows) for which one batched call gave the same bits as one M=1 call a row, tested at load on every
+  // F32/BF16 matrix shape of the checkpoint (cuBLAS picks its kernel by shape and batch count, not by the data).
+  std::set<std::tuple<int, int, int, int>> rows_exact;
+  bool rows_ok(int n, int k, bool f32, int rows) const { return rows_exact.count({n, k, int(f32), rows}) > 0; }
+  void check_rows_batched() {
+    std::map<std::tuple<int, int, int>, const void *> shapes;
+    for (auto &[name, wt] : weights)
+      if ((wt.dtype == "F32" || wt.dtype == "BF16") && wt.shape.size() == 2 && !wt.data.mapped_host && wt.data.p &&
+          wt.shape[0] * wt.shape[1] <= (64ull << 20))
+        shapes.emplace(std::make_tuple(int(wt.shape[0]), int(wt.shape[1]), int(wt.dtype == "F32")), wt.data.p);
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    int tested = 0;
+    std::vector<std::string> inexact;
+    for (auto &[shape, ptr] : shapes) {
+      auto [n, k, f32] = shape;
+      const size_t el = f32 ? 4 : 2;
+      Device x(size_t(8) * k * el), y1(size_t(8) * n * el), y2(size_t(8) * n * el);
+      std::vector<char> host(size_t(8) * k * el);
+      for (size_t i = 0; i < size_t(8) * k; ++i) {
+        float v = nd(rng);
+        if (f32) std::memcpy(host.data() + i * 4, &v, 4);
+        else { Bf16 b = __float2bfloat16(v); std::memcpy(host.data() + i * 2, &b, 2); }
+      }
+      CK(cudaMemcpy(x.p, host.data(), host.size(), cudaMemcpyHostToDevice));
+      for (int rows = 2; rows <= 8; ++rows) {
+        for (int r = 0; r < rows; ++r)
+          CK(ds41_dense_cublas(blas, x.as<char>(r * k * el), ptr, y1.as<char>(r * n * el), 1, n, k, f32, 1, stream));
+        CK(ds41_dense_cublas_rows(blas, x.p, ptr, y2.p, rows, n, k, f32, stream));
+        CK(cudaStreamSynchronize(stream));
+        std::vector<char> a(size_t(rows) * n * el), b(a.size());
+        CK(cudaMemcpy(a.data(), y1.p, a.size(), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(b.data(), y2.p, b.size(), cudaMemcpyDeviceToHost));
+        ++tested;
+        if (std::memcmp(a.data(), b.data(), a.size()) == 0) rows_exact.insert({n, k, f32, rows});
+        else inexact.push_back(std::to_string(n) + "x" + std::to_string(k) + (f32 ? " F32" : " BF16") + " rows " +
+                               std::to_string(rows));
+      }
+    }
+    std::cerr << "rows batched (DS41_ROWS_BATCHED=1): " << rows_exact.size() << " of " << tested
+              << " (shape, rows) pairs bit-identical in one call; one call a row for the rest";
+    for (size_t i = 0; i < inexact.size() && i < 12; ++i) std::cerr << (i ? ", " : ": ") << inexact[i];
+    std::cerr << "\n";
+  }
   std::unique_ptr<ds41::HostBuffer> lookahead_host;
   std::unique_ptr<Phase> lookahead_sync;
   int lookahead_layer = -1, lookahead_k = 6;
@@ -503,6 +549,7 @@ public:
       consumer_readiness=std::make_unique<hotpath::ConsumerReadiness>();
     }
     reset();
+    if (rows_batched) check_rows_batched();
     std::cerr << "ds41d native M1 loaded; UNQUALIFIED; expert slots="
               << c.expert_slots << (exl3 ? (exl3_bits_loaded == 2 ? " (EXL3 K2 target experts, native MTP store)"
                                                    : " (EXL3 K3 target experts, native MTP store)") : "") << "\n";

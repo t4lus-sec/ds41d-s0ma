@@ -138,12 +138,15 @@ extern "C" int ds41_dense_cublas_rows(void* raw,const void*x,const void*w,void*y
  status=cublasGemmStridedBatchedEx(h,CUBLAS_OP_T,CUBLAS_OP_N,N,1,K,&alpha,w,dt,K,0,x,dt,K,(long long)K,&beta,y,dt,N,(long long)N,rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
  return status==CUBLAS_STATUS_SUCCESS?0:10000+status;
 }
-// ds41_dense_hc_mixes for M rows with every row's math as at M=1: one block a row in the M=1 geometry, the mixes as
-// M=1 problems batched, the Sinkhorn one block a row (it already is).
-extern "C" int ds41_dense_hc_mixes_rows(void* handle,const void*h,const float*fn,const float*s,const float*b,float*pre,float*post,float*comb,float*x,float*mixes,float*rstd,int M,int K,float neps,float heps,cudaStream_t st){
+// ds41_dense_hc_mixes for M rows with every row's math as at M=1: one block a row in the M=1 geometry for the
+// promotion and the Sinkhorn (exact by construction); the mixes GEMV as one M=1 call a row, or batched when
+// batched_gemv says the batched call was found bit-identical for this shape and row count (the engine checks at load).
+extern "C" int ds41_dense_hc_mixes_rows(void* handle,const void*h,const float*fn,const float*s,const float*b,float*pre,float*post,float*comb,float*x,float*mixes,float*rstd,int M,int K,float neps,float heps,int batched_gemv,cudaStream_t st){
  if(!handle||!h||!fn||!s||!b||!pre||!post||!comb||!x||!mixes||!rstd||M<1||M>8||K<32||K%32)return cudaErrorInvalidValue;
  int width,threads=geometry(1,K*4,width);promote_stats<<<M,threads,0,st>>>((const bf16*)h,x,rstd,M,K*4,neps,width);int rc=cudaGetLastError();if(rc)return rc;
- rc=ds41_dense_cublas_rows(handle,x,fn,mixes,M,24,K*4,1,st);if(rc)return rc;
+ if(batched_gemv)rc=ds41_dense_cublas_rows(handle,x,fn,mixes,M,24,K*4,1,st);
+ else for(int r=0;r<M&&!rc;++r)rc=ds41_dense_cublas(handle,x+(size_t)r*K*4,fn,mixes+r*24,1,24,K*4,1,1,st);
+ if(rc)return rc;
  sinkhorn<<<M,32,0,st>>>(mixes,s,b,pre,post,comb,M,heps,rstd);return cudaGetLastError();
 }
 extern "C" int ds41_dense_norm_quant(const void*x,const float*pre,const void*w,void*out,void*a,void*s,int M,int K,float eps,cudaStream_t st){if(!x||!w||!a||!s||M<1||M>8||K<128||K%32||K>20480)return cudaErrorInvalidValue;int width,threads=geometry(M,K,width);

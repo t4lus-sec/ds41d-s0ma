@@ -33,7 +33,7 @@ void blinear(const std::string &prefix, const void *in, void *out,
     // Keep the accepted M1 cuBLAS geometry. Batch-dependent reductions must
     // pass class N gates before a different geometry can replace these calls.
     const size_t element = weight.dtype == "F32" ? 4 : 2;
-    if (rows_batched && m > 1) {
+    if (rows_batched && m > 1 && rows_ok(n, k, weight.dtype == "F32", m)) {
       CK(ds41_dense_cublas_rows(blas, in, weight.data.p, out, m, n, k, weight.dtype == "F32", stream));
       return;
     }
@@ -51,7 +51,7 @@ void bhc(const std::string &p, const char *kind, Device &target_pre, int m) {
     CK(ds41_dense_hc_mixes_rows(blas, h.p, w(p + ".hc_" + kind + "_fn").data.as<float>(),
         w(p + ".hc_" + kind + "_scale").data.as<float>(), w(p + ".hc_" + kind + "_base").data.as<float>(),
         target_pre.as<float>(), post.as<float>(), comb.as<float>(), f32.as<float>(), mixes.as<float>(),
-        rstd.as<float>(), m, H, 1e-20f, 1e-6f, stream));
+        rstd.as<float>(), m, H, 1e-20f, 1e-6f, int(rows_ok(24, 4 * H, true, m)), stream));
     return;
   }
   for (int r = 0; r < m; ++r)

@@ -30,7 +30,7 @@
         "tests/vision_probe.cpp"
       ],
       "files": 74,
-      "tree_sha256": "5bdb4c6c6aaa731881ae81393537ee82c29b33c2a80744eba77165009258012b"
+      "tree_sha256": "58146ad9e494054dee8fb430c1eede0056d139c697ca478310beeffcb3226019"
     },
     {
       "path": "components/moe",
@@ -107,8 +107,8 @@
       "release_build_files": [
         "CMakeLists.txt"
       ],
-      "files": 5,
-      "tree_sha256": "9c9d9781e02f60c4a50e214c5e0e989012608b5bb619f6a99076f259a6036ec8"
+      "files": 6,
+      "tree_sha256": "f43a1bf3e18fa9ffb0910b67c7f0c42019caed20e612ddd88c4341f14cd702ac"
     }
   ],
   "dependencies": {
@@ -133,5 +133,5 @@
     "driver": "615.71.09",
     "gpu": "RTX PRO 6000 Blackwell Workstation Edition (sm_120a)"
   },
-  "note": "Each component tree is extracted unchanged from its origin commit in the project's private development repositories, except the files in release_build_files: CMake/build scripts written or edited so the tree builds standalone (install rules, component paths, no machine paths), and the engine files in release_source_changes: image input (docs/engine.md#images) and the EXL3 3-bit expert path (docs/exl3.md), added in this repo. components/exl3 carries its origin's kernel sources unchanged; that repository's tests, benchmarks and fixtures are not included (results in docs/exl3.md). tree_sha256 covers the tree as shipped; origin_tree_sha256 the tree as extracted."
+  "note": "Each component tree is extracted unchanged from its origin commit in the project's private development repositories, except the files in release_build_files: CMake/build scripts written or edited so the tree builds standalone (install rules, component paths, no machine paths), and the engine files in release_source_changes: image input (docs/engine.md#images) and the EXL3 3-bit expert path (docs/exl3.md), added in this repo. components/exl3 carries its origin's kernel sources unchanged; that repository's tests, benchmarks and fixtures are not included (results in docs/exl3.md). tree_sha256 covers the tree as shipped; origin_tree_sha256 the tree as extracted. s0ma's K2 change (2026-10-31; docs/exl3.md#k2) edits components/exl3 (the trellis decode at 2 or 3 bits, tests/exl3_check.cu) and engine/src/forward.cu (a K2 bank's records accepted); tree_sha256 covers the tree with it."
 }

@@ -26,6 +26,10 @@ EXPERT_SLOTS = 4452
 # dynamic slots) plus a separate store with the drafter's 384 native experts.
 K3_PLACEMENT = ROOT / 'profiles/k3-p80.placement'
 K3_EXPERT_SLOTS = 5745
+# "experts": "k2" (s0ma's leg 12, scripts/k2_bank.py): the same at two bits (8.9 MB per expert): the same expert VRAM
+# holds 8,602 target slots (k2-p80: the same pins, the dynamic budgets scaled again).
+K2_PLACEMENT = ROOT / 'profiles/k2-p80.placement'
+K2_EXPERT_SLOTS = 8602
 # The measured host RAM tier. More RAM lowers NVMe reads (96 -> 104 GiB: +3.3% decode); larger tiers are untested.
 MAX_HOST_GIB = 104
 # The placement seeds 5,480 experts into the RAM tier (95.99 GiB), so the tier needs at least 96 GiB.
@@ -107,9 +111,10 @@ def configuration():
         raise ValueError('gds must be "auto", true or false')
     if not (isinstance(cfg['max_context'], int) and 4096 <= cfg['max_context'] <= 1048576):
         raise ValueError('max_context must be 4096..1048576')
-    if cfg['experts'] not in ('native', 'k3'):
-        raise ValueError('experts must be "native" or "k3"')
+    if cfg['experts'] not in ('native', 'k3', 'k2'):
+        raise ValueError('experts must be "native", "k3" or "k2"')
     cfg['k3_bank'] = str((ROOT / Path(cfg['k3_bank']).expanduser()).resolve())
+    cfg['k2_bank'] = str((ROOT / Path(cfg.get('k2_bank', 'models/k2-bank')).expanduser()).resolve())
     return cfg
 
 
@@ -173,18 +178,22 @@ def cufile_config(cfg):
 def command(cfg, socket):
     dist, assets = Path(cfg['build']) / 'dist', Path(cfg['assets'])
     k3 = cfg['experts'] == 'k3'
+    k2 = cfg['experts'] == 'k2'
     cmd = [str(dist / 'ds41d'), 'serve', '--socket', str(socket),
            '--weights', cfg['weights'], '--receipt', str(assets / 'full-integrity.json'),
            '--auxiliary', str(assets / 'auxiliary.json'), '--engram', str(assets / 'engram.json'),
            '--rope', str(assets / 'rope.bin'), '--experts', str(assets / 'records.tsv'),
            '--engram-lib', str(dist / 'libds41_engram.so'), '--fused-head', str(dist / 'libds41_fuse_head.so'),
-           '--placement', str(K3_PLACEMENT if k3 else PLACEMENT),
-           '--expert-slots', str(K3_EXPERT_SLOTS if k3 else EXPERT_SLOTS),
+           '--placement', str(K3_PLACEMENT if k3 else K2_PLACEMENT if k2 else PLACEMENT),
+           '--expert-slots', str(K3_EXPERT_SLOTS if k3 else K2_EXPERT_SLOTS if k2 else EXPERT_SLOTS),
            '--host-gib', str(host_gib(cfg)), '--max-context', str(cfg['max_context'])] + ENGINE_FLAGS
     if k3:
         # the native manifest still supplies the drafter's experts; target layers come from the bank
         bank = Path(cfg['k3_bank'])
         cmd += ['--exl3-experts', str(bank / 'records-k3.tsv'), '--exl3-receipts', str(bank / 'receipts.json')]
+    if k2:
+        bank = Path(cfg['k2_bank'])
+        cmd += ['--exl3-experts', str(bank / 'records-k2.tsv'), '--exl3-receipts', str(bank / 'receipts.json')]
     return cmd
 
 
@@ -220,6 +229,10 @@ def preflight(cfg):
         raise RuntimeError('Create the API environment first: scripts/setup.sh')
     if cfg['experts'] == 'k3' and not (Path(cfg['k3_bank']) / 'records-k3.tsv').exists():
         raise RuntimeError(f'No 3-bit expert bank at {cfg["k3_bank"]}: run scripts/k3_bank.py fetch {cfg["k3_bank"]}')
+    if cfg['experts'] == 'k2' and not K2_PLACEMENT.exists():
+        raise RuntimeError(f'No {K2_PLACEMENT.name}: run scripts/k2_bank.py placement')
+    if cfg['experts'] == 'k2' and not (Path(cfg['k2_bank']) / 'records-k2.tsv').exists():
+        raise RuntimeError(f'No 2-bit expert bank at {cfg["k2_bank"]}: run scripts/k2_bank.py fetch {cfg["k2_bank"]}')
     aux = json.loads((Path(cfg['assets']) / 'auxiliary.json').read_text())
     if aux['weight_root'] != cfg['weights']:
         raise RuntimeError(f'The assets were prepared for {aux["weight_root"]}; run scripts/build.sh again')
@@ -268,6 +281,8 @@ def serve(cfg):
     evict_page_cache(cfg['weights'])
     if cfg['experts'] == 'k3':
         evict_page_cache(cfg['k3_bank'])
+    if cfg['experts'] == 'k2':
+        evict_page_cache(cfg['k2_bank'])
     argv = command(cfg, socket)
     print(shlex.join(argv), flush=True)
     engine = subprocess.Popen(argv, env=environment(cfg))

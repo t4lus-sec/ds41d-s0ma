@@ -4,7 +4,7 @@ namespace ds41 {
 namespace exl3_detail {
 // Fixed 8-row tile, 128 columns, four contiguous K partitions. M never changes
 // geometry, K order, rounding, or reduction order. No inter-CTA communication.
-template<int K>
+template<int K,int BITS>
 __global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const GemmJob* jobs,int projection,int N) {
     GemmJob job=jobs[blockIdx.y];
     if(job.tokens<1||job.tokens>8){asm volatile("trap;");return;}
@@ -27,8 +27,8 @@ __global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const 
     const uint32_t* A2=reinterpret_cast<const uint32_t*>(A);
     uint32_t pf[PF][WNT];
     auto load=[&](int i,int t){
-        size_t off=(size_t(start+i)*(N/16)+blockIdx.x*8+wn*2+t)*24+lane;
-        return lane<24?__ldcs(B+off):0u;
+        size_t off=(size_t(start+i)*(N/16)+blockIdx.x*8+wn*2+t)*(8*BITS)+lane;
+        return lane<8*BITS?__ldcs(B+off):0u;
     };
     #pragma unroll
     for(int d=0;d<PF;++d)if(d<len){
@@ -46,7 +46,7 @@ __global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const 
             int col=(start+i)*8+(lane&3);
             uint32_t a[4]={active?A2[r*(K/2)+col]:0u,0u,active?A2[r*(K/2)+col+4]:0u,0u};
             #pragma unroll
-            for(int t=0;t<WNT;++t){Pair f0,f1;dq3(bw[t],f0,f1,lane);mma(acc[t][0],a,f0);mma(acc[t][1],a,f1);}
+            for(int t=0;t<WNT;++t){Pair f0,f1;dqk<BITS>(bw[t],f0,f1,lane);mma(acc[t][0],a,f0);mma(acc[t][1],a,f1);}
         }
     }
     if(active){
@@ -74,6 +74,7 @@ __global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const 
 // Prefill: 64 rows x 128 cols. Eight warps own 16 cols each, reuse trellis
 // fragments across four m16 tiles. K128 staging avoids an M*K scratch buffer.
 // The 136-half stride distributes eight MMA rows over all shared banks.
+template<int BITS>
 __global__ __launch_bounds__(256,1) void prefill(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,int K,int max_tokens) {
     GemmJob job=jobs[blockIdx.y];
     if(job.tokens<1||job.tokens>max_tokens){asm volatile("trap;");return;}
@@ -92,9 +93,9 @@ __global__ __launch_bounds__(256,1) void prefill(const DeviceExpert* table,const
         __syncthreads();
         #pragma unroll
         for(int ki=0;ki<8;++ki){
-            const uint32_t* b=B+(size_t((k0/16)+ki)*(N/16)+blockIdx.x*8+warp)*24;
-            uint32_t word=lane<24?__ldcs(b+lane):0;
-            Pair f0,f1;dq3(word,f0,f1,lane);
+            const uint32_t* b=B+(size_t((k0/16)+ki)*(N/16)+blockIdx.x*8+warp)*(8*BITS);
+            uint32_t word=lane<8*BITS?__ldcs(b+lane):0;
+            Pair f0,f1;dqk<BITS>(word,f0,f1,lane);
             #pragma unroll
             for(int mi=0;mi<4;++mi){
                 uint32_t a[4]={};
@@ -127,30 +128,45 @@ __global__ __launch_bounds__(256,1) void prefill(const DeviceExpert* table,const
 }
 }
 namespace {
+// The bank's width, set once from its records before any launch (exl3_set_bits); K3 unless set.
+int g_bits=3;
 bool valid(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k){
     return count>=0&&count<=65535&&int(p)>=0&&int(p)<=2&&n>0&&n%128==0&&k>0&&k%128==0&&k<=5120&&(count==0||(t&&j));
 }
-template<int K> cudaError_t launch_decode(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,cudaStream_t s){
+template<int K,int BITS> cudaError_t launch_decode(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,cudaStream_t s){
     constexpr int bytes=(8*K*2<4096?4096:8*K*2)+4*8*128*4;
     // Function attributes are host metadata operations, with no stream work,
     // allocation or synchronization; legal during capture as well as replay.
-    auto err=cudaFuncSetAttribute(exl3_detail::decode<K>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
+    auto err=cudaFuncSetAttribute(exl3_detail::decode<K,BITS>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
     if(err!=cudaSuccess)return err;
-    exl3_detail::decode<K><<<dim3(n/128,count),512,bytes,s>>>(t,j,int(p),n);
+    exl3_detail::decode<K,BITS><<<dim3(n/128,count),512,bytes,s>>>(t,j,int(p),n);
     return cudaGetLastError();
 }
 }
 cudaError_t grouped_exl3(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,cudaStream_t s){
     if(!valid(t,j,count,p,n,k))return cudaErrorInvalidValue;if(!count)return cudaSuccess;
-    if(k==5120)return launch_decode<5120>(t,j,count,p,n,s);
-    if(k==2304)return launch_decode<2304>(t,j,count,p,n,s);
-    if(k==256)return launch_decode<256>(t,j,count,p,n,s);
-    if(k==128)return launch_decode<128>(t,j,count,p,n,s);
+    if(g_bits==2){
+        if(k==5120)return launch_decode<5120,2>(t,j,count,p,n,s);
+        if(k==2304)return launch_decode<2304,2>(t,j,count,p,n,s);
+        if(k==256)return launch_decode<256,2>(t,j,count,p,n,s);
+        if(k==128)return launch_decode<128,2>(t,j,count,p,n,s);
+        return cudaErrorNotSupported;
+    }
+    if(k==5120)return launch_decode<5120,3>(t,j,count,p,n,s);
+    if(k==2304)return launch_decode<2304,3>(t,j,count,p,n,s);
+    if(k==256)return launch_decode<256,3>(t,j,count,p,n,s);
+    if(k==128)return launch_decode<128,3>(t,j,count,p,n,s);
     return cudaErrorNotSupported;
 }
 cudaError_t grouped_exl3_prefill(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,int max_tokens,cudaStream_t s){
     if(!valid(t,j,count,p,n,k)||max_tokens<1||max_tokens>256)return cudaErrorInvalidValue;if(!count)return cudaSuccess;
-    exl3_detail::prefill<<<dim3(n/128,count,(max_tokens+63)/64),256,0,s>>>(t,j,int(p),n,k,max_tokens);
+    if(g_bits==2)exl3_detail::prefill<2><<<dim3(n/128,count,(max_tokens+63)/64),256,0,s>>>(t,j,int(p),n,k,max_tokens);
+    else exl3_detail::prefill<3><<<dim3(n/128,count,(max_tokens+63)/64),256,0,s>>>(t,j,int(p),n,k,max_tokens);
     return cudaGetLastError();
 }
+cudaError_t exl3_set_bits(int bits){
+    if(bits!=2&&bits!=3)return cudaErrorInvalidValue;
+    g_bits=bits;return cudaSuccess;
+}
+int exl3_bits(){return g_bits;}
 }

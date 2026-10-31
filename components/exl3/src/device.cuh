@@ -16,16 +16,20 @@ __device__ __forceinline__ uint32_t decode_pair(uint32_t x, uint32_t y) {
     half2 f=__halves2half2(__ushort_as_half(sx),__ushort_as_half(sy));
     half2 v=__hfma2(f,__half2half2(__ushort_as_half(0x1eee)),__half2half2(__ushort_as_half(0xc931))); return *reinterpret_cast<uint32_t*>(&v);
 }
-__device__ __forceinline__ void dq3(uint32_t word, Pair& f0, Pair& f1, int lane) {
-    const int b1=(lane*8+257)*3, b2=b1+21;
+// One lane's eight weights of a 16x16 tile (BITS bits each, 8*BITS words per tile, word `lane` held by lane
+// `lane`): exllamav3's dq8<BITS> with the tile's words exchanged by shuffles. BITS=3 is the K3 kernel's dq3 exactly.
+template<int BITS>
+__device__ __forceinline__ void dqk(uint32_t word, Pair& f0, Pair& f1, int lane) {
+    constexpr int W=8*BITS;
+    const int b1=(lane*8+257)*BITS, b2=b1+7*BITS;
     const int i0=(b1-16)/32, i2=(b2-1)/32, s=(i2+1)*32-b2;
-    uint32_t a=__shfl_sync(0xffffffff,word,i0%24), b=__shfl_sync(0xffffffff,word,i2%24);
+    uint32_t a=__shfl_sync(0xffffffff,word,i0%W), b=__shfl_sync(0xffffffff,word,i2%W);
     uint64_t joined=(uint64_t(a)<<32)|b;
-    uint32_t w7=joined>>s, w3=joined>>(s+12);
-    f0.v[0]=decode_pair((w3>>9)&65535,(w3>>6)&65535);
-    f0.v[1]=decode_pair((w3>>3)&65535,w3&65535);
-    f1.v[0]=decode_pair((w7>>9)&65535,(w7>>6)&65535);
-    f1.v[1]=decode_pair((w7>>3)&65535,w7&65535);
+    uint32_t w7=joined>>s, w3=joined>>(s+4*BITS);
+    f0.v[0]=decode_pair((w3>>(3*BITS))&65535,(w3>>(2*BITS))&65535);
+    f0.v[1]=decode_pair((w3>>BITS)&65535,w3&65535);
+    f1.v[0]=decode_pair((w7>>(3*BITS))&65535,(w7>>(2*BITS))&65535);
+    f1.v[1]=decode_pair((w7>>BITS)&65535,w7&65535);
 }
 __device__ __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], Pair b) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "

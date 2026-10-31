@@ -2,7 +2,7 @@
 #include <ds41/kernels.cuh>
 
 namespace ds41 {
-// K=3, mul1 EXL3. DeviceExpert weights are [K/16,N/16,48] uint16;
+// K=3 or K=2 (exl3_set_bits), mul1 EXL3. DeviceExpert weights are [K/16,N/16,16*bits] uint16 (48 for K3, 32 for K2);
 // each scale pointer holds suh[K] followed immediately by svh[N], both FP16.
 // GemmJob::x is BF16 [tokens,K], output BF16 [tokens,N]. x_scale is ignored.
 // Device-resident jobs/table are reread on every invocation and graph replay.
@@ -15,4 +15,8 @@ cudaError_t grouped_exl3(const DeviceExpert* table, const GemmJob* jobs, int cou
                          Projection projection, int n, int k, cudaStream_t stream);
 cudaError_t grouped_exl3_prefill(const DeviceExpert* table, const GemmJob* jobs, int count,
                          Projection projection, int n, int k, int max_tokens, cudaStream_t stream);
+// The bank's bits per weight, 3 (default) or 2: set once, before any launch or graph capture; every launch after
+// it decodes that width. Not thread-safe against concurrent launches (the engine sets it at load).
+cudaError_t exl3_set_bits(int bits);
+int exl3_bits();
 }

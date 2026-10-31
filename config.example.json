@@ -4,6 +4,7 @@
   "build": "build",
   "experts": "native",
   "k3_bank": "models/k3-bank",
+  "k2_bank": "models/k2-bank",
   "port": 18087,
   "unit": "ds41-pro6000",
   "model_id": "deepseek-v4.1-flash-1017",

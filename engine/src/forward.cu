@@ -217,6 +217,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
   // MXFP4 MTP experts, all pinned in VRAM. Without it, `experts` serves every logical ID.
   std::unique_ptr<ds41::OffloadStore> mtp_experts;
   bool exl3 = false;
+  int exl3_bits_loaded = 3;
   size_t expert_slot_bytes = 18808832;
   ds41::OffloadStore &spark_store() { return mtp_experts ? *mtp_experts : *experts; }
   // Target-layer expert GEMM. EXL3 jobs read BF16 rows; native jobs MXFP8 rows and scales.
@@ -368,8 +369,8 @@ public:
     if(c.async_retire) retirement_futures.reserve(240);
 #endif
     exl3 = !c.exl3_experts.empty();
-    if (c.expert_slots < 6 || c.expert_slots > (exl3 ? 8000 : 5000))
-      throw std::invalid_argument("expert slots must be 6..5000 (6..8000 with --exl3-experts)");
+    if (c.expert_slots < 6 || c.expert_slots > (exl3 ? 12000 : 5000))
+      throw std::invalid_argument("expert slots must be 6..5000 (6..12000 with --exl3-experts)");
     if (exl3) bxh.resize(36 * H * 2);
     eos_id =
         read_json(c.weights + "/config.json").at("eos_token_id").get<int>();
@@ -500,7 +501,8 @@ public:
     }
     reset();
     std::cerr << "ds41d native M1 loaded; UNQUALIFIED; expert slots="
-              << c.expert_slots << (exl3 ? " (EXL3 K3 target experts, native MTP store)" : "") << "\n";
+              << c.expert_slots << (exl3 ? (exl3_bits_loaded == 2 ? " (EXL3 K2 target experts, native MTP store)"
+                                                   : " (EXL3 K3 target experts, native MTP store)") : "") << "\n";
   }
   ~Native() override {
     if (stream)
@@ -870,7 +872,7 @@ public:
     if(stale) j["moe_stats_error"]=stats_error;
     j["cpu_only_experts"]=0; // CPU backend is not integrated in this adapter.
     j["expert_kernel"]=exl3?"grouped_exl3 (target), grouped_mxfp4_native_parallel (MTP)":"grouped_mxfp4_native_parallel";
-    j["target_expert_format"]=exl3?"EXL3 K3 mul1":"MXFP4";
+    j["target_expert_format"]=exl3?(exl3_bits_loaded==2?"EXL3 K2 mul1":"EXL3 K3 mul1"):"MXFP4";
     if(mtp_experts) j["mtp_expert_store"]="native MXFP4, 384 VRAM pins";
     j["xk_enabled"]=false; // Cache-only adapter never constructs DecodeBackend/XK.
     j["moe_demand_grouping"]="sorted unique logical-ID union per layer/verify";
@@ -1715,8 +1717,17 @@ private:
   // FP16. The layout and file coverage are checked exactly. Each receipt holds the bank's SHA-256 and the
   // size and mtime it had when that digest was last recomputed from disk (k3/verify_bank.sh); a bank
   // rewritten since then is refused. The digest itself is not recomputed at startup.
+  // The same layout at K2 (scripts/k2_bank.py): trellis [k/16,n/16,32], records of 8,892,416 bytes. The width
+  // comes from the records' size, is the same for every record, and selects the kernels (exl3_set_bits).
   void validate_k3_records(const std::vector<ds41::Record> &records, const std::string &receipts) {
-    constexpr uint64_t REC = 13316096, TB = 320 * 144 * 48 * 2, SB = 2 * (5120 + 2304);
+    if (records.empty()) throw std::runtime_error("EXL3 manifest is empty");
+    constexpr uint64_t SB = 2 * (5120 + 2304);
+    auto rec_of = [](uint64_t bits) { return (3 * (320 * 144 * 16 * bits * 2 + 2 * (5120 + 2304)) + 4095) / 4096 * 4096; };
+    const uint64_t bits = records.front().bytes == rec_of(2) ? 2 : 3;
+    const uint64_t REC = rec_of(bits), TB = 320 * 144 * 16 * bits * 2;
+    if (bits == 3 && REC != 13316096) throw std::logic_error("K3 record size");
+    if (ds41::exl3_set_bits(int(bits)) != cudaSuccess) throw std::runtime_error("EXL3 width not supported");
+    exl3_bits_loaded = int(bits);
     const ds41::TensorView gate{0, TB}, gate_scale{TB, SB}, up{TB + SB, TB},
         up_scale{2 * TB + SB, SB}, down{2 * TB + 2 * SB, TB}, down_scale{3 * TB + 2 * SB, SB};
     if (records.size() != 15360)

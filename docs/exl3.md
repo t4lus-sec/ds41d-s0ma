@@ -105,3 +105,14 @@ Cold-weight timings (384 distinct experts, more than the L2 cache), against the 
 - Measured on one machine (see [benchmarks](benchmarks.md)); the bank's speed gain depends on how much of the native profile's time goes to RAM and NVMe transfers.
 - The drafter still predicts the native model: draft acceptance is about 1 point lower. A drafter tuned to the K3 target could recover that.
 - The placement's pins come from the native profile; they were not re-tuned for the larger slot count.
+
+## K2: the same path at two bits (s0ma's leg 12, 2026-10-31)
+
+`"experts": "k2"` runs a bank of K2 routed experts (`scripts/k2_bank.py`: records of 8,892,416 bytes, trellis
+`[k/16, n/16, 32]`, 127 GiB) through the same kernels: `exl3_set_bits(2)` is set from the records' size at load,
+and the trellis decode is exllamav3's `dq8<bits>` at two bits (`dqk<2>`); `dqk<3>` compiles to the same PTX as the K3
+kernel did. `profiles/k2-p80.placement` (`k2_bank.py placement` writes it) keeps k3-p80's pins and seeds and scales the dynamic budgets to 8,602 slots.
+The bank has no pinned digests: `k2_bank.py fetch --source REPO@REV[:LAYERS]` takes the K2 tensors of public quants
+(mul1 codebook only) and records each layer's digest and source in its receipt. `components/exl3/tests/exl3_check.cu`
+checks K2 and K3 decode and prefill against a reference that decodes every weight on its own. Quality: K2 measured
+29-41% relative output error per expert here (K3 18%); measure before relying on it.

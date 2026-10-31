@@ -73,6 +73,8 @@ def run_seed(cfg, seed, workdir):
     run.evict_page_cache(cfg['weights'])
     if cfg['experts'] == 'k3':
         run.evict_page_cache(cfg['k3_bank'])
+    if cfg['experts'] == 'k2':
+        run.evict_page_cache(cfg['k2_bank'])
     log = (workdir / f'engine-{seed}.log').open('w')
     start = time.perf_counter()
     engine = subprocess.Popen(run.command(cfg, path), stdout=log, stderr=subprocess.STDOUT,

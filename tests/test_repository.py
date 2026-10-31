@@ -232,7 +232,16 @@ class ProfileTests(unittest.TestCase):
                           (8877056, 4423680), (13300736, 14848)])
         # the engine checks the same layout (validate_k3_records)
         forward = (ROOT / 'engine/src/forward.cu').read_text()
-        self.assertIn('REC = 13316096, TB = 320 * 144 * 48 * 2, SB = 2 * (5120 + 2304)', forward)
+        # (with s0ma's K2 change the sizes are computed from the width; K3 is still checked to be 13,316,096)
+        self.assertIn('auto rec_of = [](uint64_t bits) { return (3 * (320 * 144 * 16 * bits * 2 + 2 * (5120 + 2304)) '
+                      '+ 4095) / 4096 * 4096; };', forward)
+        self.assertIn('if (bits == 3 && REC != 13316096) throw std::logic_error("K3 record size");', forward)
+        import k2_bank
+        v = k2_bank.VIEWS
+        self.assertEqual(k2_bank.REC, 8892416)
+        self.assertEqual([v[k] for k in ('gate', 'gate_scale', 'up', 'up_scale', 'down', 'down_scale')],
+                         [(0, 2949120), (2949120, 14848), (2963968, 2949120), (5913088, 14848),
+                          (5927936, 2949120), (8877056, 14848)])
 
 
 class BenchmarkTests(unittest.TestCase):

@@ -56,12 +56,10 @@ __global__ void mixnorm(const Bf16 *h, float *mix, int k) {
   if (t < 24)
     mix[t] = __fmul_rn(mix[t], sh[0]);
 }
-__global__ void route(const float *s, const int *ids, float *w, int k) {
+__device__ __forceinline__ void route_one(const float *s, const int *ids, float *w, int k) {
   // T=1 torch Reduce.cuh: block width last_pow2(K), vt0=4, descending
   // shuffles. K=3 uses two lanes; K=6 uses four lanes. The addition order
   // matters even though all router scores are positive.
-  if (threadIdx.x)
-    return;
   float v[4] = {0, 0, 0, 0};
   for (int i = 0; i < k; ++i)
     v[i % 4] = __fadd_rn(v[i % 4], s[ids[i]]);
@@ -70,6 +68,18 @@ __global__ void route(const float *s, const int *ids, float *w, int k) {
   sum = __fadd_rn(sum, 1e-20f);
   for (int i = 0; i < k; ++i)
     w[i] = __fmul_rn(s[ids[i]] / sum, 1.5f);
+}
+__global__ void route(const float *s, const int *ids, float *w, int k) {
+  if (threadIdx.x)
+    return;
+  route_one(s, ids, w, k);
+}
+// s0ma leg 26: every row's route weights in one launch, block r doing for row r what route<<<1,32>>> does.
+__global__ void route_rows(const float *s, const int *ids, float *w, int k, int scores_stride) {
+  if (threadIdx.x)
+    return;
+  const int r = blockIdx.x;
+  route_one(s + size_t(r) * scores_stride, ids + r * k, w + r * k, k);
 }
 __global__ void rows(const uint8_t *values, const uint8_t *scales, Bf16 *out,
                      int n) {
@@ -114,6 +124,10 @@ void normalize_mixes(const void *h, float *m, int k, cudaStream_t s) {
 void route_weights(const float *s, const int *ids, float *w, int k,
                    cudaStream_t stream) {
   route<<<1, 32, 0, stream>>>(s, ids, w, k);
+}
+void route_weights_rows(const float *s, const int *ids, float *w, int k, int rows, int scores_stride,
+                        cudaStream_t stream) {
+  route_rows<<<rows, 32, 0, stream>>>(s, ids, w, k, scores_stride);
 }
 void engram_dequant(const uint8_t *v, const uint8_t *s, void *out, int n,
                     cudaStream_t stream) {

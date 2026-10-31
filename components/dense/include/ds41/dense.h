@@ -38,6 +38,9 @@ int ds41_dense_norm_quant(const void* x,const float* pre,const void* norm_weight
 // Full HC coefficient path, native FP32 projection and Sinkhorn20.
 // Scratch sizes: promoted_x[M,4*K] FP32, mixes[M,24] FP32, rstd[M] FP32.
 int ds41_dense_hc_mixes(void* blas_handle,const void* h_bf16,const float* fn,const float* scale,const float* base,float* pre,float* post,float* comb,float* promoted_x,float* mixes,float* rstd,int M,int K,float norm_eps,float hc_eps,cudaStream_t stream);
+// s0ma leg 26 (DS41_ROWS_BATCHED=1): M=1 problems for `rows` rows in one launch each, the same per-row math.
+int ds41_dense_cublas_rows(void* handle,const void* x,const void* w,void* y,int rows,int N,int K,int f32,cudaStream_t stream);
+int ds41_dense_hc_mixes_rows(void* blas_handle,const void* h_bf16,const float* fn,const float* scale,const float* base,float* pre,float* post,float* comb,float* promoted_x,float* mixes,float* rstd,int M,int K,float norm_eps,float hc_eps,cudaStream_t stream);
 int ds41_dense_shared_act(const void* gate_bf16,const void* up_bf16,void* z_bf16,void* a_fp8,void* as_ue8m0,int M,int K,cudaStream_t stream);
 int ds41_dense_promote(const void* x_bf16,float* x_f32,int elements,cudaStream_t stream);
 // wo_a grouped BF16 einsum, token-major x[M,G,K], y[M,G,N], w[G,N,K].

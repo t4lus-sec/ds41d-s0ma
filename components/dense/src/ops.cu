@@ -126,6 +126,26 @@ extern "C" int ds41_dense_cublas(void* raw,const void*x,const void*w,void*y,int 
  else status=cublasGemmStridedBatchedEx(h,CUBLAS_OP_T,CUBLAS_OP_N,N,M,K,&alpha,w,dt,K,(long long)N*K,x,dt,K,(long long)M*K,&beta,y,dt,N,(long long)M*N,groups,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
  return status==CUBLAS_STATUS_SUCCESS?0:10000+status;
 }
+// s0ma leg 26: `rows` M=1 problems in one launch, each computed as ds41_dense_cublas(M=1) computes it (the same
+// weight for every row: stride 0). Exact only if cuBLAS's batched kernel reduces each row as its M=1 call does: the
+// engine uses it under DS41_ROWS_BATCHED=1, and the rows check and the benchmark's token comparison decide.
+extern "C" int ds41_dense_cublas_rows(void* raw,const void*x,const void*w,void*y,int rows,int N,int K,int f32,cudaStream_t st){
+ if(rows==1)return ds41_dense_cublas(raw,x,w,y,1,N,K,f32,1,st);
+ if(!raw||!x||!w||!y||rows<1||N<1||K<1)return cudaErrorInvalidValue;
+ auto h=(cublasHandle_t)raw;cublasStatus_t status=cublasSetStream(h,st);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;
+ status=cublasSetMathMode(h,CUBLAS_DEFAULT_MATH);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;
+ float alpha=1.f,beta=0.f;auto dt=f32?CUDA_R_32F:CUDA_R_16BF;
+ status=cublasGemmStridedBatchedEx(h,CUBLAS_OP_T,CUBLAS_OP_N,N,1,K,&alpha,w,dt,K,0,x,dt,K,(long long)K,&beta,y,dt,N,(long long)N,rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+ return status==CUBLAS_STATUS_SUCCESS?0:10000+status;
+}
+// ds41_dense_hc_mixes for M rows with every row's math as at M=1: one block a row in the M=1 geometry, the mixes as
+// M=1 problems batched, the Sinkhorn one block a row (it already is).
+extern "C" int ds41_dense_hc_mixes_rows(void* handle,const void*h,const float*fn,const float*s,const float*b,float*pre,float*post,float*comb,float*x,float*mixes,float*rstd,int M,int K,float neps,float heps,cudaStream_t st){
+ if(!handle||!h||!fn||!s||!b||!pre||!post||!comb||!x||!mixes||!rstd||M<1||M>8||K<32||K%32)return cudaErrorInvalidValue;
+ int width,threads=geometry(1,K*4,width);promote_stats<<<M,threads,0,st>>>((const bf16*)h,x,rstd,M,K*4,neps,width);int rc=cudaGetLastError();if(rc)return rc;
+ rc=ds41_dense_cublas_rows(handle,x,fn,mixes,M,24,K*4,1,st);if(rc)return rc;
+ sinkhorn<<<M,32,0,st>>>(mixes,s,b,pre,post,comb,M,heps,rstd);return cudaGetLastError();
+}
 extern "C" int ds41_dense_norm_quant(const void*x,const float*pre,const void*w,void*out,void*a,void*s,int M,int K,float eps,cudaStream_t st){if(!x||!w||!a||!s||M<1||M>8||K<128||K%32||K>20480)return cudaErrorInvalidValue;int width,threads=geometry(M,K,width);
  normquant<<<M,threads,K*sizeof(bf16),st>>>((const bf16*)x,pre,(const bf16*)w,(bf16*)out,(uint8_t*)a,(uint8_t*)s,M,K,eps,width);return cudaGetLastError();}
 extern "C" int ds41_dense_hc_mixes(void* handle,const void*h,const float*fn,const float*s,const float*b,float*pre,float*post,float*comb,float*x,float*mixes,float*rstd,int M,int K,float neps,float heps,cudaStream_t st){if(!handle||!h||!fn||!s||!b||!pre||!post||!comb||!x||!mixes||!rstd||M<1||M>8||K<32||K%32)return cudaErrorInvalidValue;int width,threads=geometry(M,K*4,width);promote_stats<<<M,threads,0,st>>>((const bf16*)h,x,rstd,M,K*4,neps,width);int rc=cudaGetLastError();if(rc)return rc;rc=ds41_dense_cublas(handle,x,fn,mixes,M,24,K*4,1,1,st);if(rc)return rc;sinkhorn<<<M,32,0,st>>>(mixes,s,b,pre,post,comb,M,heps,rstd);return cudaGetLastError();}

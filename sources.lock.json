@@ -30,7 +30,7 @@
         "tests/vision_probe.cpp"
       ],
       "files": 74,
-      "tree_sha256": "58146ad9e494054dee8fb430c1eede0056d139c697ca478310beeffcb3226019"
+      "tree_sha256": "c31582cc706ddcd7984296a329d8c8d2b5b7b4f154f8f9c4273bb598df718ca7"
     },
     {
       "path": "components/moe",
@@ -55,8 +55,8 @@
       "release_build_files": [
         "CMakeLists.txt"
       ],
-      "files": 13,
-      "tree_sha256": "4c12334fbb215959911c7368d6f9acc415d4308e5364c09a8b8cee200a5ea775"
+      "files": 14,
+      "tree_sha256": "4a93603af1ecfb5c2467b7487b74a06130ce7560f518b7fd48b66f579317075a"
     },
     {
       "path": "components/attn",
@@ -133,5 +133,5 @@
     "driver": "615.71.09",
     "gpu": "RTX PRO 6000 Blackwell Workstation Edition (sm_120a)"
   },
-  "note": "Each component tree is extracted unchanged from its origin commit in the project's private development repositories, except the files in release_build_files: CMake/build scripts written or edited so the tree builds standalone (install rules, component paths, no machine paths), and the engine files in release_source_changes: image input (docs/engine.md#images) and the EXL3 3-bit expert path (docs/exl3.md), added in this repo. components/exl3 carries its origin's kernel sources unchanged; that repository's tests, benchmarks and fixtures are not included (results in docs/exl3.md). tree_sha256 covers the tree as shipped; origin_tree_sha256 the tree as extracted. s0ma's K2 change (2026-10-31; docs/exl3.md#k2) edits components/exl3 (the trellis decode at 2 or 3 bits, tests/exl3_check.cu) and engine/src/forward.cu (a K2 bank's records accepted); tree_sha256 covers the tree with it."
+  "note": "Each component tree is extracted unchanged from its origin commit in the project's private development repositories, except the files in release_build_files: CMake/build scripts written or edited so the tree builds standalone (install rules, component paths, no machine paths), and the engine files in release_source_changes: image input (docs/engine.md#images) and the EXL3 3-bit expert path (docs/exl3.md), added in this repo. components/exl3 carries its origin's kernel sources unchanged; that repository's tests, benchmarks and fixtures are not included (results in docs/exl3.md). tree_sha256 covers the tree as shipped; origin_tree_sha256 the tree as extracted. s0ma's K2 change (2026-10-31; docs/exl3.md#k2) edits components/exl3 (the trellis decode at 2 or 3 bits, tests/exl3_check.cu) and engine/src/forward.cu (a K2 bank's records accepted); tree_sha256 covers the tree with it. s0ma's leg 26 change (2026-10-31) adds batched-row entry points to components/dense (ds41_dense_cublas_rows, ds41_dense_hc_mixes_rows, tests/rows_check.cu) and uses them under DS41_ROWS_BATCHED=1."
 }

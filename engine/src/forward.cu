@@ -274,6 +274,9 @@ class Native final : public Forward, public hotpath::GateEvidence {
   int lookahead_m = 1, lookahead_n = 4;
   std::unique_ptr<ds41::HostBuffer> spark_host;
   const bool prefill_chunk_fit = [] { const char *v = std::getenv("DS41_PREFILL_CHUNK_FIT"); return v && std::string(v) == "1"; }();
+  // s0ma leg 26: a verify step's per-row cuBLAS rows, hyper-connection mixes and route weights in one launch each,
+  // every row computed as on its own (DS41_ROWS_BATCHED=1; tokens checked identical by the lab's benchmark).
+  const bool rows_batched = [] { const char *v = std::getenv("DS41_ROWS_BATCHED"); return v && std::string(v) == "1"; }();
   std::unique_ptr<ds41::HostBuffer> lookahead_host;
   std::unique_ptr<Phase> lookahead_sync;
   int lookahead_layer = -1, lookahead_k = 6;

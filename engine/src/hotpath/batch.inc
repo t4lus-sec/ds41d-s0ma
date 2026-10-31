@@ -33,6 +33,10 @@ void blinear(const std::string &prefix, const void *in, void *out,
     // Keep the accepted M1 cuBLAS geometry. Batch-dependent reductions must
     // pass class N gates before a different geometry can replace these calls.
     const size_t element = weight.dtype == "F32" ? 4 : 2;
+    if (rows_batched && m > 1) {
+      CK(ds41_dense_cublas_rows(blas, in, weight.data.p, out, m, n, k, weight.dtype == "F32", stream));
+      return;
+    }
     for (int r = 0; r < m; ++r)
       CK(ds41_dense_cublas(blas, static_cast<const char *>(in) + r*k*element,
           weight.data.p, static_cast<char *>(out) + r*n*element, 1, n, k,
@@ -43,6 +47,13 @@ void bnorm(const std::string &name, const void *in, void *out, int k, int m) {
   hotpath::rms_decode(in,w(name+".weight").data.p,out,m,k,stream);
 }
 void bhc(const std::string &p, const char *kind, Device &target_pre, int m) {
+  if (rows_batched && m > 1) {
+    CK(ds41_dense_hc_mixes_rows(blas, h.p, w(p + ".hc_" + kind + "_fn").data.as<float>(),
+        w(p + ".hc_" + kind + "_scale").data.as<float>(), w(p + ".hc_" + kind + "_base").data.as<float>(),
+        target_pre.as<float>(), post.as<float>(), comb.as<float>(), f32.as<float>(), mixes.as<float>(),
+        rstd.as<float>(), m, H, 1e-20f, 1e-6f, stream));
+    return;
+  }
   for (int r = 0; r < m; ++r)
     CK(ds41_dense_hc_mixes(blas, h.as<char>(r*HC*H*2),
         w(p + ".hc_" + kind + "_fn").data.as<float>(),
@@ -284,7 +295,8 @@ void bmoe(int l,int m) {
   upload(up_jobs,uj.data(),uj.size()*sizeof(ds41::GemmJob));
   upload(down_jobs,dj.data(),dj.size()*sizeof(ds41::GemmJob));
   zc_end();
-  for(int r=0;r<m;++r) route_weights(unbiased.as<float>(r*384*4),
+  if(rows_batched && m>1) route_weights_rows(unbiased.as<float>(),ids_device.as<int>(),route.as<float>(),6,m,384,stream);
+  else for(int r=0;r<m;++r) route_weights(unbiased.as<float>(r*384*4),
       ids_device.as<int>(r*6*4),route.as<float>(r*6*4),6,stream);
   if(exl3) hotpath::gather_routes_bf16(x.p,route.as<float>(),route_source.as<int>(),
       route_slots.as<int>(),bxh.p,broute.as<float>(),plan.count,stream);

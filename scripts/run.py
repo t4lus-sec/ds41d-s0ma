@@ -51,6 +51,11 @@ K2_ENV = {'DS41_SPARK_STOP_Q': '0.2',
 # s0ma change 24: and drafts ending at confidence 0.35 (K2's 0.2 makes rows Sero pays NVMe reads for): 34.33 -> 36.01
 # tok/s, NVMe misses 20,332 -> 17,506, acceptance 0.660 -> 0.723 (width 4 at 0.35: 35.73).
 SERO_ENV = {'DS41_CLASS_WEIGHTS': 'K3:1.3', 'DS41_SPARK_STOP_Q': '0.35'}
+# s0ma change 25: 3.5 GiB more expert slots at max_context 262,144 (2.4 at 1M: the arenas hold ~1.1 GB more). Measured:
+# 36.01 -> 38.08 tok/s, NVMe misses 17,506 -> 15,947, first tokens unchanged (8K 15.0-15.7 s); 4.5 GiB pushed the 8K
+# prompts' prefill into two segments (+7-12 s each).
+SERO_MAX_CONTEXT = 262144
+SERO_EXTRA_GIB, SERO_EXTRA_GIB_1M = '3.5', '2.4'
 # The measured host RAM tier. More RAM lowers NVMe reads (96 -> 104 GiB: +3.3% decode); larger tiers are untested.
 MAX_HOST_GIB = 104
 # The placement seeds 5,480 experts into the RAM tier (95.99 GiB), so the tier needs at least 96 GiB.
@@ -122,8 +127,12 @@ GDS_ENV = {'DS41_MOE_GDS': '1', 'CUFILE_USE_PCIP2PDMA': 'true'}
 def configuration():
     cfg = json.loads((ROOT / 'config.example.json').read_text())
     local = ROOT / 'config.local.json'
-    if local.exists():
-        cfg.update(json.loads(local.read_text()))
+    mine = json.loads(local.read_text()) if local.exists() else {}
+    cfg.update(mine)
+    if cfg.get('experts') == 'sero' and 'max_context' not in mine:
+        # s0ma change 25: s0ma's window (its adapter caps requests at 262,144); the VRAM the 1M arenas held goes to
+        # expert slots (SERO_ENV's DS41_EXPERT_EXTRA_GIB)
+        cfg['max_context'] = SERO_MAX_CONTEXT
     for key in ('weights', 'assets', 'build'):
         cfg[key] = str((ROOT / Path(cfg[key]).expanduser()).resolve())
     if not re.fullmatch(r'[a-zA-Z0-9_-]+', cfg['unit']):
@@ -261,6 +270,8 @@ def environment(cfg, render=True):
         env.update(K2_ENV)
     if cfg.get('experts') == 'sero':
         env.update(SERO_ENV)
+        # change 25: a lab --env DS41_EXPERT_EXTRA_GIB=... (in ENGINE_ENV) wins
+        env.setdefault('DS41_EXPERT_EXTRA_GIB', SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
     # the pinned cuBLAS pair (dist/blas) before CUDA 13.4's own libraries (cudart, cuFile)
     env['LD_LIBRARY_PATH'] = f'{dist}:{dist}/blas:{cuda_lib()}'
     if gds(cfg):

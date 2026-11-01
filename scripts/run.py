@@ -48,7 +48,9 @@ K2_ENV = {'DS41_SPARK_STOP_Q': '0.2',
           'DS41_ROWS_BATCHED': '1'}
 # s0ma change 20: 0xSero's bank splits its width classes' dynamic VRAM with K3 weighted 1.3 (change 19): 34.13 -> 35.04
 # tok/s, NVMe misses 21,915 -> 21,337 (K3:1.6 34.94). A lab --env DS41_CLASS_WEIGHTS=... still wins.
-SERO_ENV = {'DS41_CLASS_WEIGHTS': 'K3:1.3'}
+# s0ma change 24: and drafts ending at confidence 0.35 (K2's 0.2 makes rows Sero pays NVMe reads for): 34.33 -> 36.01
+# tok/s, NVMe misses 20,332 -> 17,506, acceptance 0.660 -> 0.723 (width 4 at 0.35: 35.73).
+SERO_ENV = {'DS41_CLASS_WEIGHTS': 'K3:1.3', 'DS41_SPARK_STOP_Q': '0.35'}
 # The measured host RAM tier. More RAM lowers NVMe reads (96 -> 104 GiB: +3.3% decode); larger tiers are untested.
 MAX_HOST_GIB = 104
 # The placement seeds 5,480 experts into the RAM tier (95.99 GiB), so the tier needs at least 96 GiB.

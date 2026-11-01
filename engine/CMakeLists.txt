@@ -71,7 +71,7 @@ if(DS41_CUDA)
  target_link_libraries(engine_ops PRIVATE ds41_dense CUDA::cublas)
  target_compile_options(engine_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3;--fmad=false;-lineinfo>)
  set_target_properties(engine_ops PROPERTIES CUDA_ARCHITECTURES "120a" CUDA_STANDARD 17)
- add_library(engine_cuda src/forward.cu src/vision.cu src/engram_async.cpp src/spark_bridge.cpp src/prefill/stager.cpp src/blas_runtime.cpp)
+ add_library(engine_cuda src/forward.cu src/vision.cu src/engram_async.cpp src/spark_bridge.cpp src/prefill/stager.cpp src/blas_runtime.cpp src/draft_draw.cu)
  if(DS41_BLAS_RUNTIME_DIR)
   target_compile_definitions(engine_cuda PRIVATE DS41_BLAS_PIN_ACTIVE=1
       DS41_CUBLAS_SHA256="${DS41_CUBLAS_SHA256}"

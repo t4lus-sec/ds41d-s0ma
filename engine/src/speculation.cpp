@@ -113,13 +113,25 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
       // product of draft confidences (max q_j, j <= k) falls below the floor. The decision uses only
       // the prefix, earlier drafts and q_k before d_k is drawn, so T=1 verification stays exact.
       double reach = 1;
+      observed_.draft_forward_ms = observed_.draft_ms;
       for (int k = 0; k < width - 1; ++k) {
-        auto logits = draft->logits(k, inputs_.back());
-        if (logits.size() != size_t(target.vocab()))
-          throw std::runtime_error("draft vocabulary mismatch");
+        // s0ma: DS41_SPARK_GPU_DRAW=1 computes q, its maximum and the draw on the device (draft_draw.cu)
+        DraftDraw g;
+        const bool on_gpu = draft->draw_gpu(k, inputs_.back(), sampling.temperature, sampling.top_p, rng.seed,
+                                            step, uint32_t(k), uint32_t(Purpose::Draft), g);
+        std::vector<float> logits;
+        if (!on_gpu) {
+          logits = draft->logits(k, inputs_.back());
+          if (logits.size() != size_t(target.vocab()))
+            throw std::runtime_error("draft vocabulary mismatch");
+        }
         if (stop_floor_ > 0 || stop_log_) {
           double c = sampling.temperature == 0 ? 0 : 1;
-          if (sampling.temperature == 0) {
+          if (on_gpu) {
+            c = g.confidence;
+            if (sampling.temperature != 0)
+              q.push_back(Distribution(g.q, g.q + target.vocab()));
+          } else if (sampling.temperature == 0) {
             auto d = probabilities(logits, 1, 1);
             c = *std::max_element(d.begin(), d.end());
           } else {
@@ -127,7 +139,7 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
             c = *std::max_element(q.back().begin(), q.back().end());
           }
           confidence_.push_back(c);
-          const float head = draft->last_confidence();
+          const float head = on_gpu ? g.head : draft->last_confidence();
           head_confidence_.push_back(head);
           double estimate = c;
           if (!stop_model_->empty() && std::isfinite(head)) {
@@ -145,7 +157,11 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
           reach *= c;
         }
         int token;
-        if (sampling.temperature == 0) {
+        if (on_gpu) {
+          token = g.token;
+          if (sampling.temperature != 0 && q.size() == size_t(k))
+            q.push_back(Distribution(g.q, g.q + target.vocab()));
+        } else if (sampling.temperature == 0) {
           token = argmax(logits);
         } else {
           if (q.size() == size_t(k))
@@ -159,6 +175,7 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
       width = int(inputs_.size());
       observed_.width = width;
       observed_.draft_ms += milliseconds() - started;
+      observed_.draft_draw_ms = observed_.draft_ms - observed_.draft_forward_ms;
     }
     // Draft expert work is deliberately outside these target-only deltas.
     const auto before = target.demand_counters();

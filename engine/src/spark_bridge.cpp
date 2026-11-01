@@ -1,4 +1,6 @@
 #include <cstdlib>
+#include <cstring>
+#include <cmath>
 #include "ds41/engine.hpp"
 #include "ds41/spark.h"
 #include <algorithm>
@@ -8,6 +10,10 @@
 #include "ds41/spark_policy.h"
 #endif
 
+extern "C" size_t ds41_draft_draw_scratch_bytes();
+extern "C" int ds41_draft_draw_gpu(const float *logits, int n, double temperature, uint64_t seed, uint64_t step,
+                                   uint32_t slot, uint32_t purpose, double *q, void *scratch, void **result,
+                                   cudaStream_t stream);
 namespace ds41e {
 #ifdef DS41_SPARK_NATIVE
 namespace {
@@ -61,6 +67,9 @@ class SparkTarget final : public Forward, public DraftProvider {
   bool append_restore_ = false, append_pending_ = false;
   uint64_t append_restores_ = 0;
   float last_confidence_ = std::numeric_limits<float>::quiet_NaN();
+  // s0ma GPU draws: q [V] f64 and the kernels' scratch on the device, pinned copies for the host
+  double *draw_q_dev_ = nullptr, *draw_q_host_ = nullptr;
+  void *draw_scratch_ = nullptr, *draw_result_host_ = nullptr;
   std::unique_ptr<float, decltype(&cudaFreeHost)> confidence_host_{[] { void *p = nullptr; if (cudaMallocHost(&p, sizeof(float)) != cudaSuccess) throw std::runtime_error("confidence host buffer"); return static_cast<float *>(p); }(), cudaFreeHost};
   int64_t tail_limit_ = 0, append_old_ = 0;
   std::string seed_mode_ = "unseeded";
@@ -508,6 +517,48 @@ public:
     }
 #endif
     return preflight;
+  }
+  bool draw_gpu(int k, int previous, double temperature, double top_p, uint64_t seed, uint64_t step,
+                uint32_t slot, uint32_t purpose, DraftDraw &out) override {
+    static const bool on = [] { const char *v = std::getenv("DS41_SPARK_GPU_DRAW"); return v && v[0] == '1'; }();
+    if (!on || top_p != 1.0 || !(temperature >= 0)) return false;
+#ifdef DS41_SPARK_POLICY_V2
+    if (policy2_pending_) return false;   // q0 was already copied for the policy; keep its host path
+#endif
+    check();
+    const size_t n = size_t(vocab());
+    if (!draw_q_dev_) {
+      cuda_checked(cudaMalloc(reinterpret_cast<void **>(&draw_q_dev_), n * sizeof(double)));
+      cuda_checked(cudaMalloc(&draw_scratch_, ds41_draft_draw_scratch_bytes()));
+      cuda_checked(cudaMallocHost(reinterpret_cast<void **>(&draw_q_host_), n * sizeof(double)));
+      cuda_checked(cudaMallocHost(&draw_result_host_, 64));
+    }
+    const float *data = nullptr, *confidence = nullptr;
+    checked(ds41_spark_markov(spark_.get(), k, previous, &data, &confidence));
+    auto stream = static_cast<cudaStream_t>(weights_.cuda_stream);
+    // probabilities() floors a positive temperature at 1e-5; zero is greedy
+    const double t = temperature > 0 ? std::max(temperature, 1e-5) : 0.0;
+    void *result = nullptr;
+    cuda_checked(cudaError_t(ds41_draft_draw_gpu(data, int(n), t, seed, step, slot, purpose, draw_q_dev_,
+                                                 draw_scratch_, &result, stream)));
+    cuda_checked(cudaMemcpyAsync(draw_result_host_, result, 24, cudaMemcpyDeviceToHost, stream));
+    cuda_checked(cudaMemcpyAsync(confidence_host_.get(), confidence, sizeof(float), cudaMemcpyDeviceToHost, stream));
+    if (t > 0)
+      cuda_checked(cudaMemcpyAsync(draw_q_host_, draw_q_dev_, n * sizeof(double), cudaMemcpyDeviceToHost, stream));
+    cuda_checked(cudaStreamSynchronize(stream));
+    const auto *r = static_cast<const char *>(draw_result_host_);
+    int32_t token;
+    double c;
+    std::memcpy(&token, r, 4);
+    std::memcpy(&c, r + 8, 8);
+    if (token < 0 || size_t(token) >= n || !std::isfinite(c))
+      throw std::runtime_error(token == -2 ? "draft logits not finite" : "GPU draft draw found no token");
+    last_confidence_ = *confidence_host_;
+    out.token = token;
+    out.confidence = c;
+    out.head = last_confidence_;
+    out.q = t > 0 ? draw_q_host_ : nullptr;
+    return true;
   }
   std::vector<float> logits(int k, int previous) override {
     check();

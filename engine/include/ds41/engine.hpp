@@ -231,6 +231,16 @@ struct DraftObservation {
   size_t accepted_drafts = 0, tested_drafts = 0;
   double draft_ms = 0, verify_ms = 0, other_ms = 0;
   double host_misses = 0, nvme_misses = 0;
+  // s0ma: draft_ms split into the drafter's forward (begin) and the per-position draws (Markov head + q + draw)
+  double draft_forward_ms = 0, draft_draw_ms = 0;
+};
+// s0ma: a draft position drawn on the GPU (DS41_SPARK_GPU_DRAW=1). q, when sampling, is the fp64 measure the
+// verifier needs, valid until the next draw.
+struct DraftDraw {
+  int token = -1;
+  double confidence = 0;
+  float head = std::numeric_limits<float>::quiet_NaN();
+  const double *q = nullptr;
 };
 struct DraftContext {
   int anchor, maximum_width;
@@ -253,6 +263,10 @@ public:
   // Optional q0-only refinement. This runs before any current proposal draw.
   virtual int finalize_width(int preflight) { return preflight; }
   virtual std::vector<float> logits(int block_position, int previous) = 0;
+  // s0ma: the same position's q, confidence and token computed on the device; false = use logits()
+  virtual bool draw_gpu(int, int, double, double, uint64_t, uint64_t, uint32_t, uint32_t, DraftDraw &) {
+    return false;
+  }
   virtual void observe(const DraftObservation &) = 0;
   virtual void complete(const DraftObservation &observation, bool censored) {
     if (!censored) observe(observation);

@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "ds41/engine.hpp"
 #include "ds41/native_store.hpp"
 #include <algorithm>
@@ -587,7 +588,7 @@ public:
             draft_mode == "off" ? nullptr : model->drafter();
         std::string reason = "length";
         uint64_t cycles = 0, drafted = 0, accepted = 0, verified_accepted = 0;
-        double draft_ms = 0, verify_ms = 0;
+        double draft_ms = 0, verify_ms = 0, draft_forward_ms = 0, draft_draw_ms = 0;
         auto emit = [&](int token, const std::vector<float> &row) {
           if (cancelled()) {
             reason = "cancelled";
@@ -649,6 +650,8 @@ public:
             verified_accepted += result.accepted;
             draft_ms += step.observation().draft_ms;
             verify_ms += step.observation().verify_ms;
+            draft_forward_ms += step.observation().draft_forward_ms;
+            draft_draw_ms += step.observation().draft_draw_ms;
             size_t delivered = 0;
             for (size_t k = 0; k < result.emitted.size(); ++k) {
               if (!emit(result.emitted[k], step.rows()[k])) {
@@ -701,6 +704,9 @@ public:
         stats["draft_mode"] = drafter ? "native-candidate" : "off";
         stats["draft_ms"] = draft_ms;
         stats["target_verify_ms"] = verify_ms;
+        stats["draft_forward_ms"] = draft_forward_ms;   // s0ma: the drafter's forward (begin)
+        stats["draft_draw_ms"] = draft_draw_ms;         // s0ma: Markov heads, q and draws per position
+        stats["draft_gpu_draw"] = [] { const char *v = std::getenv("DS41_SPARK_GPU_DRAW"); return v && v[0] == '1'; }();
         stats["decode_tps"] = completed > 1 && last > first
                                   ? (completed - 1) / (last - first)
                                   : 0;

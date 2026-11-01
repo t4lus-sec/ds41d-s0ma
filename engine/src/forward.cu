@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <cublas_v2.h>
 #include <filesystem>
+#include <sstream>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -222,7 +223,9 @@ class Native final : public Forward, public hotpath::GateEvidence {
   int exl3_bits_loaded = 3;
   // s0ma change 12: each target layer's EXL3 width (2 or 3), from its records' size. A bank whose layers differ
   // ("experts": "mixed") gets one store slot class per width; exl3_bits_loaded is then 0.
-  std::array<int, 40> layer_bits{};
+  std::array<int, 40> layer_bits{};   // 0: the layer mixes widths (s0ma change 15)
+  std::vector<uint8_t> width_of;      // each target expert's width
+  Device expert_width_dev;            // the same on the device, for grouped_exl3_var
   bool exl3_mixed = false;
   uint64_t expert_payload_bytes = 0;   // the target store's VRAM slots in bytes (all classes)
   std::string mixed_k3_layers;         // for the log and stats: "9,12,17,..."
@@ -232,6 +235,8 @@ class Native final : public Forward, public hotpath::GateEvidence {
   // Target-layer expert GEMM. EXL3 jobs read BF16 rows; native jobs MXFP8 rows and scales.
   cudaError_t expert_gemm(const ds41::GemmJob *jobs, int count, ds41::Projection p,
                           int n, int k, cudaStream_t s, int layer) {
+    if (exl3 && !expert_bits(layer))   // s0ma change 15: a layer whose experts differ in width
+      return ds41::grouped_exl3_var(experts->table(), jobs, count, p, n, k, expert_width_dev.as<uint8_t>(), s);
     return exl3 ? ds41::grouped_exl3_bits(experts->table(), jobs, count, p, n, k, expert_bits(layer), s)
                 : ds41::grouped_mxfp4_native_parallel(experts->table(), jobs, count, p, n, k, s);
   }
@@ -638,7 +643,7 @@ public:
     reset();
     if (rows_dense) check_rows_batched();
     std::cerr << "ds41d native M1 loaded; UNQUALIFIED; expert slots="
-              << c.expert_slots << (exl3_mixed ? " (EXL3 mixed target experts: K3 in layers " + mixed_k3_layers + ", K2 elsewhere; native MTP store)"
+              << c.expert_slots << (exl3_mixed ? " (EXL3 mixed target experts: " + mixed_k3_layers + "; native MTP store)"
                                     : exl3 ? (exl3_bits_loaded == 2 ? " (EXL3 K2 target experts, native MTP store)"
                                                    : " (EXL3 K3 target experts, native MTP store)") : "") << "\n";
   }
@@ -1014,7 +1019,7 @@ public:
     if(stale) j["moe_stats_error"]=stats_error;
     j["cpu_only_experts"]=0; // CPU backend is not integrated in this adapter.
     j["expert_kernel"]=exl3?"grouped_exl3 (target), grouped_mxfp4_native_parallel (MTP)":"grouped_mxfp4_native_parallel";
-    j["target_expert_format"]=exl3_mixed?"EXL3 mixed K2/K3 mul1 (K3 layers "+mixed_k3_layers+")":exl3?(exl3_bits_loaded==2?"EXL3 K2 mul1":"EXL3 K3 mul1"):"MXFP4";
+    j["target_expert_format"]=exl3_mixed?"EXL3 mixed mul1 ("+mixed_k3_layers+")":exl3?(exl3_bits_loaded==2?"EXL3 K2 mul1":"EXL3 K3 mul1"):"MXFP4";
     if(mtp_experts) j["mtp_expert_store"]="native MXFP4, 384 VRAM pins";
     j["xk_enabled"]=false; // Cache-only adapter never constructs DecodeBackend/XK.
     j["moe_demand_grouping"]="sorted unique logical-ID union per layer/verify";
@@ -1866,62 +1871,106 @@ private:
   // plus dynamic budget, which a mixed placement states in its layers' own sizes; they must add up to
   // --expert-slots). RAM: the tier's bytes split between the classes as the placement's per-layer host capacities
   // are (its seeds), in each class's slot size.
+  static uint64_t exl3_rec_of(uint64_t bits) { return (3 * (320 * 144 * 16 * bits * 2 + 2 * (5120 + 2304)) + 4095) / 4096 * 4096; }
+  // s0ma changes 12 and 15: a bank of several widths gets one store slot class per record size, so an expert only
+  // takes a slot of its own size. VRAM: the placement's pinned experts each in their class; each layer's dynamic
+  // budget split between the classes in proportion to that layer's unpinned experts of each (largest remainder), and
+  // pins plus budgets must add up to --expert-slots. RAM: the tier's bytes split as the placement's seeds' bytes are.
   void mixed_store_classes(ds41::OffloadStore::Config &ec, const Config &c) {
     if (c.placement.empty()) throw std::invalid_argument("a mixed EXL3 bank needs its placement (--placement)");
     const auto pl = ds41::load_placement(c.placement);
-    const size_t bytes[2] = {8892416, 13316096};
-    std::array<size_t, 40> cap{};
-    for (auto id : pl.vram_pins) if (id < 15360) ++cap[id / 384];
-    size_t vram[2] = {0, 0};
-    double host_w[2] = {0, 0};
-    std::array<size_t, 2> seeds{};
-    for (auto id : pl.host_residents) if (id < 15360) ++seeds[layer_bits[id / 384] == 3];
+    std::vector<int> widths;
+    for (int b = 2; b <= 5; ++b) if (std::count(width_of.begin(), width_of.end(), uint8_t(b))) widths.push_back(b);
+    const size_t n = widths.size();
+    std::array<int, 6> cls{};
+    for (size_t k = 0; k < n; ++k) cls[widths[k]] = int(k);
+    ec.expert_class.assign(ds41::expert_count, 0);
+    for (ds41::ExpertId id = 0; id < 15360; ++id) ec.expert_class[id] = uint8_t(cls[width_of[id]]);
+    std::vector<size_t> bytes(n), vram(n, 0), seeds(n, 0);
+    std::vector<double> host_w(n, 0);
+    for (size_t k = 0; k < n; ++k) bytes[k] = exl3_rec_of(widths[k]);
+    std::vector<bool> pinned(15360);
+    for (auto id : pl.vram_pins) if (id < 15360) { pinned[id] = true; ++vram[ec.expert_class[id]]; }
     for (int l = 0; l < 40; ++l) {
-      const int k = layer_bits[l] == 3;
-      ec.layer_class[l] = uint8_t(k);
-      vram[k] += cap[l] + pl.dynamic_slots_per_layer[l];
-      host_w[k] += double(pl.host_slots_per_layer[l]) * bytes[k];
+      std::vector<size_t> free_k(n, 0);
+      size_t free_all = 0;
+      for (int e = 0; e < 384; ++e) if (!pinned[l * 384 + e]) { ++free_k[ec.expert_class[l * 384 + e]]; ++free_all; }
+      const size_t d = pl.dynamic_slots_per_layer[l];
+      std::vector<size_t> part(n);
+      std::vector<std::pair<double, size_t>> rest;
+      size_t given = 0;
+      for (size_t k = 0; k < n; ++k) {
+        const double exact = free_all ? double(d) * free_k[k] / free_all : 0;
+        part[k] = size_t(exact); given += part[k]; rest.push_back({exact - part[k], k});
+      }
+      std::sort(rest.begin(), rest.end(), [](auto a, auto b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+      for (size_t j = 0; given < d && j < rest.size(); ++j, ++given) ++part[rest[j].second];
+      for (size_t k = 0; k < n; ++k) vram[k] += part[k];
     }
-    if (vram[0] + vram[1] != size_t(c.expert_slots))
+    for (auto id : pl.host_residents) if (id < 15360) { ++seeds[ec.expert_class[id]]; host_w[ec.expert_class[id]] += bytes[ec.expert_class[id]]; }
+    size_t total = 0;
+    for (auto v : vram) total += v;
+    if (total != size_t(c.expert_slots))
       throw std::invalid_argument("a mixed bank's placement must state every VRAM slot: its pins and budgets give " +
-                                  std::to_string(vram[0] + vram[1]) + ", --expert-slots is " + std::to_string(c.expert_slots));
-    if (host_w[0] + host_w[1] <= 0) host_w[0] = host_w[1] = 1;
-    ec.class_bytes = {bytes[0], bytes[1]};
-    ec.class_slots = {vram[0], vram[1]};
-    ec.class_host_slots = {0, 0};
-    for (int k = 0; k < 2; ++k) {
-      ec.class_host_slots[k] = size_t(double(c.host_bytes) * host_w[k] / (host_w[0] + host_w[1])) / bytes[k];
+                                  std::to_string(total) + ", --expert-slots is " + std::to_string(c.expert_slots));
+    double hw = 0;
+    for (auto w : host_w) hw += w;
+    if (hw <= 0) for (size_t k = 0; k < n; ++k) { host_w[k] = double(std::count(width_of.begin(), width_of.end(), uint8_t(widths[k]))) * bytes[k]; hw += host_w[k]; }
+    ec.class_bytes = bytes;
+    ec.class_slots = vram;
+    ec.class_host_slots.assign(n, 0);
+    expert_payload_bytes = 0;
+    std::ostringstream log;
+    log << "mixed EXL3 store (" << mixed_k3_layers << "): VRAM";
+    for (size_t k = 0; k < n; ++k) {
+      ec.class_host_slots[k] = size_t(double(c.host_bytes) * host_w[k] / hw) / bytes[k];
       if (ec.class_host_slots[k] < seeds[k])
-        throw std::invalid_argument("the RAM tier's " + std::string(k ? "K3" : "K2") + " slots (" +
+        throw std::invalid_argument("the RAM tier's K" + std::to_string(widths[k]) + " slots (" +
                                     std::to_string(ec.class_host_slots[k]) + ") cannot hold the placement's " +
                                     std::to_string(seeds[k]) + " seeds");
+      expert_payload_bytes += uint64_t(vram[k]) * bytes[k];
+      log << (k ? " + " : " ") << vram[k] << " K" << widths[k];
     }
-    expert_payload_bytes = uint64_t(vram[0]) * bytes[0] + uint64_t(vram[1]) * bytes[1];
-    std::cerr << "mixed EXL3 store: VRAM " << vram[0] << " K2 + " << vram[1] << " K3 slots ("
-              << expert_payload_bytes / double(1ull << 30) << " GiB), RAM tier " << ec.class_host_slots[0] << " K2 + "
-              << ec.class_host_slots[1] << " K3 slots; K3 layers " << mixed_k3_layers << "\n";
+    log << " slots (" << expert_payload_bytes / double(1ull << 30) << " GiB), RAM tier";
+    for (size_t k = 0; k < n; ++k) log << (k ? " + " : " ") << ec.class_host_slots[k] << " K" << widths[k];
+    std::cerr << log.str() << " slots\n";
   }
   void validate_k3_records(const std::vector<ds41::Record> &records, const std::string &receipts) {
     if (records.empty()) throw std::runtime_error("EXL3 manifest is empty");
     constexpr uint64_t SB = 2 * (5120 + 2304);
-    auto rec_of = [](uint64_t bits) { return (3 * (320 * 144 * 16 * bits * 2 + 2 * (5120 + 2304)) + 4095) / 4096 * 4096; };
+    auto rec_of = [](uint64_t bits) { return exl3_rec_of(bits); };
     if (rec_of(3) != 13316096) throw std::logic_error("K3 record size");
-    // s0ma change 12: the width is per layer (every record of a layer the same size); layers may differ.
+    // s0ma changes 12 and 15: the width is per expert, from its record's size (2..5 bits); a layer whose experts all
+    // share one width launches at that width, a layer that mixes them through grouped_exl3_var.
+    width_of.assign(15360, 0);
     for (auto &r : records) {
       if (r.id >= 15360) throw std::runtime_error("EXL3 manifest duplicate/id");
-      const int b = r.bytes == rec_of(2) ? 2 : r.bytes == rec_of(3) ? 3 : 0;
-      if (!b) throw std::runtime_error("EXL3 record size is neither K2 nor K3: expert " + std::to_string(r.id));
-      int &lb = layer_bits[r.id / 384];
-      if (lb && lb != b) throw std::runtime_error("EXL3 layer mixes widths: layer " + std::to_string(r.id / 384));
-      lb = b;
+      int b = 0;
+      for (int k = 2; k <= 5; ++k) if (r.bytes == rec_of(k)) b = k;
+      if (!b) throw std::runtime_error("EXL3 record size is not K2..K5: expert " + std::to_string(r.id));
+      width_of[r.id] = uint8_t(b);
+    }
+    std::array<size_t, 6> hist{};
+    for (int l = 0; l < 40; ++l) {
+      int lb = width_of[l * 384];
+      for (int e = 0; e < 384; ++e) { ++hist[width_of[l * 384 + e]]; if (width_of[l * 384 + e] != lb) lb = 0; }
+      layer_bits[l] = lb;
     }
     int widths = 0;
-    for (int b : {2, 3}) widths += std::count(layer_bits.begin(), layer_bits.end(), b) > 0;
+    for (int b = 2; b <= 5; ++b) widths += hist[b] > 0;
     exl3_mixed = widths > 1;
-    exl3_bits_loaded = exl3_mixed ? 0 : layer_bits[0];
+    exl3_bits_loaded = exl3_mixed ? 0 : width_of[0];
     if (!exl3_mixed && ds41::exl3_set_bits(exl3_bits_loaded) != cudaSuccess) throw std::runtime_error("EXL3 width not supported");
-    for (int l = 0; l < 40; ++l)
-      if (layer_bits[l] == 3) mixed_k3_layers += (mixed_k3_layers.empty() ? "" : ",") + std::to_string(l);
+    if (std::all_of(layer_bits.begin(), layer_bits.end(), [](int b) { return b == 2 || b == 3; })) {
+      for (int l = 0; l < 40; ++l)
+        if (layer_bits[l] == 3) mixed_k3_layers += (mixed_k3_layers.empty() ? "" : ",") + std::to_string(l);
+      mixed_k3_layers = "K3 in layers " + mixed_k3_layers + ", K2 elsewhere";
+    } else {
+      for (int b = 2; b <= 5; ++b) if (hist[b]) mixed_k3_layers += (mixed_k3_layers.empty() ? "" : ", ") + std::string("K") + std::to_string(b) + " " + std::to_string(hist[b]);
+      mixed_k3_layers += " experts";
+    }
+    expert_width_dev.resize(15360);
+    CK(cudaMemcpy(expert_width_dev.p, width_of.data(), 15360, cudaMemcpyHostToDevice));
     auto views_of = [&](uint64_t bits) {
       const uint64_t TB = 320 * 144 * 16 * bits * 2;
       return std::array<ds41::TensorView, 6>{ds41::TensorView{0, TB}, ds41::TensorView{TB, SB}, ds41::TensorView{TB + SB, TB},
@@ -1935,38 +1984,48 @@ private:
     auto same = [](ds41::TensorView a, ds41::TensorView b) { return a.offset == b.offset && a.bytes == b.bytes; };
     std::vector<bool> seen(15360);
     std::map<unsigned, std::string> bank;
+    std::map<unsigned, uint64_t> file_bytes;
+    std::map<unsigned, std::vector<std::pair<uint64_t, uint64_t>>> spans;
     for (auto &r : records) {
       if (r.id >= 15360 || seen[r.id]) throw std::runtime_error("EXL3 manifest duplicate/id");
       seen[r.id] = true;
-      unsigned layer = r.id / 384, expert = r.id % 384;
-      const uint64_t REC = rec_of(layer_bits[layer]);
-      const auto v = views_of(layer_bits[layer]);
+      unsigned layer = r.id / 384;
+      const uint64_t REC = rec_of(width_of[r.id]);
+      const auto v = views_of(width_of[r.id]);
       const auto &gate = v[0], &gate_scale = v[1], &up = v[2], &up_scale = v[3], &down = v[4], &down_scale = v[5];
       if (r.bytes != REC || !same(r.gate, gate) || !same(r.gate_scale, gate_scale) || !same(r.up, up) ||
           !same(r.up_scale, up_scale) || !same(r.down, down) || !same(r.down_scale, down_scale))
         throw std::runtime_error("EXL3 record layout mismatch: expert " + std::to_string(r.id));
       if (r.extents.size() != 1) throw std::runtime_error("EXL3 record must be one bank extent");
       const auto &e = r.extents[0];
+      // the record lies whole, 4 KiB aligned, inside its layer's bank file (one record a 4 KiB-aligned run; K2/K3 banks
+      // place expert e at e * REC, a mixed-width bank packs them in expert order)
       if (e.dst_offset != 0 || e.bytes != REC || (e.required_bytes && e.required_bytes != REC) ||
-          e.file_offset != expert * REC || e.expected_file_bytes != 384 * REC)
+          e.file_offset % 4096 || e.file_offset + REC > e.expected_file_bytes)
         throw std::runtime_error("EXL3 bank extent mismatch: expert " + std::to_string(r.id));
       auto &path = bank[layer];
-      if (path.empty()) path = e.path;
-      else if (path != e.path) throw std::runtime_error("EXL3 layer spans several bank files");
+      if (path.empty()) { path = e.path; file_bytes[layer] = e.expected_file_bytes; }
+      else if (path != e.path || file_bytes[layer] != e.expected_file_bytes) throw std::runtime_error("EXL3 layer spans several bank files");
+      spans[layer].push_back({e.file_offset, e.file_offset + REC});
+    }
+    for (auto &[layer, v] : spans) {
+      std::sort(v.begin(), v.end());
+      for (size_t j = 1; j < v.size(); ++j)
+        if (v[j].first < v[j - 1].second) throw std::runtime_error("EXL3 records overlap in layer " + std::to_string(layer));
     }
     for (auto &[layer, path] : bank) {
-      const uint64_t REC = rec_of(layer_bits[layer]);
+      const uint64_t FB = file_bytes[layer];
       char name[32];
       std::snprintf(name, sizeof name, "bank-%02u.bin", layer);
       auto file = std::filesystem::path(path);
       const auto key = std::to_string(layer);
       if (file.filename() != name || !receipt.contains(key) ||
           receipt[key].at("file").get<std::string>() != name ||
-          receipt[key].at("bytes").get<uint64_t>() != 384 * REC ||
+          receipt[key].at("bytes").get<uint64_t>() != FB ||
           receipt[key].at("sha256").get<std::string>().size() != 64 || !receipt[key].contains("mtime_ns"))
         throw std::runtime_error("EXL3 bank has no matching verified receipt: " + path);
       struct stat st {};
-      if (::stat(path.c_str(), &st) || uint64_t(st.st_size) != 384 * REC ||
+      if (::stat(path.c_str(), &st) || uint64_t(st.st_size) != FB ||
           uint64_t(st.st_mtim.tv_sec) * 1000000000ull + uint64_t(st.st_mtim.tv_nsec) !=
               receipt[key].at("mtime_ns").get<uint64_t>())
         throw std::runtime_error("EXL3 bank changed since its receipt was verified: " + path);

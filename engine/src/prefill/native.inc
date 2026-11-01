@@ -253,7 +253,7 @@ Json pmoe(int l,ds41e::prefill::Span span) {
       if(exl3) {
         ds41e::prefill::gather_routes_bf16(pf.ffn_input.as<char>(base*H*2),pf.weights.as<float>(base*6*4),
             gpu_slots+b.offset,pf.bxh.p,pf.bw.as<float>(),b.rows,s);
-        const int bits=expert_bits(int(id/384));   // s0ma change 12: this expert's layer's width
+        const int bits=width_of.empty()?expert_bits(int(id/384)):width_of[id];   // s0ma changes 12, 15: this expert's width
         CK(ds41::grouped_exl3_prefill_bits(table,gpu_jobs+b.job,1,ds41::Projection::Gate,I,H,b.rows,bits,s));
         CK(ds41::grouped_exl3_prefill_bits(table,gpu_jobs+b.job+1,1,ds41::Projection::Up,I,H,b.rows,bits,s));
         CK(ds41::swiglu(pf.gate.as<Bf16>(),pf.up.as<Bf16>(),pf.bw.as<float>(),pf.act.as<Bf16>(),b.rows,I,10,s));

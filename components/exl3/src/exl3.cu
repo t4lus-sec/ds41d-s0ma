@@ -7,7 +7,7 @@ namespace exl3_detail {
 // Fixed 8-row tile, 128 columns, four contiguous K partitions. M never changes
 // geometry, K order, rounding, or reduction order. No inter-CTA communication.
 template<int K,int BITS>
-__global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const GemmJob* jobs,int projection,int N) {
+__device__ __forceinline__ void decode_body(const DeviceExpert* table,const GemmJob* jobs,int projection,int N) {
     GemmJob job=jobs[blockIdx.y];
     if(job.tokens<1||job.tokens>8){asm volatile("trap;");return;}
     DeviceExpert e=table[job.expert];wait_ready(e);
@@ -27,10 +27,10 @@ __global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const 
     const int start=wk*CHUNK, len=min(CHUNK,SLICES-start);
     const int r=lane/4; bool active=r<job.tokens;
     const uint32_t* A2=reinterpret_cast<const uint32_t*>(A);
-    uint32_t pf[PF][WNT];
+    TileW<BITS> pf[PF][WNT];
     auto load=[&](int i,int t){
-        size_t off=(size_t(start+i)*(N/16)+blockIdx.x*8+wn*2+t)*(8*BITS)+lane;
-        return lane<8*BITS?__ldcs(B+off):0u;
+        size_t off=(size_t(start+i)*(N/16)+blockIdx.x*8+wn*2+t)*(8*BITS);
+        return load_tile<BITS>(B+off,lane);
     };
     #pragma unroll
     for(int d=0;d<PF;++d)if(d<len){
@@ -42,7 +42,7 @@ __global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const 
         #pragma unroll
         for(int d=0;d<PF;++d){
             int i=base+d;if(i>=len)break;
-            uint32_t bw[WNT];
+            TileW<BITS> bw[WNT];
             #pragma unroll
             for(int t=0;t<WNT;++t){bw[t]=pf[d][t];if(i+PF<len)pf[d][t]=load(i+PF,t);}
             int col=(start+i)*8+(lane&3);
@@ -72,6 +72,22 @@ __global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const 
     }
     __syncthreads();
     if(warp<job.tokens)rotate_output(out+warp*128,sv+blockIdx.x*128,job.output+warp*N+blockIdx.x*128,lane);
+}
+template<int K,int BITS>
+__global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const GemmJob* jobs,int projection,int N) {
+    decode_body<K,BITS>(table,jobs,projection,N);
+}
+// s0ma change 15: one launch for jobs of several widths. Each CTA reads its job's expert's width from `bits` and
+// runs that width's decode, so the work per CTA is exactly decode<K,BITS>'s (block-uniform branch, same shared memory).
+template<int K>
+__global__ __launch_bounds__(512,1) void decode_var(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,const uint8_t* bits) {
+    switch(bits[jobs[blockIdx.y].expert]){
+        case 2: decode_body<K,2>(table,jobs,projection,N); break;
+        case 3: decode_body<K,3>(table,jobs,projection,N); break;
+        case 4: decode_body<K,4>(table,jobs,projection,N); break;
+        case 5: decode_body<K,5>(table,jobs,projection,N); break;
+        default: asm volatile("trap;");
+    }
 }
 // s0ma: the same tile computed by a cluster of four CTAs, one per K partition (blockIdx.z), four warps each. Every
 // warp does exactly what warp (wn, wk) of decode() does: the same rotated inputs (each CTA rotates only the 128-wide
@@ -107,10 +123,10 @@ __global__ void __cluster_dims__(1,1,4) __launch_bounds__(128) decode_split(cons
     __syncthreads();
     const int r=lane/4; bool active=r<job.tokens;
     const uint32_t* A2=reinterpret_cast<const uint32_t*>(A);
-    uint32_t pf[PF][WNT];
+    TileW<BITS> pf[PF][WNT];
     auto load=[&](int i,int t){
-        size_t off=(size_t(start+i)*(N/16)+blockIdx.x*8+wn*2+t)*(8*BITS)+lane;
-        return lane<8*BITS?__ldcs(B+off):0u;
+        size_t off=(size_t(start+i)*(N/16)+blockIdx.x*8+wn*2+t)*(8*BITS);
+        return load_tile<BITS>(B+off,lane);
     };
     #pragma unroll
     for(int d=0;d<PF;++d)if(d<len){
@@ -122,7 +138,7 @@ __global__ void __cluster_dims__(1,1,4) __launch_bounds__(128) decode_split(cons
         #pragma unroll
         for(int d=0;d<PF;++d){
             int i=base+d;if(i>=len)break;
-            uint32_t bw[WNT];
+            TileW<BITS> bw[WNT];
             #pragma unroll
             for(int t=0;t<WNT;++t){bw[t]=pf[d][t];if(i+PF<len)pf[d][t]=load(i+PF,t);}
             int col=(start+i)*8+(lane&3)-lo*64;
@@ -183,7 +199,7 @@ __global__ __launch_bounds__(256,1) void prefill(const DeviceExpert* table,const
         #pragma unroll
         for(int ki=0;ki<8;++ki){
             const uint32_t* b=B+(size_t((k0/16)+ki)*(N/16)+blockIdx.x*8+warp)*(8*BITS);
-            uint32_t word=lane<8*BITS?__ldcs(b+lane):0;
+            TileW<BITS> word=load_tile<BITS>(b,lane);
             Pair f0,f1;dqk<BITS>(word,f0,f1,lane);
             #pragma unroll
             for(int mi=0;mi<4;++mi){
@@ -245,8 +261,32 @@ template<int K,int BITS> cudaError_t launch_decode(const DeviceExpert* t,const G
 cudaError_t grouped_exl3(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,cudaStream_t s){
     return grouped_exl3_bits(t,j,count,p,n,k,g_bits,s);
 }
+template<int BITS> cudaError_t launch_k(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,cudaStream_t s){
+    if(k==5120)return launch_decode<5120,BITS>(t,j,count,p,n,s);
+    if(k==2304)return launch_decode<2304,BITS>(t,j,count,p,n,s);
+    if(k==256)return launch_decode<256,BITS>(t,j,count,p,n,s);
+    if(k==128)return launch_decode<128,BITS>(t,j,count,p,n,s);
+    return cudaErrorNotSupported;
+}
+template<int K> cudaError_t launch_var(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,const uint8_t* bits,cudaStream_t s){
+    constexpr int bytes=(8*K*2<4096?4096:8*K*2)+4*8*128*4;
+    auto err=cudaFuncSetAttribute(exl3_detail::decode_var<K>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
+    if(err!=cudaSuccess)return err;
+    exl3_detail::decode_var<K><<<dim3(n/128,count),512,bytes,s>>>(t,j,int(p),n,bits);
+    return cudaGetLastError();
+}
+cudaError_t grouped_exl3_var(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,const uint8_t* bits,cudaStream_t s){
+    if(!valid(t,j,count,p,n,k) || !bits)return cudaErrorInvalidValue;if(!count)return cudaSuccess;
+    if(k==5120)return launch_var<5120>(t,j,count,p,n,bits,s);
+    if(k==2304)return launch_var<2304>(t,j,count,p,n,bits,s);
+    if(k==256)return launch_var<256>(t,j,count,p,n,bits,s);
+    if(k==128)return launch_var<128>(t,j,count,p,n,bits,s);
+    return cudaErrorNotSupported;
+}
 cudaError_t grouped_exl3_bits(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,int bits,cudaStream_t s){
-    if(!valid(t,j,count,p,n,k) || (bits!=2 && bits!=3))return cudaErrorInvalidValue;if(!count)return cudaSuccess;
+    if(!valid(t,j,count,p,n,k) || bits<2 || bits>5)return cudaErrorInvalidValue;if(!count)return cudaSuccess;
+    if(bits==4)return launch_k<4>(t,j,count,p,n,k,s);
+    if(bits==5)return launch_k<5>(t,j,count,p,n,k,s);
     if(bits==2){
         if(k==5120)return launch_decode<5120,2>(t,j,count,p,n,s);
         if(k==2304)return launch_decode<2304,2>(t,j,count,p,n,s);
@@ -264,13 +304,15 @@ cudaError_t grouped_exl3_prefill(const DeviceExpert* t,const GemmJob* j,int coun
     return grouped_exl3_prefill_bits(t,j,count,p,n,k,max_tokens,g_bits,s);
 }
 cudaError_t grouped_exl3_prefill_bits(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,int max_tokens,int bits,cudaStream_t s){
-    if(!valid(t,j,count,p,n,k)||max_tokens<1||max_tokens>256||(bits!=2&&bits!=3))return cudaErrorInvalidValue;if(!count)return cudaSuccess;
+    if(!valid(t,j,count,p,n,k)||max_tokens<1||max_tokens>256||bits<2||bits>5)return cudaErrorInvalidValue;if(!count)return cudaSuccess;
+    if(bits==4){exl3_detail::prefill<4><<<dim3(n/128,count,(max_tokens+63)/64),256,0,s>>>(t,j,int(p),n,k,max_tokens);return cudaGetLastError();}
+    if(bits==5){exl3_detail::prefill<5><<<dim3(n/128,count,(max_tokens+63)/64),256,0,s>>>(t,j,int(p),n,k,max_tokens);return cudaGetLastError();}
     if(bits==2)exl3_detail::prefill<2><<<dim3(n/128,count,(max_tokens+63)/64),256,0,s>>>(t,j,int(p),n,k,max_tokens);
     else exl3_detail::prefill<3><<<dim3(n/128,count,(max_tokens+63)/64),256,0,s>>>(t,j,int(p),n,k,max_tokens);
     return cudaGetLastError();
 }
 cudaError_t exl3_set_bits(int bits){
-    if(bits!=2&&bits!=3)return cudaErrorInvalidValue;
+    if(bits<2||bits>5)return cudaErrorInvalidValue;
     g_bits=bits;return cudaSuccess;
 }
 int exl3_bits(){return g_bits;}

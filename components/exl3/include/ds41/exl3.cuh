@@ -2,7 +2,7 @@
 #include <ds41/kernels.cuh>
 
 namespace ds41 {
-// K=3 or K=2 (exl3_set_bits), mul1 EXL3. DeviceExpert weights are [K/16,N/16,16*bits] uint16 (48 for K3, 32 for K2);
+// K=2..5 (exl3_set_bits; s0ma changes 12 and 15), mul1 EXL3. DeviceExpert weights are [K/16,N/16,16*bits] uint16 (48 for K3, 32 for K2);
 // each scale pointer holds suh[K] followed immediately by svh[N], both FP16.
 // GemmJob::x is BF16 [tokens,K], output BF16 [tokens,N]. x_scale is ignored.
 // Device-resident jobs/table are reread on every invocation and graph replay.
@@ -24,4 +24,8 @@ cudaError_t grouped_exl3_bits(const DeviceExpert* table, const GemmJob* jobs, in
                               Projection projection, int n, int k, int bits, cudaStream_t stream);
 cudaError_t grouped_exl3_prefill_bits(const DeviceExpert* table, const GemmJob* jobs, int count,
                               Projection projection, int n, int k, int max_tokens, int bits, cudaStream_t stream);
+// s0ma change 15: widths 2..5 (K4: 32 words a tile; K5: 40, as exllamav3's dq_dispatch<5>). grouped_exl3_var launches
+// jobs of mixed widths at once: CTA y decodes at bits[jobs[y].expert] (a device array indexed by expert id).
+cudaError_t grouped_exl3_var(const DeviceExpert* table, const GemmJob* jobs, int count,
+                             Projection projection, int n, int k, const uint8_t* bits, cudaStream_t stream);
 }

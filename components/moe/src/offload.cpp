@@ -181,9 +181,12 @@ struct OffloadStore::Impl {
             for(size_t c=0;c<n;++c){if(!cfg.class_bytes[c] || cfg.class_bytes[c]%4096)throw std::invalid_argument("slot class size");vs+=cfg.class_slots[c];hb+=cfg.class_host_slots[c]*cfg.class_bytes[c];}
             if(vs!=cfg.slots)throw std::invalid_argument("slot classes must add up to the VRAM slots");
             if(hb>cfg.host_budget_bytes)throw std::invalid_argument("slot classes exceed the RAM tier");
+            std::vector<uint8_t> ec=cfg.expert_class;
+            if(ec.empty()){ec.resize(expert_count);for(ExpertId id=0;id<expert_count;++id)ec[id]=cfg.layer_class[expert_layer(id)];}
+            if(ec.size()!=expert_count)throw std::invalid_argument("expert classes must cover every expert");
             for(auto& [id,r]:records){
-                auto c=cfg.layer_class[expert_layer(id)];
-                if(c>=n || r.bytes>cfg.class_bytes[c])throw std::invalid_argument("record larger than its layer's slot class");
+                auto c=ec[id];
+                if(c>=n || r.bytes>cfg.class_bytes[c])throw std::invalid_argument("record larger than its slot class");
             }
             std::vector<uint8_t> vc,hc;vram_total=0;host_total=0;
             for(size_t c=0;c<n;++c){
@@ -191,8 +194,8 @@ struct OffloadStore::Impl {
                 for(size_t j=0;j<cfg.class_host_slots[c];++j){host_offsets.push_back(host_total);host_total+=cfg.class_bytes[c];hc.push_back(uint8_t(c));}
             }
             host_slot_count=hc.size();
-            pool.classes(vc,cfg.layer_class);
-            if(host_slot_count){host_pool=std::make_unique<SlotPool>(host_slot_count,cfg.host_recent_window,cfg.host_decay_interval,cfg.distinct_lfu);host_pool->classes(hc,cfg.layer_class);}
+            pool.classes(vc,ec);
+            if(host_slot_count){host_pool=std::make_unique<SlotPool>(host_slot_count,cfg.host_recent_window,cfg.host_decay_interval,cfg.distinct_lfu);host_pool->classes(hc,ec);}
         }
         else if(host_slot_count)host_pool=std::make_unique<SlotPool>(host_slot_count,cfg.host_recent_window,cfg.host_decay_interval,cfg.distinct_lfu);
         policy_options={flag("DS41_MOE_DECAY256"),flag("DS41_MOE_DRIFT_0_50"),flag("DS41_MOE_FAST_MINIMA")};

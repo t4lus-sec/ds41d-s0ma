@@ -54,7 +54,7 @@ static void hadamard128(float* v) {           // Sylvester order, scaled by 1/sq
     for (int i = 0; i < 128; ++i) v[i] *= 0.088388347648f;
 }
 
-struct Case { int bits, K, N, tokens; bool prefill; ds41::Projection p; };
+struct Case { int bits, K, N, tokens; bool prefill; ds41::Projection p; bool var = false; };
 
 static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
     const int K = c.K, N = c.N, M = c.tokens, bits = c.bits;
@@ -86,6 +86,14 @@ static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
     CK(cudaMalloc(&dj, sizeof job)); CK(cudaMemcpy(dj, &job, sizeof job, cudaMemcpyHostToDevice));
     CK(ds41::exl3_set_bits(bits));
     if (c.prefill) CK(ds41::grouped_exl3_prefill(dt, dj, 1, c.p, N, K, M, 0));
+    else if (c.var) {   // s0ma change 15: the mixed-width launch, its expert's width from a device table
+        uint8_t* dbits; const uint8_t b8 = uint8_t(bits);
+        CK(cudaMalloc(&dbits, 1)); CK(cudaMemcpy(dbits, &b8, 1, cudaMemcpyHostToDevice));
+        CK(ds41::exl3_set_bits(bits == 2 ? 3 : 2));   // the global width must not matter
+        CK(ds41::grouped_exl3_var(dt, dj, 1, c.p, N, K, dbits, 0));
+        CK(cudaDeviceSynchronize()); cudaFree(dbits);
+        CK(ds41::exl3_set_bits(bits));
+    }
     else CK(ds41::grouped_exl3(dt, dj, 1, c.p, N, K, 0));
     CK(cudaDeviceSynchronize());
     std::vector<__nv_bfloat16> out(size_t(M) * N);
@@ -142,6 +150,13 @@ int main() {
         {2, 5120, 2304, 1, false, ds41::Projection::Gate}, {2, 5120, 2304, 8, false, ds41::Projection::Up},
         {2, 2304, 5120, 3, false, ds41::Projection::Down}, {2, 5120, 2304, 64, true, ds41::Projection::Gate},
         {2, 2304, 5120, 200, true, ds41::Projection::Down},
+        // s0ma change 15: K4 and K5 (0xSero's 2.7 bpw bank), decode and prefill, and the mixed-width launch
+        {4, 5120, 2304, 1, false, ds41::Projection::Gate}, {4, 2304, 5120, 6, false, ds41::Projection::Down},
+        {4, 5120, 2304, 70, true, ds41::Projection::Up},
+        {5, 5120, 2304, 2, false, ds41::Projection::Gate}, {5, 2304, 5120, 7, false, ds41::Projection::Down},
+        {5, 2304, 5120, 65, true, ds41::Projection::Down},
+        {2, 5120, 2304, 3, false, ds41::Projection::Gate, true}, {3, 2304, 5120, 2, false, ds41::Projection::Down, true},
+        {4, 5120, 2304, 5, false, ds41::Projection::Up, true}, {5, 2304, 5120, 8, false, ds41::Projection::Down, true},
     };
     int fail = 0;
     for (const auto& c : cases) {
@@ -150,7 +165,7 @@ int main() {
         bool ok = e < 1e-2 && inv;
         fail += !ok;
         std::printf("%s K%d %s k=%d n=%d rows=%d: relative error %.2e%s\n", ok ? "ok  " : "FAIL", c.bits,
-                    c.prefill ? "prefill" : "decode ", c.K, c.N, c.tokens, e, inv ? "" : "; row 0 differs by row count");
+                    c.prefill ? "prefill" : c.var ? "mixed  " : "decode ", c.K, c.N, c.tokens, e, inv ? "" : "; row 0 differs by row count");
     }
     std::printf(fail ? "%d FAILED\n" : "all passed\n", fail);
     return fail ? 1 : 0;

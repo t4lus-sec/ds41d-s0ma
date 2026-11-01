@@ -206,6 +206,53 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(cmd[cmd.index('--spark-width') + 1], '6')
             self.assertEqual(run.environment(cfg, render=False)['DS41_SPARK_STOP_Q'], '0.2')
 
+    def test_sero_bank(self):
+        import random
+        import shutil
+        import tempfile
+        import sero_bank
+        self.assertEqual([sero_bank.LAYOUTS[b][1] for b in (2, 3)], [8892416, 13316096])
+        self.assertTrue(all(sero_bank.LAYOUTS[b][1] % 4096 == 0 for b in (2, 3, 4, 5)))
+        rng = random.Random(5)
+        with tempfile.TemporaryDirectory() as d:
+            root, out = Path(d) / 'root', Path(d) / 'bank'
+            (root / 'profiles').mkdir(parents=True)
+            out.mkdir()
+            shutil.copy(ROOT / 'profiles/k3-p80.placement', root / 'profiles/')
+            receipts = {}
+            for layer in range(40):
+                widths = [rng.choice((2, 2, 3, 3, 3, 4)) for _ in range(384)]
+                widths[7] = 5
+                offs, total = sero_bank.offsets(widths)
+                receipts[str(layer)] = {'widths': ''.join(map(str, widths)), 'bytes': total}
+            sero_bank.manifest(out, receipts)
+            slots = sero_bank.placement(out, receipts, root=root)
+            # the engine's split (mixed_store_classes): pins in their width, each layer's budget by unpinned counts
+            lines = (out / 'mixed-p80.placement').read_text().splitlines()
+            self.assertEqual(run.placement_slots(out / 'mixed-p80.placement'), slots)
+            width = {l * 384 + e: int(c) for l in range(40) for e, c in enumerate(receipts[str(l)]['widths'])}
+            pins = {int(x.split()[1]) for x in lines if x.startswith('vram ') and int(x.split()[1]) < 15360}
+            used = sum(sero_bank.LAYOUTS[width[e]][1] for e in pins)
+            for x in lines:
+                if x.startswith('budget ') and int(x.split()[1]) < 40:
+                    ly, dyn = int(x.split()[1]), int(x.split()[2])
+                    free = [width[ly * 384 + e] for e in range(384) if ly * 384 + e not in pins]
+                    for b in (2, 3, 4, 5):
+                        used += dyn * free.count(b) / len(free) * sero_bank.LAYOUTS[b][1]
+            k2 = (root / 'profiles/k2-p80.placement').read_text().splitlines()
+            cap = sum(1 for x in k2 if x.startswith('vram ') and int(x.split()[1]) < 15360) + \
+                sum(int(x.split()[2]) for x in k2 if x.startswith('budget ') and int(x.split()[1]) < 40)
+            self.assertLessEqual(used, cap * 8892416 * 1.002)   # rounding between widths aside, k2-p80's bytes
+            self.assertGreater(used, cap * 8892416 * 0.97)
+            rec = [x for x in (out / 'records-mixed.tsv').read_text().splitlines() if x.startswith('R 7 ')]
+            self.assertEqual(int(rec[0].split()[2]), sero_bank.LAYOUTS[5][1])
+            cfg = dict(self.config(), experts='sero', sero_bank=str(out), gds=False)
+            with patch.object(run, 'meminfo', return_value={'MemTotal': 126573804 * 1024}):
+                cmd = run.command(cfg, Path('/run/ds41/engine.sock'))
+            self.assertEqual(cmd[cmd.index('--exl3-experts') + 1], str(out / 'records-mixed.tsv'))
+            self.assertEqual(cmd[cmd.index('--placement') + 1], str(out / 'mixed-p80.placement'))
+            self.assertEqual(cmd[cmd.index('--expert-slots') + 1], str(slots))
+
     def test_environment(self):
         cfg = dict(self.config(), gds=False)
         env = run.environment(cfg, render=False)
@@ -281,8 +328,8 @@ class ProfileTests(unittest.TestCase):
         # the engine checks the same layout (validate_k3_records)
         forward = (ROOT / 'engine/src/forward.cu').read_text()
         # (with s0ma's K2 change the sizes are computed from the width; K3 is still checked to be 13,316,096)
-        self.assertIn('auto rec_of = [](uint64_t bits) { return (3 * (320 * 144 * 16 * bits * 2 + 2 * (5120 + 2304)) '
-                      '+ 4095) / 4096 * 4096; };', forward)
+        self.assertIn('static uint64_t exl3_rec_of(uint64_t bits) { return (3 * (320 * 144 * 16 * bits * 2 + 2 * (5120 + 2304)) '
+                      '+ 4095) / 4096 * 4096; }', forward)
         # (s0ma change 12: the width per layer; K3 is still checked to be 13,316,096)
         self.assertIn('if (rec_of(3) != 13316096) throw std::logic_error("K3 record size");', forward)
         import k2_bank

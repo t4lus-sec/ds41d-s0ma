@@ -106,9 +106,10 @@ public:
     // residency and is not allocatable until drained(slot). Soft (non-hard) pools only.
     std::vector<Allocation> reserve(size_t target, const std::unordered_set<ExpertId>& wanted, int cls = -1);
     // s0ma change 12: slot classes for records of several sizes (a mixed EXL3 bank). slot_class[s] is slot s's
-    // class, layer_class[l] the class of layer l's records; an expert only ever occupies a slot of its layer's
-    // class. With cls >= 0, reserve() counts and frees slots of that class only. Before policy()/use.
-    void classes(std::vector<uint8_t> slot_class, const std::array<uint8_t,43>& layer_class);
+    // class, expert_class[id] the class of expert id's record (s0ma change 15: per expert; a layer may mix); an
+    // expert only ever occupies a slot of its class. With cls >= 0, reserve() counts and frees slots of that class
+    // only. Before policy()/use. Layers that mix classes take the scanning victim search, not the per-layer cache.
+    void classes(std::vector<uint8_t> slot_class, std::vector<uint8_t> expert_class);
     bool classed() const { return classed_; }
     int class_of(ExpertId id) const;
     void drained(size_t slot);
@@ -133,8 +134,8 @@ private:
     std::array<uint64_t,43> layer_clocks_{};
     bool fast_=false, host_=false, exclusive_=false;
     int scan_victim(const std::unordered_set<ExpertId>& wanted, const std::array<size_t,43>& counts, int layer, int cls = -1) const;
-    bool classed_=false;
-    std::vector<uint8_t> slot_class_;
+    bool classed_=false, uniform_=true;
+    std::vector<uint8_t> slot_class_, expert_class_;
     std::array<uint8_t,43> layer_class_{};
     bool fits(size_t slot, ExpertId e) const;
     const SlotPool* peer_=nullptr;

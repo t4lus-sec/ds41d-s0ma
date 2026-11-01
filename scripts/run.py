@@ -38,6 +38,8 @@ K2_SPARK_WIDTH = '6'
 # The bank directory holds its manifest, receipts and placement; the placement states every VRAM slot (each K3
 # layer's capacity restated in 13.3 MB slots), and ds41d gives each width its own slot class. Drafting as K2.
 MIXED_PLACEMENT = None   # the bank's mixed-p80.placement unless set (the lab sets a trimmed copy)
+# "experts": "sero" (s0ma change 15, scripts/sero_bank.py): 0xSero's 2.7 bpw quant's routed experts (a width each,
+# K2..K5), the quality baseline. Its bank directory has the same files as a mixed bank and runs the same way.
 K2_ENV = {'DS41_SPARK_STOP_Q': '0.2',
           # s0ma change 14: a verify step's dense rows in one cuBLAS call where the load check found it bit-identical
           # (+1.7 tok/s on K2, 58.3 -> 60.1). At run time ~2 in 5,000 such calls round differently (a K3 run's
@@ -129,16 +131,22 @@ def configuration():
         raise ValueError('gds must be "auto", true or false')
     if not (isinstance(cfg['max_context'], int) and 4096 <= cfg['max_context'] <= 1048576):
         raise ValueError('max_context must be 4096..1048576')
-    if cfg['experts'] not in ('native', 'k3', 'k2', 'mixed'):
-        raise ValueError('experts must be "native", "k3", "k2" or "mixed"')
+    if cfg['experts'] not in ('native', 'k3', 'k2', 'mixed', 'sero'):
+        raise ValueError('experts must be "native", "k3", "k2", "mixed" or "sero"')
     cfg['k3_bank'] = str((ROOT / Path(cfg['k3_bank']).expanduser()).resolve())
     cfg['k2_bank'] = str((ROOT / Path(cfg.get('k2_bank', 'models/k2-bank')).expanduser()).resolve())
     cfg['mixed_bank'] = str((ROOT / Path(cfg.get('mixed_bank', 'models/mixed-bank')).expanduser()).resolve())
+    cfg['sero_bank'] = str((ROOT / Path(cfg.get('sero_bank', 'models/sero-bank')).expanduser()).resolve())
     return cfg
 
 
+def bank_dir(cfg):
+    """the mixed-width bank's directory: the sero bank for "sero", the assembled mixed bank for "mixed\""""
+    return Path(cfg['sero_bank'] if cfg['experts'] == 'sero' else cfg['mixed_bank'])
+
+
 def mixed_placement(cfg):
-    return Path(MIXED_PLACEMENT) if MIXED_PLACEMENT else Path(cfg['mixed_bank']) / 'mixed-p80.placement'
+    return Path(MIXED_PLACEMENT) if MIXED_PLACEMENT else bank_dir(cfg) / 'mixed-p80.placement'
 
 
 def placement_slots(path):
@@ -213,7 +221,7 @@ def command(cfg, socket):
     dist, assets = Path(cfg['build']) / 'dist', Path(cfg['assets'])
     k3 = cfg['experts'] == 'k3'
     k2 = cfg['experts'] == 'k2'
-    mixed = cfg['experts'] == 'mixed'
+    mixed = cfg['experts'] in ('mixed', 'sero')
     cmd = [str(dist / 'ds41d'), 'serve', '--socket', str(socket),
            '--weights', cfg['weights'], '--receipt', str(assets / 'full-integrity.json'),
            '--auxiliary', str(assets / 'auxiliary.json'), '--engram', str(assets / 'engram.json'),
@@ -234,7 +242,7 @@ def command(cfg, socket):
         bank = Path(cfg['k2_bank'])
         cmd += ['--exl3-experts', str(bank / 'records-k2.tsv'), '--exl3-receipts', str(bank / 'receipts.json')]
     if mixed:
-        bank = Path(cfg['mixed_bank'])
+        bank = bank_dir(cfg)
         cmd += ['--exl3-experts', str(bank / 'records-mixed.tsv'), '--exl3-receipts', str(bank / 'receipts.json')]
     return cmd
 
@@ -244,7 +252,7 @@ def environment(cfg, render=True):
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DS41_', 'CUFILE_'))}
     env.pop('LD_PRELOAD', None)
     env.update(ENGINE_ENV)
-    if cfg.get('experts') in ('k2', 'mixed'):
+    if cfg.get('experts') in ('k2', 'mixed', 'sero'):
         env.update(K2_ENV)
     # the pinned cuBLAS pair (dist/blas) before CUDA 13.4's own libraries (cudart, cuFile)
     env['LD_LIBRARY_PATH'] = f'{dist}:{dist}/blas:{cuda_lib()}'
@@ -275,6 +283,8 @@ def preflight(cfg):
         raise RuntimeError(f'No 3-bit expert bank at {cfg["k3_bank"]}: run scripts/k3_bank.py fetch {cfg["k3_bank"]}')
     if cfg['experts'] == 'k2' and not K2_PLACEMENT.exists():
         raise RuntimeError(f'No {K2_PLACEMENT.name}: run scripts/k2_bank.py placement')
+    if cfg['experts'] == 'sero' and not (bank_dir(cfg) / 'records-mixed.tsv').exists():
+        raise RuntimeError(f'No sero bank at {cfg["sero_bank"]}: run scripts/sero_bank.py fetch {cfg["sero_bank"]}')
     if cfg['experts'] == 'mixed' and not (Path(cfg['mixed_bank']) / 'records-mixed.tsv').exists():
         raise RuntimeError(f'No mixed bank at {cfg["mixed_bank"]}: run scripts/mixed_bank.py build {cfg["mixed_bank"]} '
                            '--k2 K2_BANK --k3 K3_BANK')

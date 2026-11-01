@@ -34,13 +34,20 @@ void SlotPool::policy(const Placement& p) {
     }
     budgets_=std::any_of(layer_budgets_.begin(),layer_budgets_.end(),[](size_t n){return n!=0;});
 }
-void SlotPool::classes(std::vector<uint8_t> slot_class,const std::array<uint8_t,43>& layer_class){
+void SlotPool::classes(std::vector<uint8_t> slot_class,std::vector<uint8_t> expert_class){
     if(slot_class.size()!=slots_.size())throw std::invalid_argument("slot classes must cover every slot");
+    if(expert_class.size()!=expert_count)throw std::invalid_argument("expert classes must cover every expert");
     for(const auto& s:slots_)if(s.id>=0)throw std::logic_error("slot classes require an empty pool");
-    slot_class_=std::move(slot_class);layer_class_=layer_class;classed_=true;dirty_.fill(true);
+    slot_class_=std::move(slot_class);expert_class_=std::move(expert_class);classed_=true;dirty_.fill(true);
+    uniform_=true;
+    for(unsigned l=0;l<43;++l){
+        unsigned first=expert_id(l,0),end=first+(l<40?384:128);
+        layer_class_[l]=expert_class_[first];
+        for(unsigned e=first;e<end;++e)if(expert_class_[e]!=layer_class_[l])uniform_=false;
+    }
 }
-int SlotPool::class_of(ExpertId id)const{return classed_?int(layer_class_[layer_of(id)]):-1;}
-bool SlotPool::fits(size_t slot,ExpertId e)const{return !classed_ || slot_class_[slot]==layer_class_[layer_of(e)];}
+int SlotPool::class_of(ExpertId id)const{return classed_?int(expert_class_[id]):-1;}
+bool SlotPool::fits(size_t slot,ExpertId e)const{return !classed_ || slot_class_[slot]==expert_class_[e];}
 void SlotPool::reset_history(){dirty_.fill(true);std::fill(frequency_.begin(),frequency_.end(),0);std::fill(last_use_.begin(),last_use_.end(),0);layer_clocks_.fill(0);clock_=0;}
 void SlotPool::touch(const std::vector<ExpertId>& ids){
     std::vector<ExpertId> unique;std::unordered_set<ExpertId> seen;
@@ -94,7 +101,7 @@ std::vector<SlotPool::Allocation> SlotPool::acquire(const std::vector<ExpertId>&
     if (ids.size() > available) throw std::runtime_error("need set exceeds unleased slot capacity; split the batch");
     if(classed_){
         std::array<size_t,256> need{},avail{};
-        for(auto e:ids)++need[layer_class_[layer_of(e)]];
+        for(auto e:ids)++need[expert_class_[e]];
         for(size_t j=0;j<slots_.size();++j){const auto& s=slots_[j];if(s.draining)continue;if(s.id<0 || wanted.count(s.id) || (!s.pinned && !s.leases && s.retention.use_count()<=1))++avail[slot_class_[j]];}
         for(size_t c=0;c<need.size();++c)if(need[c]>avail[c])throw std::runtime_error("need set exceeds unleased slot capacity of its size class; split the batch");
     }
@@ -110,7 +117,7 @@ std::vector<SlotPool::Allocation> SlotPool::acquire(const std::vector<ExpertId>&
         if (!hit) {
             for (size_t s = 0; s < slots_.size(); ++s) if (slots_[s].id < 0 && !slots_[s].draining && (!hard_ || slot_layers_[s]==layer_of(e)) && fits(s,e)) { slot = s; break; }
             if (slot < 0) {
-                if(fast_ && distinct_ && !hard_)slot=fast_victim(wanted,layer_counts,class_of(e));
+                if(fast_ && distinct_ && !hard_ && uniform_)slot=fast_victim(wanted,layer_counts,class_of(e));
                 else slot=scan_victim(wanted,layer_counts,hard_?int(layer_of(e)):-1,class_of(e));
             }
             if (slot < 0) throw std::logic_error("capacity precheck disagreed");
@@ -151,7 +158,7 @@ std::vector<SlotPool::Allocation> SlotPool::reserve(size_t target,const std::uno
     std::array<size_t,43> layer_counts{};
     for(const auto& s:slots_)if(s.id>=0 && !s.pinned)++layer_counts[layer_of(s.id)];
     while(idle<target) {
-        int slot=fast_ && distinct_?fast_victim(wanted,layer_counts,cls):scan_victim(wanted,layer_counts,-1,cls);
+        int slot=fast_ && distinct_ && uniform_?fast_victim(wanted,layer_counts,cls):scan_victim(wanted,layer_counts,-1,cls);
         if(slot<0)break;
         auto e=ExpertId(slots_[slot].id);
         dirty_[layer_of(e)]=true;++epochs_[layer_of(e)];--layer_counts[layer_of(e)];residency_[e]=-1;

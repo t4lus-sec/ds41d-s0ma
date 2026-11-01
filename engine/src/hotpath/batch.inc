@@ -554,6 +554,8 @@ void batch_head(BatchLane &lane,int row) {
     else blinear("head",f32.p,logits.p,V,H,m);
   }); });
   zc(host_alias(static_cast<float *>(host->data())+size_t(row)*V),logits.p,size_t(m)*V*4);
+  if(vlogits.p)   // s0ma change 29: a device copy for acceptance there; lane B writes its rows on its own stream
+    CK(cudaMemcpyAsync(static_cast<float *>(vlogits.p)+size_t(row)*V,logits.p,size_t(m)*V*4,cudaMemcpyDeviceToDevice,stream));
 }
 std::vector<std::vector<float>> batch_finish(int64_t pos,int m,const StepMarks &k) {
   const double start=k.start; const double io_before=k.io, route_before=k.route,

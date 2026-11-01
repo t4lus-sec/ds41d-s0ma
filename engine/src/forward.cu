@@ -319,6 +319,11 @@ class Native final : public Forward, public hotpath::GateEvidence {
   // s0ma change 10: DS41_ROWS_VERIFY=1 recomputes every batched cuBLAS call one row at a time outside graph capture
   // and logs the shapes where the bits differ ("rows verify: ..." on stderr). A diagnostic: it syncs every call.
   const bool rows_verify = [] { const char *v = std::getenv("DS41_ROWS_VERIFY"); return v && std::string(v) == "1"; }();
+  // s0ma change 29: the verify's logits also kept on the device, [6, V] f32, for acceptance there
+  // (DS41_SPARK_GPU_VERIFY=1; layer-major verify only); vlogits_rows is 0 when the last verify left none
+  const bool keep_device_logits = [] { const char *v = std::getenv("DS41_SPARK_GPU_VERIFY"); return v && std::string(v) == "1"; }();
+  Device vlogits;
+  int vlogits_rows = 0;
   Device rows_verify_buf;
   uint64_t rows_verify_calls = 0, rows_verify_bad = 0;
   std::set<std::tuple<int, int, int, int>> rows_verify_seen;
@@ -573,6 +578,7 @@ public:
          &logits,&top,&visible,&block_visible,&chosen_blocks,&candidate_ids,
          &candidate_top,&rows_raw,&scales_raw,&rows_bf,&engram_kv,&rows_interleaved})
       d->resize(d->bytes * 6);
+    if (keep_device_logits) vlogits.resize(size_t(6) * V * 4);
     host = std::make_unique<ds41::HostBuffer>(16 << 20, true);
     pages = std::make_unique<ds41::HostBuffer>(1 << 20, true);
     if (!c.fused_head_library.empty()) {
@@ -995,6 +1001,7 @@ public:
     capture_rows = pending;
     capture_committed = 0;
     std::vector<std::vector<float>> out;
+    vlogits_rows = 0;
     const double verify_begin=config.hotpath_profile?clock_ms():0;
     try {
       check_moe_retirement(false);
@@ -1004,6 +1011,7 @@ public:
         capture_slot = int(i);
         out.push_back(one(input[i], committed + i));
       }
+      if (config.batched_verify && vlogits.p) vlogits_rows = int(input.size());
       const double retire_begin=config.hotpath_profile?clock_ms():0;
       check_moe_retirement(true);
       if(config.hotpath_profile && config.batched_verify && !profile_steps.empty()) {
@@ -1016,6 +1024,10 @@ public:
       throw;
     }
     return out;
+  }
+  const float *device_logits(int &rows) const override {
+    rows = vlogits_rows;
+    return vlogits_rows ? static_cast<const float *>(vlogits.p) : nullptr;
   }
   void commit(size_t accepted) override {
     if (poisoned)

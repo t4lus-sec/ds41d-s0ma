@@ -172,6 +172,9 @@ public:
   virtual Json counters() const { return Json::object(); }
   virtual DemandCounters demand_counters() const;
   virtual DraftProvider *drafter() { return nullptr; }
+  // s0ma change 29: the last verify's logits, [its rows, vocab] f32 on the device, stream-ordered after verify()
+  // returned and valid until the next verify(); nullptr when the target keeps none (DS41_SPARK_GPU_VERIFY off).
+  virtual const float *device_logits(int &rows) const { rows = 0; return nullptr; }
 };
 std::unique_ptr<Forward> make_native(const Config &config);
 std::unique_ptr<Forward> make_spark_target(std::unique_ptr<Forward>,
@@ -241,6 +244,8 @@ struct DraftDraw {
   double confidence = 0;
   float head = std::numeric_limits<float>::quiet_NaN();
   const double *q = nullptr;
+  // s0ma change 29: with DS41_SPARK_GPU_VERIFY=1 q stays on the device (q is then nullptr): the drafter's slot k
+  const double *q_device = nullptr;
 };
 struct DraftContext {
   int anchor, maximum_width;
@@ -266,6 +271,15 @@ public:
   // s0ma: the same position's q, confidence and token computed on the device; false = use logits()
   virtual bool draw_gpu(int, int, double, double, uint64_t, uint64_t, uint32_t, uint32_t, DraftDraw &) {
     return false;
+  }
+  // s0ma change 29: acceptance on the device from the target's device logits and the q_device of draws 0..k-1
+  // (verify_draw.cu); false = run reject_sample on the host (fetch_q brings back a q that stayed on the device).
+  virtual bool verify_gpu(const std::vector<int> &, const std::vector<const double *> &, double, uint64_t,
+                          uint64_t, std::vector<int> &, size_t &, bool &) {
+    return false;
+  }
+  virtual void fetch_q(const double *, std::vector<double> &) {
+    throw std::logic_error("draft q on the device without a fetch");
   }
   virtual void observe(const DraftObservation &) = 0;
   virtual void complete(const DraftObservation &observation, bool censored) {

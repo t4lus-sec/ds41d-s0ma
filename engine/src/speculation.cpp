@@ -99,6 +99,14 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
     inputs_.push_back(anchor);
     std::vector<int> proposals;
     std::vector<Distribution> q;
+    // s0ma change 29: q_k's device copy when it stayed on the device (q[k] is then empty), else nullptr
+    std::vector<const double *> qdev;
+    auto push_gpu_q = [&](const DraftDraw &g) {
+      if (g.q) q.push_back(Distribution(g.q, g.q + target.vocab()));
+      else if (g.q_device) q.emplace_back();
+      else throw std::runtime_error("GPU draft draw returned no q");
+      qdev.push_back(g.q_device);
+    };
     const Rng rng{sampling.seed};
     if (width > 1) {
       double started = milliseconds();
@@ -130,12 +138,13 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
           if (on_gpu) {
             c = g.confidence;
             if (sampling.temperature != 0)
-              q.push_back(Distribution(g.q, g.q + target.vocab()));
+              push_gpu_q(g);
           } else if (sampling.temperature == 0) {
             auto d = probabilities(logits, 1, 1);
             c = *std::max_element(d.begin(), d.end());
           } else {
             q.push_back(probabilities(logits, sampling.temperature, sampling.top_p));
+            qdev.push_back(nullptr);
             c = *std::max_element(q.back().begin(), q.back().end());
           }
           confidence_.push_back(c);
@@ -151,7 +160,7 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
           const double scale = stop_scale_->empty() ? 1.0
               : (*stop_scale_)[std::min<size_t>(size_t(k), stop_scale_->size() - 1)];
           if (reach * c < stop_floor_ * scale) {
-            if (sampling.temperature != 0) q.pop_back();
+            if (sampling.temperature != 0) { q.pop_back(); qdev.pop_back(); }
             break;
           }
           reach *= c;
@@ -160,13 +169,15 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
         if (on_gpu) {
           token = g.token;
           if (sampling.temperature != 0 && q.size() == size_t(k))
-            q.push_back(Distribution(g.q, g.q + target.vocab()));
+            push_gpu_q(g);
         } else if (sampling.temperature == 0) {
           token = argmax(logits);
         } else {
-          if (q.size() == size_t(k))
+          if (q.size() == size_t(k)) {
             q.push_back(
                 probabilities(logits, sampling.temperature, sampling.top_p));
+            qdev.push_back(nullptr);
+          }
           token = sample(q.back(), rng, step, uint32_t(k), Purpose::Draft);
         }
         proposals.push_back(token);
@@ -193,10 +204,31 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
     for (const auto &row : rows_)
       if (row.size() != size_t(target.vocab()))
         throw std::runtime_error("target vocabulary mismatch");
-    std::vector<Distribution> p =
-        probabilities_rows(rows_, sampling.temperature, sampling.top_p);
-    const double reject_start = milliseconds();
-    result_ = reject_sample(proposals, q, p, rng, step, sampling.temperature);
+    // s0ma change 29: acceptance on the device when every q is there (DS41_SPARK_GPU_VERIFY=1); the same
+    // uniforms and arithmetic, only the order of the fp64 sums differs (verify_draw.cu)
+    bool on_device = false;
+    if (draft && sampling.temperature > 0 && sampling.top_p == 1.0 && qdev.size() == proposals.size() &&
+        std::all_of(qdev.begin(), qdev.end(), [](const double *d) { return d != nullptr; })) {
+      Verification v;
+      on_device = draft->verify_gpu(proposals, qdev, std::max(sampling.temperature, 1e-5), rng.seed, step,
+                                    v.emitted, v.accepted, v.rejected);
+      if (on_device) {
+        v.accepted_input_rows = v.accepted + 1;
+        result_ = std::move(v);
+      }
+    }
+    double reject_start = milliseconds();
+    if (!on_device) {
+      for (size_t k = 0; k < q.size(); ++k)
+        if (q[k].empty()) {
+          if (!qdev[k]) throw std::logic_error("draft q missing");
+          draft->fetch_q(qdev[k], q[k]);
+        }
+      std::vector<Distribution> p =
+          probabilities_rows(rows_, sampling.temperature, sampling.top_p);
+      reject_start = milliseconds();
+      result_ = reject_sample(proposals, q, p, rng, step, sampling.temperature);
+    }
     const double reject_end = milliseconds();
     observed_.accepted_drafts = result_.accepted;
     observed_.tested_drafts = result_.accepted + size_t(result_.rejected);

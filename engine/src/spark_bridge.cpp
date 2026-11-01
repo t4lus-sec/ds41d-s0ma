@@ -14,6 +14,11 @@ extern "C" size_t ds41_draft_draw_scratch_bytes();
 extern "C" int ds41_draft_draw_gpu(const float *logits, int n, double temperature, uint64_t seed, uint64_t step,
                                    uint32_t slot, uint32_t purpose, double *q, void *scratch, void **result,
                                    cudaStream_t stream);
+extern "C" size_t ds41_verify_draw_scratch_bytes();
+extern "C" size_t ds41_verify_draw_result_bytes();
+extern "C" int ds41_verify_draw_gpu(const float *logits, int n, int count, const double *const *q, const int32_t *d,
+                                    double temperature, uint64_t seed, uint64_t step, double *p, void *scratch,
+                                    void **result, cudaStream_t stream);
 namespace ds41e {
 #ifdef DS41_SPARK_NATIVE
 namespace {
@@ -70,6 +75,21 @@ class SparkTarget final : public Forward, public DraftProvider {
   // s0ma GPU draws: q [V] f64 and the kernels' scratch on the device, pinned copies for the host
   double *draw_q_dev_ = nullptr, *draw_q_host_ = nullptr;
   void *draw_scratch_ = nullptr, *draw_result_host_ = nullptr;
+  // s0ma change 29 (DS41_SPARK_GPU_VERIFY=1): q stays on the device, one slot a draft position ([5, V] f64), and the
+  // acceptance runs there (verify_draw.cu): p [6, V] f64, its scratch, a pinned copy of the result
+  // DS41_SPARK_GPU_VERIFY=check also reruns every step's acceptance on the host from the same logits and q,
+  // keeps the host's result and counts the steps whose results differ (spark_gpu_verify_mismatches)
+  static int gpu_verify_mode() {
+    static const int mode = [] {
+      const char *v = std::getenv("DS41_SPARK_GPU_VERIFY");
+      return !v ? 0 : std::string(v) == "1" ? 1 : std::string(v) == "check" ? 2 : 0;
+    }();
+    return mode;
+  }
+  static bool gpu_verify_on() { return gpu_verify_mode() != 0; }
+  double *verify_p_dev_ = nullptr;
+  void *verify_scratch_ = nullptr, *verify_result_host_ = nullptr;
+  uint64_t gpu_verify_steps_ = 0, gpu_verify_fallbacks_ = 0, gpu_verify_mismatches_ = 0;
   std::unique_ptr<float, decltype(&cudaFreeHost)> confidence_host_{[] { void *p = nullptr; if (cudaMallocHost(&p, sizeof(float)) != cudaSuccess) throw std::runtime_error("confidence host buffer"); return static_cast<float *>(p); }(), cudaFreeHost};
   int64_t tail_limit_ = 0, append_old_ = 0;
   std::string seed_mode_ = "unseeded";
@@ -417,7 +437,12 @@ public:
     out["spark_native_candidate"] = true;
     out["spark_committed_inputs"] = ds41_spark_committed(spark_.get());
     out["spark_fixed_width"] = fixed_width_;
-    out["spark_sampling_path"] = "host-fp64-v2-UNQUALIFIED";
+    out["spark_sampling_path"] = gpu_verify_on() ? "device-fp64-v2-UNQUALIFIED" : "host-fp64-v2-UNQUALIFIED";
+    if (gpu_verify_on()) {   // s0ma change 29
+      out["spark_gpu_verify_steps"] = gpu_verify_steps_;
+      out["spark_gpu_verify_fallbacks"] = gpu_verify_fallbacks_;
+    }
+    if (gpu_verify_mode() == 2) out["spark_gpu_verify_mismatches"] = gpu_verify_mismatches_;
     out["spark_seed_mode"] = seed_mode_;
     out["spark_append_restores"] = append_restores_;
     out["spark_draft_prior_scope"] =
@@ -527,8 +552,9 @@ public:
 #endif
     check();
     const size_t n = size_t(vocab());
+    if (k < 0 || k > 4) return false;
     if (!draw_q_dev_) {
-      cuda_checked(cudaMalloc(reinterpret_cast<void **>(&draw_q_dev_), n * sizeof(double)));
+      cuda_checked(cudaMalloc(reinterpret_cast<void **>(&draw_q_dev_), (gpu_verify_on() ? 5 : 1) * n * sizeof(double)));
       cuda_checked(cudaMalloc(&draw_scratch_, ds41_draft_draw_scratch_bytes()));
       cuda_checked(cudaMallocHost(reinterpret_cast<void **>(&draw_q_host_), n * sizeof(double)));
       cuda_checked(cudaMallocHost(&draw_result_host_, 64));
@@ -539,11 +565,12 @@ public:
     // probabilities() floors a positive temperature at 1e-5; zero is greedy
     const double t = temperature > 0 ? std::max(temperature, 1e-5) : 0.0;
     void *result = nullptr;
-    cuda_checked(cudaError_t(ds41_draft_draw_gpu(data, int(n), t, seed, step, slot, purpose, draw_q_dev_,
+    double *q_dev = draw_q_dev_ + (gpu_verify_on() ? size_t(k) * n : 0);
+    cuda_checked(cudaError_t(ds41_draft_draw_gpu(data, int(n), t, seed, step, slot, purpose, q_dev,
                                                  draw_scratch_, &result, stream)));
     cuda_checked(cudaMemcpyAsync(draw_result_host_, result, 24, cudaMemcpyDeviceToHost, stream));
     cuda_checked(cudaMemcpyAsync(confidence_host_.get(), confidence, sizeof(float), cudaMemcpyDeviceToHost, stream));
-    if (t > 0)
+    if (t > 0 && !gpu_verify_on())
       cuda_checked(cudaMemcpyAsync(draw_q_host_, draw_q_dev_, n * sizeof(double), cudaMemcpyDeviceToHost, stream));
     cuda_checked(cudaStreamSynchronize(stream));
     const auto *r = static_cast<const char *>(draw_result_host_);
@@ -557,9 +584,72 @@ public:
     out.token = token;
     out.confidence = c;
     out.head = last_confidence_;
-    out.q = t > 0 ? draw_q_host_ : nullptr;
+    out.q = t > 0 && !gpu_verify_on() ? draw_q_host_ : nullptr;
+    out.q_device = t > 0 && gpu_verify_on() ? q_dev : nullptr;
     return true;
   }
+  // s0ma change 29: speculative acceptance on the device; false (and the host path) whenever it cannot or the
+  // device reports what the host would reject, so the host's own checks report it
+  bool verify_gpu(const std::vector<int> &proposals, const std::vector<const double *> &q, double temperature,
+                  uint64_t seed, uint64_t step, std::vector<int> &emitted, size_t &accepted,
+                  bool &rejected) override {
+    if (!gpu_verify_on() || !(temperature > 0) || proposals.size() > 5 || q.size() != proposals.size()) return false;
+    check();
+    int rows = 0;
+    const float *logits = target_->device_logits(rows);
+    const size_t n = size_t(vocab());
+    if (!logits || rows != int(proposals.size()) + 1) { ++gpu_verify_fallbacks_; return false; }
+    if (!verify_p_dev_) {
+      cuda_checked(cudaMalloc(reinterpret_cast<void **>(&verify_p_dev_), 6 * n * sizeof(double)));
+      cuda_checked(cudaMalloc(&verify_scratch_, ds41_verify_draw_scratch_bytes()));
+      cuda_checked(cudaMallocHost(&verify_result_host_, ds41_verify_draw_result_bytes()));
+    }
+    std::vector<int32_t> d(proposals.begin(), proposals.end());
+    auto stream = static_cast<cudaStream_t>(weights_.cuda_stream);
+    void *result = nullptr;
+    cuda_checked(cudaError_t(ds41_verify_draw_gpu(logits, int(n), int(d.size()), q.data(), d.data(), temperature,
+                                                  seed, step, verify_p_dev_, verify_scratch_, &result, stream)));
+    cuda_checked(cudaMemcpyAsync(verify_result_host_, result, ds41_verify_draw_result_bytes(),
+                                 cudaMemcpyDeviceToHost, stream));
+    cuda_checked(cudaStreamSynchronize(stream));
+    int32_t r[10];   // tokens[6], emitted, accepted, rejected, error
+    std::memcpy(r, verify_result_host_, sizeof(r));
+    if (r[9] || r[6] < 1 || r[6] > int32_t(proposals.size()) + 1 || r[7] < 0 || r[7] > r[6]) {
+      ++gpu_verify_fallbacks_;
+      return false;
+    }
+    for (int i = 0; i < r[6]; ++i)
+      if (r[i] < 0 || size_t(r[i]) >= n) { ++gpu_verify_fallbacks_; return false; }
+    emitted.assign(r, r + r[6]);
+    accepted = size_t(r[7]);
+    rejected = r[8] != 0;
+    ++gpu_verify_steps_;
+    if (gpu_verify_mode() == 2) {   // the host's acceptance on the same inputs; its result is the one used
+      std::vector<std::vector<float>> x(static_cast<size_t>(rows), std::vector<float>(n));
+      for (int i = 0; i < rows; ++i)
+        cuda_checked(cudaMemcpyAsync(x[i].data(), logits + size_t(i) * n, n * 4, cudaMemcpyDeviceToHost, stream));
+      std::vector<Distribution> qh(q.size());
+      for (size_t k = 0; k < q.size(); ++k) fetch_q(q[k], qh[k]);
+      cuda_checked(cudaStreamSynchronize(stream));
+      const auto host = reject_sample(proposals, qh, probabilities_rows(x, temperature, 1.0), Rng{seed}, step,
+                                      temperature);
+      if (host.emitted != emitted || host.accepted != accepted || host.rejected != rejected) {
+        ++gpu_verify_mismatches_;
+        emitted = host.emitted;
+        accepted = host.accepted;
+        rejected = host.rejected;
+      }
+    }
+    return true;
+  }
+  void fetch_q(const double *q_device, std::vector<double> &out) override {
+    const size_t n = size_t(vocab());
+    out.resize(n);
+    auto stream = static_cast<cudaStream_t>(weights_.cuda_stream);
+    cuda_checked(cudaMemcpyAsync(out.data(), q_device, n * sizeof(double), cudaMemcpyDeviceToHost, stream));
+    cuda_checked(cudaStreamSynchronize(stream));
+  }
+  const float *device_logits(int &rows) const override { return target_->device_logits(rows); }
   std::vector<float> logits(int k, int previous) override {
     check();
 #ifdef DS41_SPARK_POLICY_V2

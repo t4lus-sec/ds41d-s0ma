@@ -490,6 +490,39 @@ class Native final : public Forward, public hotpath::GateEvidence {
   struct PrefillData;
   std::unique_ptr<PrefillData> pref;
   std::unique_ptr<ds41e::prefill::Stager> prefill_stage;
+  // s0ma change 27: prefill lanes. A prompt's experts already in VRAM run on side streams, each with its own scratch,
+  // beside the staged sweep on the main stream (DS41_PREFILL_LANES=N: N-1 side lanes; 1 = published, everything on
+  // one stream). Each expert's math is unchanged and its rows land in their own slots of `routed`.
+  struct PrefillLane {
+    Device bxh, bw, gate, up, act, down;
+    cudaStream_t s = nullptr;
+    cudaEvent_t done = nullptr;
+  };
+  std::vector<std::unique_ptr<PrefillLane>> prefill_side;
+  int prefill_lanes() {
+    static const int n = [] {
+      const char *v = std::getenv("DS41_PREFILL_LANES");
+      const int x = v && *v ? std::atoi(v) : 1;
+      if (x < 1 || x > 8) throw std::invalid_argument("DS41_PREFILL_LANES must be 1..8");
+      return x;
+    }();
+    return n;
+  }
+  PrefillLane &prefill_lane(size_t i) {   // side lane i (0-based), created on first use
+    while (prefill_side.size() <= i) {
+      auto L = std::make_unique<PrefillLane>();
+      L->bxh.resize(size_t(256) * H * 2); L->bw.resize(256 * 4); L->gate.resize(size_t(256) * I * 2);
+      L->up.resize(size_t(256) * I * 2); L->act.resize(size_t(256) * I * 2); L->down.resize(size_t(256) * H * 2);
+      CK(cudaStreamCreateWithFlags(&L->s, cudaStreamNonBlocking));
+      CK(cudaEventCreateWithFlags(&L->done, cudaEventDisableTiming));
+      prefill_side.push_back(std::move(L));
+    }
+    return *prefill_side[i];
+  }
+  int prefill_variant(cudaStream_t s) {   // 0: the main stream's scratch; i + 1: side lane i
+    for (size_t i = 0; i < prefill_side.size(); ++i) if (prefill_side[i]->s == s) return int(i) + 1;
+    return 0;
+  }
   ds41e::prefill::TransferStats prefill_transfers;
   size_t prefill_vram_hits=0;
   std::vector<ds41::Record> prefill_records;

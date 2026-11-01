@@ -68,6 +68,7 @@ template<class Store> std::vector<uint8_t> p_residency(Store& store) {
 }
 template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
   prefill_transfers={};prefill_vram_hits=0;
+  int side_pending=0;
   auto lease=pborrow(*experts,ids);
   std::set<ds41::ExpertId> hits;std::vector<ds41::ExpertId> misses;
   try {
@@ -77,9 +78,27 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
     }
     prefill_vram_hits=hits.size();
     for(auto id:ids)if(!hits.count(id))misses.push_back(id);
-    for(auto id:hits)consume(id,experts->table(),stream);
+    const int sides=exl3?prefill_lanes()-1:0;
+    if(sides>0 && !hits.empty()) {
+      // s0ma change 27: resident experts on the side lanes, round robin, beside the staged sweep below; joined (and
+      // their lease retired) before this layer's epilogue reads `routed`
+      cudaEvent_t start=prefill_lane(size_t(sides-1)).done;   // any lane's event: recorded, then waited at once
+      CK(cudaEventRecord(start,stream));
+      for(int i=0;i<sides;++i)CK(cudaStreamWaitEvent(prefill_lane(size_t(i)).s,start,0));
+      size_t k=0;
+      for(auto id:hits)consume(id,experts->table(),prefill_lane(k++%size_t(sides)).s);
+      for(int i=0;i<sides;++i){auto &L=prefill_lane(size_t(i));CK(cudaEventRecord(L.done,L.s));}
+      side_pending=sides;
+    } else for(auto id:hits)consume(id,experts->table(),stream);
+    if(!side_pending && lease.serial)experts->retire(std::move(lease),stream);
+  }catch(...){cudaStreamSynchronize(stream);for(auto &L:prefill_side)cudaStreamSynchronize(L->s);side_pending=0;
+    if(lease.serial&&lease.owner)experts->retire(std::move(lease),stream);throw;}
+  auto join=[&]{   // s0ma change 27: the main stream waits for the side lanes, then the resident lease ends
+    if(!side_pending)return;
+    for(int i=0;i<side_pending;++i)CK(cudaStreamWaitEvent(stream,prefill_side[size_t(i)]->done,0));
+    side_pending=0;
     if(lease.serial)experts->retire(std::move(lease),stream);
-  }catch(...){cudaStreamSynchronize(stream);if(lease.serial&&lease.owner)experts->retire(std::move(lease),stream);throw;}
+  };
   if(!misses.empty()) {
     if(!prefill_stage){
       // s0ma change 26: DS41_PREFILL_STAGE_SLOTS=N (2..64; published 8) deepens the prompt sweep's staging ring. Sero's
@@ -97,8 +116,10 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
         return ds41e::prefill::HostView{v.data,v.record.bytes,lease};
       return ds41e::prefill::HostView{};
     };
-    prefill_transfers=prefill_stage->stream(misses,stream,consume,lookup,[&]{p_engram_barrier();});
+    try{prefill_transfers=prefill_stage->stream(misses,stream,consume,lookup,[&]{p_engram_barrier();});}
+    catch(...){join();throw;}
   }
+  join();
 }
 void p_engram_barrier() {
   if(!async_engram)return;
@@ -222,7 +243,8 @@ Json pmoe(int l,ds41e::prefill::Span span) {
     const char* bucket=n==1?"1":n==2?"2":n<=8?"3-8":n<=32?"9-32":n<=256?"33-256":"257+";
     distribution[bucket]=distribution[bucket].get<size_t>()+1;
   }
-  size_t descriptor_bytes=(chunks*3*sizeof(ds41::GemmJob)+63)&~size_t(63);
+  const size_t variants=exl3?size_t(prefill_lanes()):1;   // s0ma change 27: each lane's jobs point at its own scratch
+  size_t descriptor_bytes=(variants*chunks*3*sizeof(ds41::GemmJob)+63)&~size_t(63);
   pf.descriptors=std::make_unique<ds41::HostBuffer>(descriptor_bytes+count*6*4,true);
   auto* cpu_jobs=static_cast<ds41::GemmJob*>(pf.descriptors->data());
   auto* gpu_jobs=static_cast<ds41::GemmJob*>(pf.descriptors->device_data());
@@ -244,6 +266,12 @@ Json pmoe(int l,ds41e::prefill::Span span) {
       cpu_jobs[job+1]={id,m,x,xs,pf.up.as<Bf16>()};
       cpu_jobs[job+2]=exl3?ds41::GemmJob{id,m,pf.act.as<uint8_t>(),nullptr,pf.down.as<Bf16>()}:
           ds41::GemmJob{id,m,pf.eq.as<uint8_t>(),pf.es.as<uint8_t>(),pf.down.as<Bf16>()};
+      for(size_t v=1;v<variants;++v){   // s0ma change 27: the same jobs on side lane v-1's scratch
+        auto &L=prefill_lane(v-1);auto *J=cpu_jobs+v*chunks*3+job;
+        J[0]={id,m,L.bxh.as<uint8_t>(),nullptr,L.gate.as<Bf16>()};
+        J[1]={id,m,L.bxh.as<uint8_t>(),nullptr,L.up.as<Bf16>()};
+        J[2]={id,m,L.act.as<uint8_t>(),nullptr,L.down.as<Bf16>()};
+      }
       batches[id].push_back({job,offset,m});job+=3;offset+=m;
     }
   }
@@ -259,14 +287,21 @@ Json pmoe(int l,ds41e::prefill::Span span) {
     auto &timer=*compute.at(dispatched++);CK(cudaEventRecord(timer.start,s));
     for(const auto &b:batches.at(id)) {
       if(exl3) {
+        const int v=prefill_variant(s);   // s0ma change 27: 0 = the main stream's scratch, else side lane v-1's
+        PrefillLane *L=v?prefill_side[size_t(v-1)].get():nullptr;
+        void *bxh=L?L->bxh.p:pf.bxh.p,*down=L?L->down.p:pf.down.p;
+        float *bw=L?L->bw.as<float>():pf.bw.as<float>();
+        Bf16 *gate=L?L->gate.as<Bf16>():pf.gate.as<Bf16>(),*up=L?L->up.as<Bf16>():pf.up.as<Bf16>(),
+            *act=L?L->act.as<Bf16>():pf.act.as<Bf16>();
+        const ds41::GemmJob *J=gpu_jobs+size_t(v)*chunks*3+b.job;
         ds41e::prefill::gather_routes_bf16(pf.ffn_input.as<char>(base*H*2),pf.weights.as<float>(base*6*4),
-            gpu_slots+b.offset,pf.bxh.p,pf.bw.as<float>(),b.rows,s);
+            gpu_slots+b.offset,bxh,bw,b.rows,s);
         const int bits=width_of.empty()?expert_bits(int(id/384)):width_of[id];   // s0ma changes 12, 15: this expert's width
-        CK(ds41::grouped_exl3_prefill_bits(table,gpu_jobs+b.job,1,ds41::Projection::Gate,I,H,b.rows,bits,s));
-        CK(ds41::grouped_exl3_prefill_bits(table,gpu_jobs+b.job+1,1,ds41::Projection::Up,I,H,b.rows,bits,s));
-        CK(ds41::swiglu(pf.gate.as<Bf16>(),pf.up.as<Bf16>(),pf.bw.as<float>(),pf.act.as<Bf16>(),b.rows,I,10,s));
-        CK(ds41::grouped_exl3_prefill_bits(table,gpu_jobs+b.job+2,1,ds41::Projection::Down,H,I,b.rows,bits,s));
-        ds41e::prefill::scatter_routes(pf.down.p,gpu_slots+b.offset,pf.routed.as<char>(base*6*H*2),b.rows,s);
+        CK(ds41::grouped_exl3_prefill_bits(table,J,1,ds41::Projection::Gate,I,H,b.rows,bits,s));
+        CK(ds41::grouped_exl3_prefill_bits(table,J+1,1,ds41::Projection::Up,I,H,b.rows,bits,s));
+        CK(ds41::swiglu(gate,up,bw,act,b.rows,I,10,s));
+        CK(ds41::grouped_exl3_prefill_bits(table,J+2,1,ds41::Projection::Down,H,I,b.rows,bits,s));
+        ds41e::prefill::scatter_routes(down,gpu_slots+b.offset,pf.routed.as<char>(base*6*H*2),b.rows,s);
         CK(cudaGetLastError());
         continue;
       }

@@ -5,7 +5,8 @@ assembled from the two banks already on disk (no copies: the manifest points at 
   build OUT --k2 DIR --k3 DIR [--k3-layers 9,12,17,23-27,30-31,38]
       OUT/records-mixed.tsv  the K3 bank's records for the K3 layers and the K2 bank's for the others
       OUT/receipts.json      each layer's receipt from the bank its records come from (ds41d checks them at load)
-      OUT/mixed-p80.placement  k2-p80 with each K3 layer's VRAM capacity (pins + dynamic budget) restated in K3 slots
+      OUT/mixed-p80.placement  k2-p80 in the same VRAM bytes, every layer at the same share of its capacity
+                             (--alloc equal, the default; --alloc keep: K2 layers as k2-p80, K3 layers shrink)
       OUT/layers.json        {"k3_layers": [...], "k2": DIR, "k3": DIR, "expert_slots": N}
 
 The default K3 layers are where ISTA-DASLab's RCO allocation (arXiv 2605.00649) gave this model's routed experts
@@ -45,14 +46,27 @@ def records(path):
     return by
 
 
-def placement(src, k3_layers):
-    """k2-p80 with the K3 layers' VRAM capacity (pins + budget, in K2 slots) restated in K3 slots: the same bytes"""
+def placement(src, k3_layers, alloc='equal'):
+    """k2-p80 for a mixed bank, in the same VRAM bytes. alloc 'equal' (the default): every layer keeps the same share
+    of its k2-p80 capacity (pins + budget), each in its own slot size, so a K3 layer holds as many experts as a K2 one
+    of the same capacity. alloc 'keep': the K2 layers as k2-p80, each K3 layer's capacity restated in 13.3 MB slots
+    (its bytes kept: two thirds of the experts). The first bench (keep) put the K3 layers at the top of the wait list."""
     lines = Path(src).read_text().splitlines()
     pins = [0] * 43
     for x in lines:
         if x.startswith('vram '):
             e = int(x.split()[1])
             pins[e // 384 if e < 15360 else 40 + (e - 15360) // 128] += 1
+    cap = {int(x.split()[1]): pins[int(x.split()[1])] + int(x.split()[2]) for x in lines
+           if x.startswith('budget ') and int(x.split()[1]) < 40}
+    size = {ly: K3_REC if ly in k3_layers else K2_REC for ly in cap}
+    if alloc == 'equal':
+        share = sum(cap.values()) * K2_REC / sum(c * size[ly] for ly, c in cap.items())
+        new = {ly: int(c * share) for ly, c in cap.items()}
+    elif alloc == 'keep':
+        new = {ly: c * K2_REC // size[ly] for ly, c in cap.items()}
+    else:
+        raise ValueError('alloc is equal or keep')
     out, slots = [], 0
     for x in lines:
         if x.startswith('#'):
@@ -60,18 +74,17 @@ def placement(src, k3_layers):
         if x.startswith('budget '):
             _, ly, b = x.split()
             ly, b = int(ly), int(b)
-            if ly in k3_layers:
-                cap = (pins[ly] + b) * K2_REC // K3_REC
-                if cap < pins[ly]:
-                    raise SystemExit(f'layer {ly}: its {pins[ly]} pinned experts do not fit its VRAM at K3 ({cap} slots)')
-                b = cap - pins[ly]
             if ly < 40:
-                slots += pins[ly] + b
+                if new[ly] < pins[ly]:
+                    raise SystemExit(f'layer {ly}: its {pins[ly]} pinned experts do not fit its VRAM ({new[ly]} slots)')
+                b = new[ly] - pins[ly]
+                slots += new[ly]
             x = f'budget {ly} {b}'
         out.append(x)
-    head = [f'# DS41PLACEMENT01 mixed-p80 (scripts/mixed_bank.py): k2-p80 with layers {fmt(k3_layers)} at K3: their',
-            '# VRAM capacity (pins + dynamic budget) restated in 13.3 MB slots, the same bytes; the other layers as k2-p80.',
-            f'# {slots:,} target slots in all.']
+    used = sum(new[ly] * size[ly] for ly in new)
+    assert used <= sum(cap.values()) * K2_REC
+    head = [f'# DS41PLACEMENT01 mixed-p80 (scripts/mixed_bank.py, alloc {alloc}): k2-p80 with layers {fmt(k3_layers)} at K3,',
+            f'# in the same VRAM bytes ({used / 2**30:.2f} GiB of experts); {slots:,} target slots in all.']
     return head + out, slots
 
 
@@ -86,7 +99,7 @@ def fmt(layers):
     return ','.join(out)
 
 
-def build(out, k2, k3, k3_layers, root=Path(__file__).resolve().parents[1]):
+def build(out, k2, k3, k3_layers, root=Path(__file__).resolve().parents[1], alloc='equal'):
     out.mkdir(parents=True, exist_ok=True)
     m2, m3 = k2 / 'records-k2.tsv', k3 / 'records-k3.tsv'
     for m in (m2, m3):
@@ -115,13 +128,13 @@ def build(out, k2, k3, k3_layers, root=Path(__file__).resolve().parents[1]):
     src = root / 'profiles/k2-p80.placement'
     if not src.exists():
         k2_bank.placement(root)
-    text, slots = placement(src, set(k3_layers))
+    text, slots = placement(src, set(k3_layers), alloc)
     (out / 'mixed-p80.placement').write_text('\n'.join(text) + '\n')
     (out / 'layers.json').write_text(json.dumps({'k3_layers': k3_layers, 'k2': str(k2), 'k3': str(k3),
-                                                 'expert_slots': slots}) + '\n')
+                                                 'expert_slots': slots, 'alloc': alloc}) + '\n')
     gib = (sum(1 for _ in k3_layers) * K3_REC + (40 - len(k3_layers)) * K2_REC) * 384 / 2**30
     print(f'mixed bank in {out}: K3 layers {fmt(k3_layers)} ({len(k3_layers)} of 40), {gib:.0f} GiB of experts, '
-          f'{slots:,} VRAM slots ({(len(k3_layers) * 3 + (40 - len(k3_layers)) * 2) / 40:.2f} bits a weight on average)')
+          f'{slots:,} VRAM slots, alloc {alloc} ({(len(k3_layers) * 3 + (40 - len(k3_layers)) * 2) / 40:.2f} bits a weight on average)')
 
 
 def slots_of(path):
@@ -142,8 +155,10 @@ def main():
     p.add_argument('--k2', type=Path, required=True)
     p.add_argument('--k3', type=Path, required=True)
     p.add_argument('--k3-layers', default=DEFAULT_K3)
+    p.add_argument('--alloc', choices=['equal', 'keep'], default='equal',
+                   help='VRAM per layer: equal (the same share of each layer\'s k2-p80 capacity) or keep (K3 layers shrink)')
     a = p.parse_args()
-    build(a.out, a.k2.resolve(), a.k3.resolve(), parse_layers(a.k3_layers))
+    build(a.out, a.k2.resolve(), a.k3.resolve(), parse_layers(a.k3_layers), alloc=a.alloc)
 
 
 if __name__ == '__main__':

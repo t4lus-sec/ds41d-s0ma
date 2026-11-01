@@ -175,11 +175,19 @@ class ProfileTests(unittest.TestCase):
             src = Path(d) / 'k2.placement'
             src.write_text('pools soft\n' + ''.join(f'vram {l * 384 + e}\n' for l in range(40) for e in range(10)) +
                            ''.join(f'budget {l} 200\n' for l in range(43)) + 'host 7\nhost_budget 0 1\n')
-            text, slots = mixed_bank.placement(src, {9, 12})
+            text, slots = mixed_bank.placement(src, {9, 12}, 'keep')
             budgets = {int(x.split()[1]): int(x.split()[2]) for x in text if x.startswith('budget ')}
             self.assertEqual(budgets[9], (210 * 8892416 // 13316096) - 10)
             self.assertEqual(budgets[0], 200)
             self.assertEqual(slots, 38 * 210 + 2 * (210 * 8892416 // 13316096))
+            # equal: every layer the same share of its capacity, in the same bytes
+            eq, eq_slots = mixed_bank.placement(src, {9, 12})
+            nb = {int(x.split()[1]): int(x.split()[2]) for x in eq if x.startswith('budget ')}
+            share = 40 * 210 * 8892416 / (38 * 210 * 8892416 + 2 * 210 * 13316096)
+            self.assertEqual(nb[9] + 10, int(210 * share))
+            self.assertEqual(nb[0] + 10, int(210 * share))
+            self.assertLessEqual((38 * (nb[0] + 10)) * 8892416 + 2 * (nb[9] + 10) * 13316096, 40 * 210 * 8892416)
+            self.assertEqual(eq_slots, 40 * int(210 * share))
             out = Path(d) / 'mixed-p80.placement'
             out.write_text('\n'.join(text) + '\n')
             self.assertEqual(run.placement_slots(out), slots)

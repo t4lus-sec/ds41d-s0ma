@@ -356,7 +356,10 @@ struct OffloadStore::Impl {
         std::vector<SlotPool::Allocation> allocations;
         for(;;)try {allocations=pool.acquire(ids,is_prefetch);break;}
         catch(const std::runtime_error&) {
-            if(retired.empty())throw;
+            // s0ma: slots draining into RAM (demotion copies) come back too: wait for the oldest one if nothing
+            // retired is left to collect (with slot classes a small class can be all draining).
+            if(retired.empty() && draining.empty())throw;
+            if(retired.empty())ck(cudaEventSynchronize(draining.front().event));
             collect(true);
         }
         if(drift && policy_demand && drift_demand)drift->after(ids);
@@ -539,7 +542,15 @@ struct OffloadStore::Impl {
         bool waited=demote_eager;
         std::vector<SlotPool::Allocation> victims;
         if(!pool.classed())victims=pool.reserve(demote_reserve,wanted);
-        else for(size_t c=0;c<cfg.class_bytes.size();++c){auto v=pool.reserve(demote_reserve,wanted,int(c));victims.insert(victims.end(),v.begin(),v.end());}
+        else {
+            // s0ma: the reserve split by each class's share of the VRAM slots (at least 1): a full reserve in every
+            // class drained all of a small class's unpinned slots and left its experts nowhere to go.
+            size_t all=0;for(auto v:cfg.class_slots)all+=v;
+            for(size_t c=0;c<cfg.class_bytes.size();++c){
+                const size_t r=std::max<size_t>(1,(demote_reserve*cfg.class_slots[c]+all-1)/std::max<size_t>(1,all));
+                auto v=pool.reserve(r,wanted,int(c));victims.insert(victims.end(),v.begin(),v.end());
+            }
+        }
         for(auto v:victims) {
             auto x=ExpertId(v.evicted);
             ++counters.evictions;++counters.vram.evictions;

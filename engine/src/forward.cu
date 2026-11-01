@@ -1890,11 +1890,13 @@ private:
     std::vector<double> host_w(n, 0);
     for (size_t k = 0; k < n; ++k) bytes[k] = exl3_rec_of(widths[k]);
     std::vector<bool> pinned(15360);
-    for (auto id : pl.vram_pins) if (id < 15360) { pinned[id] = true; ++vram[ec.expert_class[id]]; }
+    std::vector<size_t> pins(n, 0), unpinned(n, 0), layer_max(n, 0);
+    for (auto id : pl.vram_pins) if (id < 15360) { pinned[id] = true; ++vram[ec.expert_class[id]]; ++pins[ec.expert_class[id]]; }
     for (int l = 0; l < 40; ++l) {
       std::vector<size_t> free_k(n, 0);
       size_t free_all = 0;
       for (int e = 0; e < 384; ++e) if (!pinned[l * 384 + e]) { ++free_k[ec.expert_class[l * 384 + e]]; ++free_all; }
+      for (size_t k = 0; k < n; ++k) { unpinned[k] += free_k[k]; layer_max[k] = std::max(layer_max[k], free_k[k]); }
       const size_t d = pl.dynamic_slots_per_layer[l];
       std::vector<size_t> part(n);
       std::vector<std::pair<double, size_t>> rest;
@@ -1913,6 +1915,28 @@ private:
     if (total != size_t(c.expert_slots))
       throw std::invalid_argument("a mixed bank's placement must state every VRAM slot: its pins and budgets give " +
                                   std::to_string(total) + ", --expert-slots is " + std::to_string(c.expert_slots));
+    // A width class that is small by count (0xSero's bank: 35 K5 experts) gets almost no dynamic slots from the
+    // count split, but one layer's need set (up to 6 rows x 6 experts; the previous layer's lease may still be held)
+    // plus the lookahead and the demotion reserve must fit in its unpinned slots, or acquire throws ("exceeds
+    // unleased slot capacity of its size class"). Raise such a class to that floor, paid in bytes by the class with
+    // the most dynamic bytes, so the VRAM spent on experts does not grow.
+    std::string floor_note;
+    for (size_t k = 0; k < n; ++k) {
+      const size_t floor_k = std::min(unpinned[k], 2 * std::min<size_t>(36, layer_max[k]) + 16);
+      const size_t dyn = vram[k] - pins[k];
+      if (dyn >= floor_k) continue;
+      size_t donor = n;
+      for (size_t j = 0; j < n; ++j)
+        if (j != k && (donor == n || (vram[j] - pins[j]) * bytes[j] > (vram[donor] - pins[donor]) * bytes[donor])) donor = j;
+      const size_t add = floor_k - dyn, take = (add * bytes[k] + bytes[donor] - 1) / bytes[donor];
+      if (donor == n || vram[donor] - pins[donor] < take + 64) continue;
+      vram[k] += add; vram[donor] -= take;
+      floor_note += " K" + std::to_string(widths[k]) + " +" + std::to_string(add) + " (from K" + std::to_string(widths[donor]) +
+                    " -" + std::to_string(take) + ")";
+    }
+    ec.slots = 0;
+    for (auto v : vram) ec.slots += v;
+    if (!floor_note.empty()) std::cerr << "mixed EXL3 store: small width classes raised to one layer's need set:" << floor_note << "\n";
     double hw = 0;
     for (auto w : host_w) hw += w;
     if (hw <= 0) for (size_t k = 0; k < n; ++k) { host_w[k] = double(std::count(width_of.begin(), width_of.end(), uint8_t(widths[k]))) * bytes[k]; hw += host_w[k]; }

@@ -96,7 +96,7 @@ __global__ void __cluster_dims__(1,1,4) __launch_bounds__(128) decode_split(cons
     __shared__ __align__(16) half A[8*G::W];
     __shared__ __align__(16) float red[8*128];
     const int warp=threadIdx.x/32,lane=threadIdx.x%32,wn=warp,wk=blockIdx.z;
-    constexpr int SLICES=G::SLICES,CHUNK=G::CHUNK,PF=4,WNT=2;
+    constexpr int SLICES=G::SLICES,CHUNK=G::CHUNK,PF=16,WNT=2;   // s0ma change 6: 16 loads in flight a warp (was 4)
     const int start=wk*CHUNK, len=max(0,min(CHUNK,SLICES-start));
     const int lo=(start*16)/128, hi=len?((start+len)*16+127)/128:lo, nb=hi-lo;
     const auto* x=reinterpret_cast<const __nv_bfloat16*>(job.x);

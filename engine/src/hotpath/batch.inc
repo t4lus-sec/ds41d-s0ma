@@ -220,7 +220,7 @@ float *lane_scores() const {
 // run on the current streams (h, after this layer's attention), then layer t's ffn_norm. Without DS41_LOOKAHEAD_HC
 // the lookahead reads this layer's own FFN input (f32: this layer's mix and norm), as published.
 const void *lookahead_input(int t,int m) {
-  if(!lookahead_hc) return f32.p;
+  if(!lookahead_hc || t<lookahead_hc) return f32.p;
   const std::string p="layers."+std::to_string(t);
   for(int r=0;r<m;++r)
     CK(ds41_dense_hc_mixes(blas,h.as<char>(size_t(r)*HC*H*2),w(p+".hc_attn_fn").data.as<float>(),

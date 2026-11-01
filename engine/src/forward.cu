@@ -288,7 +288,10 @@ class Native final : public Forward, public hotpath::GateEvidence {
   Device lookahead_router{8 * 384 * 4}, lookahead_unbiased{8 * 384 * 4}, lookahead_biased{8 * 384 * 4};
   // s0ma change 18 (DS41_LOOKAHEAD_HC=1): the lookahead's router input built with the target layer's own
   // hyper-connection mix and ffn_norm from the current streams (six rows; scratch apart from the step's own).
-  const bool lookahead_hc = [] { const char *v = std::getenv("DS41_LOOKAHEAD_HC"); return v && std::string(v) == "1"; }();
+  // s0ma change 21: DS41_LOOKAHEAD_HC=L applies it to target layers L and up ("1": all; 0 or unset: none). Sero's
+  // audit: recall up in layers 7-39 (15: 37 -> 84%, 19: 46 -> 87%), down in 1-6 (2: 43 -> 26%), where the attention
+  // still moves the streams most.
+  const int lookahead_hc = [] { const char *v = std::getenv("DS41_LOOKAHEAD_HC"); return v && *v ? std::max(0, std::atoi(v)) : 0; }();
   Device la_pre{6 * 4 * 4}, la_post{6 * 4 * 4}, la_comb{6 * 16 * 4}, la_mixes{6 * 24 * 4}, la_rstd{6 * 4},
       la_promoted{6 * HC * H * 4}, la_x{6 * H * 2}, la_in{6 * H * 4};
   int lookahead_m = 1, lookahead_n = 4;

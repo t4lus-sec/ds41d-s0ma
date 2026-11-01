@@ -222,8 +222,9 @@ int g_bits=3;
 bool valid(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k){
     return count>=0&&count<=65535&&int(p)>=0&&int(p)<=2&&n>0&&n%128==0&&k>0&&k%128==0&&k<=5120&&(count==0||(t&&j));
 }
-// s0ma: DS41_EXL3_SPLIT=0 keeps the one-CTA-per-tile kernel; any launch error of the cluster kernel falls back to it.
-bool split_on(){static const bool on=[]{const char*v=std::getenv("DS41_EXL3_SPLIT");return !(v&&v[0]=='0');}();return on;}
+// s0ma: the cluster kernel only with DS41_EXL3_SPLIT=1. Measured slower in place (K2, 1.8 rows: 5.36 + 2.76 ms a step
+// against decode()'s 4.73 + 1.95), so decode() stays the default; any launch error of the cluster kernel falls back.
+bool split_on(){static const bool on=[]{const char*v=std::getenv("DS41_EXL3_SPLIT");return v&&v[0]=='1';}();return on;}
 bool split_failed=false;
 template<int K,int BITS> cudaError_t launch_decode(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,cudaStream_t s){
     if(split_on()&&!split_failed&&count<=65535){

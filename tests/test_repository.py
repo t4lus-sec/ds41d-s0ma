@@ -158,6 +158,16 @@ class ProfileTests(unittest.TestCase):
         # the same expert VRAM as the native profile: K3 slots plus the drafter's 384 native experts
         self.assertLessEqual(run.K3_EXPERT_SLOTS * 13316096 + 384 * 18808832, run.EXPERT_SLOTS * 18808832)
 
+    def test_k2_drafting(self):
+        cfg = dict(self.config(), experts='k2', k2_bank='/data/ds41/k2-bank', gds=False)
+        with patch.object(run, 'meminfo', return_value={'MemTotal': 126573804 * 1024}):
+            cmd = run.command(cfg, Path('/run/ds41/engine.sock'))
+            native = run.command(dict(cfg, experts='native'), Path('/run/ds41/engine.sock'))
+        self.assertEqual(cmd[cmd.index('--spark-width') + 1], '6')
+        self.assertEqual(native[native.index('--spark-width') + 1], '4')
+        self.assertEqual(run.environment(cfg, render=False)['DS41_SPARK_STOP_Q'], '0.2')
+        self.assertEqual(run.environment(dict(cfg, experts='native'), render=False)['DS41_SPARK_STOP_Q'], '0.65')
+
     def test_environment(self):
         cfg = dict(self.config(), gds=False)
         env = run.environment(cfg, render=False)

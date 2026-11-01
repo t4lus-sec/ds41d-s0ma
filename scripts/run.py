@@ -30,6 +30,11 @@ K3_EXPERT_SLOTS = 5745
 # holds 8,602 target slots (k2-p80: the same pins, the dynamic budgets scaled again).
 K2_PLACEMENT = ROOT / 'profiles/k2-p80.placement'
 K2_EXPERT_SLOTS = 8602
+# K2's drafting, measured on the 64 GB box (s0ma, 2026-10-31; claude/ds41-serving.md): with the 2-bit bank a verify
+# row is cheap enough that longer drafts pay. STOP_Q 0.65 -> 0.2 and width 4 -> 6 took decode 54.7 -> 58.4 tok/s
+# (0.1: 56.1, 0.05: 55.4). Native and K3 keep their measured (published) drafting.
+K2_SPARK_WIDTH = '6'
+K2_ENV = {'DS41_SPARK_STOP_Q': '0.2'}
 # The measured host RAM tier. More RAM lowers NVMe reads (96 -> 104 GiB: +3.3% decode); larger tiers are untested.
 MAX_HOST_GIB = 104
 # The placement seeds 5,480 experts into the RAM tier (95.99 GiB), so the tier needs at least 96 GiB.
@@ -196,6 +201,8 @@ def command(cfg, socket):
         bank = Path(cfg['k3_bank'])
         cmd += ['--exl3-experts', str(bank / 'records-k3.tsv'), '--exl3-receipts', str(bank / 'receipts.json')]
     if k2:
+        # the first --spark-width is the profile's; one appended later (a lab A/B) still wins
+        cmd[cmd.index('--spark-width') + 1] = K2_SPARK_WIDTH
         bank = Path(cfg['k2_bank'])
         cmd += ['--exl3-experts', str(bank / 'records-k2.tsv'), '--exl3-receipts', str(bank / 'receipts.json')]
     return cmd
@@ -206,6 +213,8 @@ def environment(cfg, render=True):
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DS41_', 'CUFILE_'))}
     env.pop('LD_PRELOAD', None)
     env.update(ENGINE_ENV)
+    if cfg.get('experts') == 'k2':
+        env.update(K2_ENV)
     # the pinned cuBLAS pair (dist/blas) before CUDA 13.4's own libraries (cudart, cuFile)
     env['LD_LIBRARY_PATH'] = f'{dist}:{dist}/blas:{cuda_lib()}'
     if gds(cfg):

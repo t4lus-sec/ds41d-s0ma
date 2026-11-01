@@ -9,8 +9,8 @@ assembled from the two banks already on disk (no copies: the manifest points at 
                              (--alloc equal, the default; --alloc keep: K2 layers as k2-p80, K3 layers shrink)
       OUT/layers.json        {"k3_layers": [...], "k2": DIR, "k3": DIR, "expert_slots": N}
 
-The default K3 layers are where ISTA-DASLab's RCO allocation (arXiv 2605.00649) gave this model's routed experts
-more bits at 2.25 bpw. ds41d runs one store with a slot class per width, so a K2 expert never takes a K3-sized
+The default (~2.7 bits a weight) keeps K3 wherever ISTA-DASLab's RCO allocation (arXiv 2605.00649) or turboderp's
+quants give this model more bits, and K2 in the 12 layers neither singles out (6-8, 10, 11, 13-16, 18-20). ds41d runs one store with a slot class per width, so a K2 expert never takes a K3-sized
 slot; the placement states every VRAM slot so ds41d can size each class."""
 import argparse
 import json
@@ -21,7 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import k2_bank  # noqa: E402
 
 K2_REC, K3_REC = 8892416, 13316096
-DEFAULT_K3 = '9,12,17,23-27,30-31,38'
+# ~2.7 bits a weight (28 K3 layers, 12 K2): K2 only in layers that neither RCO's allocation for this model (9, 12,
+# 17, 23-27, 30-31, 38 get more bits) nor turboderp's quants (0-5, 35-39 get more) single out.
+DEFAULT_K3 = '0-5,9,12,17,21-39'
 
 
 def parse_layers(text):

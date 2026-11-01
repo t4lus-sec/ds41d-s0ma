@@ -167,6 +167,8 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(native[native.index('--spark-width') + 1], '4')
         self.assertEqual(run.environment(cfg, render=False)['DS41_SPARK_STOP_Q'], '0.2')
         self.assertEqual(run.environment(dict(cfg, experts='native'), render=False)['DS41_SPARK_STOP_Q'], '0.65')
+        self.assertEqual(run.environment(cfg, render=False)['DS41_ROWS_BATCHED'], '1')
+        self.assertNotIn('DS41_ROWS_BATCHED', run.environment(dict(cfg, experts='k3'), render=False))
 
     def test_mixed_profile(self):
         import tempfile
@@ -192,6 +194,9 @@ class ProfileTests(unittest.TestCase):
             out.write_text('\n'.join(text) + '\n')
             self.assertEqual(run.placement_slots(out), slots)
             self.assertEqual(mixed_bank.parse_layers('9,12,23-25'), [9, 12, 23, 24, 25])
+            k3 = mixed_bank.parse_layers(mixed_bank.DEFAULT_K3)
+            self.assertEqual(len(k3), 28)          # ~2.7 bits a weight
+            self.assertAlmostEqual((3 * len(k3) + 2 * (40 - len(k3))) / 40, 2.7)
             cfg = dict(self.config(), experts='mixed', mixed_bank=d, gds=False)
             with patch.object(run, 'MIXED_PLACEMENT', str(out)), \
                     patch.object(run, 'meminfo', return_value={'MemTotal': 126573804 * 1024}):

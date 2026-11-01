@@ -38,7 +38,12 @@ K2_SPARK_WIDTH = '6'
 # The bank directory holds its manifest, receipts and placement; the placement states every VRAM slot (each K3
 # layer's capacity restated in 13.3 MB slots), and ds41d gives each width its own slot class. Drafting as K2.
 MIXED_PLACEMENT = None   # the bank's mixed-p80.placement unless set (the lab sets a trimmed copy)
-K2_ENV = {'DS41_SPARK_STOP_Q': '0.2'}
+K2_ENV = {'DS41_SPARK_STOP_Q': '0.2',
+          # s0ma change 14: a verify step's dense rows in one cuBLAS call where the load check found it bit-identical
+          # (+1.7 tok/s on K2, 58.3 -> 60.1). At run time ~2 in 5,000 such calls round differently (a K3 run's
+          # verifier: 32x5120 BF16, 2 rows), so K3 keeps it off to stay token-exact with its published run; the lossy
+          # banks take the speed. DS41_ROWS_BATCHED=0 turns it off.
+          'DS41_ROWS_BATCHED': '1'}
 # The measured host RAM tier. More RAM lowers NVMe reads (96 -> 104 GiB: +3.3% decode); larger tiers are untested.
 MAX_HOST_GIB = 104
 # The placement seeds 5,480 experts into the RAM tier (95.99 GiB), so the tier needs at least 96 GiB.

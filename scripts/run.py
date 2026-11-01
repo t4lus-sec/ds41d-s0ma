@@ -105,6 +105,9 @@ ENGINE_ENV = {
     'DS41_MOE_FAST_MINIMA': '1',
     # an expert evicted from VRAM moves to the RAM tier instead of being dropped
     'DS41_MOE_DEMOTE': '1',
+    # s0ma change 28: a prompt's resident experts run on 3 side streams beside the staged sweep (EXL3 banks only;
+    # exact). Sero: first token 7.90 -> 6.60 s mean, 8K prompts 15.0-15.8 -> 12.5-13.1 s, decode unchanged (37.54)
+    'DS41_PREFILL_LANES': '4',
     # DSpark adaptive draft length. Before drafting token k the engine estimates its acceptance from the
     # drafter's top probability and confidence head (a logistic model), and stops when the expected gain no
     # longer pays for another verify row. The decision uses only what is known before token k is drawn, so

@@ -54,6 +54,13 @@ struct OffloadStore::Impl {
         if(policy_options.decay256 || policy_options.drift_0_50) {
             pool.decay_interval(256);if(host_pool)host_pool->decay_interval(256);
         }
+        if(long n=env_knob("DS41_VRAM_DECAY");n>=0)pool.decay_interval(unsigned(n));   // s0ma change 22
+    }
+    static long env_knob(const char* name){   // s0ma change 22: -1 when unset
+        const char* v=std::getenv(name);if(!v || !*v)return -1;
+        char* end=nullptr;const long n=std::strtol(v,&end,10);
+        if(*end || n<0 || n>1000000)throw std::invalid_argument(std::string(name)+" must be 0..1000000");
+        return n;
     }
     SlotPool pool;
     std::unique_ptr<SlotPool> host_pool;
@@ -773,6 +780,11 @@ void OffloadStore::cache_policy(CachePolicy options) {
 void OffloadStore::place(const Placement& input) {
     Placement p=input;
     if(impl_->policy_options.decay256 || impl_->policy_options.drift_0_50)p.decay_interval=256;
+    // s0ma change 22: the VRAM cache's LFU knobs for A/B benches (placement only, so tokens are unchanged):
+    // DS41_VRAM_RECENT=N (slots used in the last N touches of their layer are not evicted first; published 2) and
+    // DS41_VRAM_DECAY=N (counts decay every N touches of a layer; published 256 with decay256/drift, else 32).
+    if(long n=Impl::env_knob("DS41_VRAM_RECENT");n>=0)p.recent_window=unsigned(n);
+    if(long n=Impl::env_knob("DS41_VRAM_DECAY");n>=0)p.decay_interval=unsigned(n);
     // Placement is a startup operation; fixed allocations cannot grow here.
     impl_->submit([this,p]{
         if(!impl_->live.empty() || !impl_->retired.empty())throw std::logic_error("placement requires quiescent startup store");

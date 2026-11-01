@@ -585,6 +585,15 @@ void OffloadStore::stream_prefill(std::vector<ExpertId> ids,cudaStream_t stream,
 }
 OffloadStore::PrefetchTicket OffloadStore::prefetch(std::vector<ExpertId> ids,PrefetchPriority priority){return prefetch_impl(std::move(ids),priority,false);}
 OffloadStore::PrefetchTicket OffloadStore::prefetch_ram(std::vector<ExpertId> ids,PrefetchPriority priority){return prefetch_impl(std::move(ids),priority,true);}
+void OffloadStore::read_ahead(std::vector<ExpertId> ids){
+    if(!impl_->spec_n || ids.empty())return;
+    check_error();
+    impl_->submit([this,ids=std::move(ids)]{
+        std::vector<ExpertId> nvme;
+        for(auto id:ids)if(impl_->records.count(id) && !impl_->host.count(id) && impl_->pool.residency(id)<0)nvme.push_back(id);
+        impl_->spec_enqueue(nvme);
+    },int(PrefetchPriority::NextLayer));
+}
 OffloadStore::PrefetchTicket OffloadStore::prefetch_impl(std::vector<ExpertId> ids,PrefetchPriority priority,bool ram_only) {
     if(unsigned(priority)>2)throw std::invalid_argument("prefetch priority");
     struct State {

@@ -394,6 +394,11 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::unique_ptr<ds41::HostBuffer> lookahead_host;
   std::unique_ptr<Phase> lookahead_sync;
   int lookahead_layer = -1, lookahead_k = 6;
+  // s0ma change 11: DS41_LOOKAHEAD_NVME_DEPTH=D (2..3; default 0 = off) also scores layer l+D's router on layer l's
+  // input and hands its top DS41_LOOKAHEAD_K a row to the store's NVMe read-ahead (DS41_MOE_SPEC_NVME), so an NVMe
+  // read gets D layers of lead instead of one. A transfer hint like the lookahead: routing and outputs are unchanged.
+  int lookahead_far_depth = 0, lookahead_far_layer = -1;
+  std::unique_ptr<ds41::HostBuffer> lookahead_far_host;
   // DS41_LOOKAHEAD_AUDIT=path: per decode layer (m==1), each routed expert's tier at demand
   // (0 VRAM, 1 RAM, 2 NVMe) and its rank in the router lookahead made 1..3 layers earlier.
   // DS41_LOOKAHEAD_DRYRUN=1 scores without prefetching. Diagnostics only.
@@ -530,6 +535,10 @@ public:
       if (lookahead_k < 1 || lookahead_k > 32)
         throw std::invalid_argument("DS41_LOOKAHEAD_K must be 1..32");
       lookahead_host = std::make_unique<ds41::HostBuffer>(8 * 384 * 4, true);
+      if (const char *d = std::getenv("DS41_LOOKAHEAD_NVME_DEPTH")) lookahead_far_depth = std::stoi(d);
+      if (lookahead_far_depth && (lookahead_far_depth < 2 || lookahead_far_depth > 3))
+        throw std::invalid_argument("DS41_LOOKAHEAD_NVME_DEPTH must be 0, 2 or 3");
+      if (lookahead_far_depth) lookahead_far_host = std::make_unique<ds41::HostBuffer>(8 * 384 * 4, true);
       if (const char *n = std::getenv("DS41_LOOKAHEAD_N")) lookahead_n = std::stoi(n);
       if (lookahead_n < 1 || lookahead_n > 48) throw std::invalid_argument("DS41_LOOKAHEAD_N must be 1..48");
       if (const char *path = std::getenv("DS41_LOOKAHEAD_AUDIT")) {

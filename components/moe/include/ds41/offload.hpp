@@ -73,6 +73,9 @@ public:
     std::future<void> prefetch(std::vector<ExpertId> ids);
     PrefetchTicket prefetch(std::vector<ExpertId> ids,PrefetchPriority priority);
     PrefetchTicket prefetch_ram(std::vector<ExpertId> ids,PrefetchPriority priority=PrefetchPriority::NextLayer);
+    // s0ma change 11: hand predicted experts to the NVMe read-ahead (DS41_MOE_SPEC_NVME); only those on NVMe alone are
+    // read, into its pinned slots, never into VRAM or the RAM tier. A no-op when the read-ahead is off.
+    void read_ahead(std::vector<ExpertId> ids);
     // Caller grants an actual link-idle window. One record per admission,
     // no H2D, no policy credit; skip if copies/demand or the deadline intervene.
     PrefetchTicket refill_host(std::vector<ExpertId> ids,uint64_t idle_ns,size_t byte_budget);

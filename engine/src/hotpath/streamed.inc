@@ -100,6 +100,15 @@ void bmoe_streamed(const std::string &p,int m,const hotpath::RoutePlan &plan,
         predicted.push_back(ds41::ExpertId((layer+1)*384+c.second));
       prefetch_ram_experts(predicted);
     }
+    if(lookahead_far_layer>=0) {
+      // s0ma change 11: layer far's predicted experts, NVMe-only ones read ahead into pinned slots
+      const auto *far=static_cast<const float *>(lookahead_far_host->data());
+      std::vector<ds41::ExpertId> ids; std::set<int> seen;
+      for(int r=0;r<lookahead_m;++r)
+        for(int e:rank(far+r*384,lookahead_k)) if(seen.insert(e).second) ids.push_back(ds41::ExpertId(lookahead_far_layer*384+e));
+      lookahead_far_layer=-1;
+      if(!lookahead_dryrun) experts->read_ahead(std::move(ids));
+    }
   }
   // Predictions affect transfers only. They never choose target routing or
   // admission. Queued prefetch is bounded by the store's one-expert chunk.

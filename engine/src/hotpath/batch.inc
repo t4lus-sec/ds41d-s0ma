@@ -232,6 +232,18 @@ void bmoe_scores(int l,int m) {
       });
       zc(static_cast<float *>(lookahead_host->device_data())+(d-1)*384,lookahead_biased.p,m*384*4);
     }
+    const int far=l+lookahead_far_depth;
+    if(lookahead_far_depth && far<40 && !lookahead_audit.is_open()) {
+      // s0ma change 11: the same graph as layer far-1's own lookahead (same input, same scratch), for the read-ahead
+      const std::string next="layers."+std::to_string(far)+".ffn";
+      bgraph(next+".lookahead",m,[&]{
+        blinear(next+".gate",f32.p,lookahead_router.p,384,H,m);
+        CK(ds41_dense_router_scores(lookahead_router.as<float>(),w(next+".gate.bias").data.as<float>(),
+            lookahead_unbiased.as<float>(),lookahead_biased.as<float>(),m,384,stream));
+      });
+      zc(lookahead_far_host->device_data(),lookahead_biased.p,m*384*4);
+      lookahead_far_layer=far;
+    }
     CK(cudaEventRecord(lookahead_sync->end,stream));
     lookahead_layer=l+1; lookahead_m=m;
   }
@@ -385,7 +397,7 @@ void trim_attention_graphs(int layer,int rows,int scan) {
 struct BatchLane { int64_t pos=0; int m=0; std::array<std::vector<int64_t>,2> rowids; };
 struct StepMarks { double start=0,io=0,route=0,engram=0,plan=0,enqueue=0; ds41::Stats stats{}; };
 StepMarks step_marks(int64_t pos) {
-  lookahead_layer=-1;
+  lookahead_layer=-1; lookahead_far_layer=-1;
   audit_pos=pos;
   for(auto &layer:audit_pred) for(auto &v:layer) v.clear();
   StepMarks k;

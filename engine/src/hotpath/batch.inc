@@ -214,6 +214,25 @@ void battention(int l, int64_t pos, int m) {
 float *lane_scores() const {
   return reinterpret_cast<float *>(static_cast<char *>(host->data())+(lane_b_active?(size_t(3)<<20)+(size_t(1)<<19):0));
 }
+// s0ma change 18: what layer t's router would read if this layer's routed experts and the attention of the layers up
+// to t added nothing. DeepSeek V4 keeps four residual streams; a sublayer reads them mixed with weights the sublayer
+// before it computed (bhc's target_pre), then its norm. Layer t's FFN mix comes from layer t's attention mixes, here
+// run on the current streams (h, after this layer's attention), then layer t's ffn_norm. Without DS41_LOOKAHEAD_HC
+// the lookahead reads this layer's own FFN input (f32: this layer's mix and norm), as published.
+const void *lookahead_input(int t,int m) {
+  if(!lookahead_hc) return f32.p;
+  const std::string p="layers."+std::to_string(t);
+  for(int r=0;r<m;++r)
+    CK(ds41_dense_hc_mixes(blas,h.as<char>(size_t(r)*HC*H*2),w(p+".hc_attn_fn").data.as<float>(),
+        w(p+".hc_attn_scale").data.as<float>(),w(p+".hc_attn_base").data.as<float>(),
+        la_pre.as<float>(r*4*4),la_post.as<float>(r*4*4),la_comb.as<float>(r*16*4),
+        la_promoted.as<float>(size_t(r)*HC*H*4),la_mixes.as<float>(r*24*4),la_rstd.as<float>(r*4),
+        1,H,1e-20f,1e-6f,stream));
+  CK(ds41_dense_hc_pre(h.p,la_pre.as<float>(),la_x.p,m,H,stream));
+  bnorm(p+".ffn_norm",la_x.p,la_x.p,H,m);
+  bf16_float(la_x.p,la_in.as<float>(),m*H,stream);
+  return la_in.p;
+}
 // Front half of the MoE block: queue the route-score copy (and lookahead) behind the router.
 void bmoe_scores(int l,int m) {
   zc(host_alias(lane_scores()),biased.p,m*384*4);
@@ -226,7 +245,7 @@ void bmoe_scores(int l,int m) {
     for(int d=1;d<=depth && l+d<40;++d) {
       const std::string next="layers."+std::to_string(l+d)+".ffn";
       bgraph(next+".lookahead",m,[&]{
-        blinear(next+".gate",f32.p,lookahead_router.p,384,H,m);
+        blinear(next+".gate",lookahead_input(l+d,m),lookahead_router.p,384,H,m);
         CK(ds41_dense_router_scores(lookahead_router.as<float>(),w(next+".gate.bias").data.as<float>(),
             lookahead_unbiased.as<float>(),lookahead_biased.as<float>(),m,384,stream));
       });
@@ -237,7 +256,7 @@ void bmoe_scores(int l,int m) {
       // s0ma change 11: the same graph as layer far-1's own lookahead (same input, same scratch), for the read-ahead
       const std::string next="layers."+std::to_string(far)+".ffn";
       bgraph(next+".lookahead",m,[&]{
-        blinear(next+".gate",f32.p,lookahead_router.p,384,H,m);
+        blinear(next+".gate",lookahead_input(far,m),lookahead_router.p,384,H,m);
         CK(ds41_dense_router_scores(lookahead_router.as<float>(),w(next+".gate.bias").data.as<float>(),
             lookahead_unbiased.as<float>(),lookahead_biased.as<float>(),m,384,stream));
       });

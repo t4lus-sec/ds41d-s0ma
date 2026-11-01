@@ -375,7 +375,8 @@ struct OffloadStore::Impl {
         try {
             for(auto a:allocations) {
                 auto& layer=counters.layers[expert_layer(a.id)];
-                if(!is_prefetch){++counters.requests;++layer.requests;}
+                const size_t kc=std::min<size_t>(7,size_t(std::max(0,pool.class_of(a.id))));
+                if(!is_prefetch){++counters.requests;++layer.requests;++counters.class_requests[kc];if(a.hit)++counters.class_hits[kc];}
                 else ++counters.prefetch_requests;
                 if(a.hit){if(!is_prefetch){++counters.hits;++layer.hits;++counters.vram.hits;if(prefetched.erase(a.id))++counters.prefetch_used;}
                     continue;}
@@ -393,8 +394,8 @@ struct OffloadStore::Impl {
                 ck(cudaMemcpyAsync(table+a.id,views+a.id,sizeof(DeviceExpert),cudaMemcpyHostToDevice,mapping));
                 ck(cudaEventRecord(slot_mapping[a.slot],mapping));
                 auto h=host.find(a.id);
-                if(h==host.end()){disk.push_back(a);if(!is_prefetch){++counters.nvme_misses;++layer.nvme_misses;++counters.ram.misses;}}
-                else if(!is_prefetch){++counters.host_hits;++layer.host_hits;++counters.ram.hits;host_prefetched.erase(a.id);}
+                if(h==host.end()){disk.push_back(a);if(!is_prefetch){++counters.nvme_misses;++layer.nvme_misses;++counters.ram.misses;++counters.class_nvme_misses[kc];}}
+                else if(!is_prefetch){++counters.host_hits;++layer.host_hits;++counters.ram.hits;host_prefetched.erase(a.id);++counters.class_host_hits[kc];}
                 if(is_prefetch)prefetched.insert(a.id);
             }
             // Submit resident work first so a cold expert cannot head-of-line

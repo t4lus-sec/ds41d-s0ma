@@ -757,6 +757,12 @@ public:
         throw std::runtime_error("request tier counter moved backwards");
       out[key] = a - b;
     }
+    for (auto it = after.begin(); it != after.end(); ++it)   // s0ma change 18: demands by width class
+      if (it.key().rfind("expert_class_", 0) == 0 && it->is_number_unsigned()) {
+        const uint64_t a = it->get<uint64_t>(), b = before.value(it.key(), uint64_t(0));
+        if (a < b) throw std::runtime_error("request tier counter moved backwards");
+        out[it.key()] = a - b;
+      }
     for (const char *key :
          {"need_host_ms", "route_wait_ms", "engram_read_ms", "forward_ms"})
       if (after.contains(key))

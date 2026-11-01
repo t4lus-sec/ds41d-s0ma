@@ -228,6 +228,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
   Device expert_width_dev;            // the same on the device, for grouped_exl3_var
   bool exl3_mixed = false;
   uint64_t expert_payload_bytes = 0;   // the target store's VRAM slots in bytes (all classes)
+  std::vector<int> class_widths;       // s0ma change 18: the width of each slot class of a mixed bank
   std::string mixed_k3_layers;         // for the log and stats: "9,12,17,..."
   int expert_bits(int layer) const { return layer >= 0 && layer < 40 && layer_bits[layer] ? layer_bits[layer] : exl3_bits_loaded; }
   size_t expert_slot_bytes = 18808832;
@@ -285,6 +286,11 @@ class Native final : public Forward, public hotpath::GateEvidence {
   // --prefetch-lookahead scratch. lookahead_sync->start: route scores on host; ->end: predicted
   // scores for lookahead_layer on host.
   Device lookahead_router{8 * 384 * 4}, lookahead_unbiased{8 * 384 * 4}, lookahead_biased{8 * 384 * 4};
+  // s0ma change 18 (DS41_LOOKAHEAD_HC=1): the lookahead's router input built with the target layer's own
+  // hyper-connection mix and ffn_norm from the current streams (six rows; scratch apart from the step's own).
+  const bool lookahead_hc = [] { const char *v = std::getenv("DS41_LOOKAHEAD_HC"); return v && std::string(v) == "1"; }();
+  Device la_pre{6 * 4 * 4}, la_post{6 * 4 * 4}, la_comb{6 * 16 * 4}, la_mixes{6 * 24 * 4}, la_rstd{6 * 4},
+      la_promoted{6 * HC * H * 4}, la_x{6 * H * 2}, la_in{6 * H * 4};
   int lookahead_m = 1, lookahead_n = 4;
   std::unique_ptr<ds41::HostBuffer> spark_host;
   const bool prefill_chunk_fit = [] { const char *v = std::getenv("DS41_PREFILL_CHUNK_FIT"); return v && std::string(v) == "1"; }();
@@ -1017,6 +1023,13 @@ public:
               {"engram_read_ms", engram_ms},
               {"forward_ms", total_ms},
               {"stream_phase_ms_including_stalls", measured}};
+    for (size_t k = 0; k < class_widths.size() && k < 8; ++k) {   // s0ma change 18: demands by width class
+      const std::string c = "expert_class_K" + std::to_string(class_widths[k]) + "_";
+      j[c + "requests"] = s.class_requests[k] - initial_stats.class_requests[k];
+      j[c + "vram_hits"] = s.class_hits[k] - initial_stats.class_hits[k];
+      j[c + "host_hits"] = s.class_host_hits[k] - initial_stats.class_host_hits[k];
+      j[c + "nvme_misses"] = s.class_nvme_misses[k] - initial_stats.class_nvme_misses[k];
+    }
     {
       // DSpark drafter (MTP layers 40..42) share of the store traffic.
       uint64_t req=0,hit=0,host=0,nvme=0;
@@ -1896,6 +1909,7 @@ private:
     std::vector<int> widths;
     for (int b = 2; b <= 5; ++b) if (std::count(width_of.begin(), width_of.end(), uint8_t(b))) widths.push_back(b);
     const size_t n = widths.size();
+    class_widths = widths;
     std::array<int, 6> cls{};
     for (size_t k = 0; k < n; ++k) cls[widths[k]] = int(k);
     ec.expert_class.assign(ds41::expert_count, 0);

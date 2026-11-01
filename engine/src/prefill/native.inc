@@ -81,7 +81,15 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
     if(lease.serial)experts->retire(std::move(lease),stream);
   }catch(...){cudaStreamSynchronize(stream);if(lease.serial&&lease.owner)experts->retire(std::move(lease),stream);throw;}
   if(!misses.empty()) {
-    if(!prefill_stage)prefill_stage=std::make_unique<ds41e::prefill::Stager>(prefill_records,8);
+    if(!prefill_stage){
+      // s0ma change 26: DS41_PREFILL_STAGE_SLOTS=N (2..64; published 8) deepens the prompt sweep's staging ring. Sero's
+      // 1K+ prompts read the drive at 2.8-3.8 GB/s of its 7.2 over their sweeps: each slot's next read waits for the
+      // GEMM behind it. A slot is the largest record in VRAM and pinned RAM (~22 MB with K5 records).
+      size_t n=8;
+      if(const char* v=std::getenv("DS41_PREFILL_STAGE_SLOTS");v&&*v){n=size_t(std::strtoul(v,nullptr,10));
+        if(n<2||n>64)throw std::invalid_argument("DS41_PREFILL_STAGE_SLOTS must be 2..64");}
+      prefill_stage=std::make_unique<ds41e::prefill::Stager>(prefill_records,n);
+    }
     auto lookup=config.prefill_host_view;
     auto lease=std::make_shared<ds41::OffloadStore::HostLease>(experts->borrow_host(misses));
     if(!lookup)lookup=[lease](uint32_t id){

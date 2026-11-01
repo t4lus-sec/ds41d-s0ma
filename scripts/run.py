@@ -46,6 +46,9 @@ K2_ENV = {'DS41_SPARK_STOP_Q': '0.2',
           # verifier: 32x5120 BF16, 2 rows), so K3 keeps it off to stay token-exact with its published run; the lossy
           # banks take the speed. DS41_ROWS_BATCHED=0 turns it off.
           'DS41_ROWS_BATCHED': '1'}
+# s0ma change 20: 0xSero's bank splits its width classes' dynamic VRAM with K3 weighted 1.3 (change 19): 34.13 -> 35.04
+# tok/s, NVMe misses 21,915 -> 21,337 (K3:1.6 34.94). A lab --env DS41_CLASS_WEIGHTS=... still wins.
+SERO_ENV = {'DS41_CLASS_WEIGHTS': 'K3:1.3'}
 # The measured host RAM tier. More RAM lowers NVMe reads (96 -> 104 GiB: +3.3% decode); larger tiers are untested.
 MAX_HOST_GIB = 104
 # The placement seeds 5,480 experts into the RAM tier (95.99 GiB), so the tier needs at least 96 GiB.
@@ -254,6 +257,8 @@ def environment(cfg, render=True):
     env.update(ENGINE_ENV)
     if cfg.get('experts') in ('k2', 'mixed', 'sero'):
         env.update(K2_ENV)
+    if cfg.get('experts') == 'sero':
+        env.update(SERO_ENV)
     # the pinned cuBLAS pair (dist/blas) before CUDA 13.4's own libraries (cudart, cuFile)
     env['LD_LIBRARY_PATH'] = f'{dist}:{dist}/blas:{cuda_lib()}'
     if gds(cfg):

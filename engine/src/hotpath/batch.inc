@@ -27,8 +27,11 @@ void blinear(const std::string &prefix, const void *in, void *out,
     throw std::runtime_error("linear shape: "+prefix);
   if (weight.dtype == "F8_E4M3" || weight.dtype == "F8_E4M3FN") {
     if(!quant_ready) CK(ds41_dense_quant(in, aq.p, as.p, m, k, stream));
+    // s0ma: ds41d's own per-shape table (-1), as the drafter uses, unless DS41_FP8_VARIANT2=1. Every variant keeps
+    // each k32 dot and adds them in ascending K from zero, so only the tiling changes, never a sum.
+    static const int variant = [] { const char *v = std::getenv("DS41_FP8_VARIANT2"); return v && v[0] == '1' ? 2 : -1; }();
     CK(ds41_dense_fp8(aq.p, as.p, weight.data.p, w(prefix + ".scale").data.p,
-                      out, m, n, k, 2, stream));
+                      out, m, n, k, variant, stream));
   } else {
     // Keep the accepted M1 cuBLAS geometry. Batch-dependent reductions must
     // pass class N gates before a different geometry can replace these calls.
@@ -339,9 +342,14 @@ void bmoe(int l,int m) {
     throw;
   }
 }
+// s0ma: DS41_QUANT_REUSE=0 quantizes every projection's input again, as published
+static bool quant_reuse() {
+  static const bool on = [] { const char *v = std::getenv("DS41_QUANT_REUSE"); return !(v && v[0] == '0'); }();
+  return on;
+}
 void bshared(const std::string &p,int m) {
   blinear(p+".shared_experts.w1",x.p,sg.p,I,H,m);
-  blinear(p+".shared_experts.w3",x.p,su.p,I,H,m);
+  blinear(p+".shared_experts.w3",x.p,su.p,I,H,m,quant_reuse());   // s0ma: x is already quantized in aq/as
   CK(ds41::swiglu(sg.as<Bf16>(),su.as<Bf16>(),nullptr,sa.as<Bf16>(),m,I,10,stream));
   blinear(p+".shared_experts.w2",sa.p,shared.p,H,I,m);
 }
@@ -438,10 +446,14 @@ void batch_front(int l,BatchLane &lane) {
       }
       auto a=p+".attn";
       blinear(a+".wq_a",x.p,qa.p,1280,H,m,bool(fused));
+      // s0ma: without the fused library wkv reads the same x: run it now, while aq/as still hold x's quantization
+      // (wq_b requantizes qa into them). Each projection's inputs and outputs are unchanged.
+      const bool early_kv=!fused&&quant_reuse();
+      if(early_kv) blinear(a+".wkv",x.p,kv.p,512,H,m,true);
       if(fused) CK(fused->norm(qa.p,nullptr,w(a+".q_norm.weight").data.p,qa.p,nullptr,aq.p,as.p,m,1280,1e-20f,stream));
       else bnorm(a+".q_norm",qa.p,qa.p,1280,m);
       blinear(a+".wq_b",qa.p,q.p,32768,1280,m,bool(fused));
-      blinear(a+".wkv",x.p,kv.p,512,H,m);
+      if(!early_kv) blinear(a+".wkv",x.p,kv.p,512,H,m);
       if(!fused) bnorm(a+".kv_norm",kv.p,kv.p,512,m);
       bgate(base+hotpath::GateLayout::AttnPre,att_pre.p,16,m);
       bgate(base+hotpath::GateLayout::AttnPost,post.p,16,m);

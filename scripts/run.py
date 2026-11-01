@@ -61,6 +61,8 @@ ENGINE_FLAGS = [
     # DSpark speculative decoding with the checkpoint's own MTP layer: up to 4 drafted tokens per step,
     # verified by the target with exact rejection sampling
     '--spark', '--spark-width', '4',
+    # s0ma: retire each layer's expert lease without a blocking round trip to the store thread (measured exact)
+    '--async-retire',
     # score layer l+1's router on layer l's input and prefetch the predicted RAM-resident experts into VRAM
     # (a transfer hint: routing and outputs are unchanged)
     '--prefetch-lookahead',
@@ -87,6 +89,8 @@ ENGINE_ENV = {
     'DS41_LOOKAHEAD_K': '4', 'DS41_LOOKAHEAD_N': '2',
     # after a long appended turn the drafter restarts from the append's last 128 rows
     'DS41_SPARK_APPEND_RESTORE': '1',
+    # s0ma: each drafted position's q, confidence and draw computed on the GPU (measured exact, 14/14)
+    'DS41_SPARK_GPU_DRAW': '1',
     # long prompts split into prefill segments that fit the VRAM the expert cache leaves free
     'DS41_PREFILL_CHUNK_FIT': '1',
 }

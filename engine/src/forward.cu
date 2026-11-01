@@ -651,6 +651,19 @@ public:
           --*big; --planned; ++trimmed;
         }
         if (trimmed) std::cerr << "mixed EXL3 store: placement budgets trimmed by " << trimmed << " slots to the store's " << ec.slots << "\n";
+        // s0ma change 23: and grown, in proportion to each layer's budget, when the store has more (DS41_EXPERT_EXTRA_GIB)
+        if (planned < ec.slots) {
+          std::array<size_t, 43> pinsl{};
+          for (auto id : placement.vram_pins) ++pinsl[id < 15360 ? id / 384 : 40 + (id - 15360) / 128];
+          size_t room = ec.slots - planned, total = 0, grown = 0;
+          for (int l = 0; l < 40; ++l) total += d[l];
+          for (int l = 0; l < 40 && total; ++l) {
+            const size_t add = std::min(room * d[l] / total, 384 - pinsl[l] - d[l]);
+            d[l] += add; grown += add;
+          }
+          for (int l = 0; grown < room && l < 40; ++l) if (d[l] + pinsl[l] < 384) { ++d[l]; ++grown; }
+          std::cerr << "mixed EXL3 store: placement budgets grown by " << grown << " slots to the store's " << ec.slots << "\n";
+        }
       }
       experts->place(placement);
     }
@@ -1956,10 +1969,20 @@ private:
     // class k gets the share w_k x (its unpinned experts) x (its record size) of the same dynamic bytes (w = 1 for every
     // class gives back the count split above). Sero's first bench: per unpinned expert, K3 is demanded ~1.3x as often as
     // K2 and takes 60% of the NVMe misses.
-    if (const char *cw = std::getenv("DS41_CLASS_WEIGHTS"); cw && *cw) {
+    // s0ma change 23: DS41_EXPERT_EXTRA_GIB=N adds N GiB of dynamic expert slots beyond the placement's VRAM (ds41d
+    // leaves ~5 GiB free beside a mixed bank; prefill segments use free VRAM too), split between the classes as below.
+    double extra_gib = 0;
+    if (const char *x = std::getenv("DS41_EXPERT_EXTRA_GIB"); x && *x) {
+      char *end = nullptr;
+      extra_gib = std::strtod(x, &end);
+      if (*end || !(extra_gib >= 0) || extra_gib > 64) throw std::invalid_argument("DS41_EXPERT_EXTRA_GIB: 0..64 GiB");
+    }
+    const char *cw_env = std::getenv("DS41_CLASS_WEIGHTS");
+    if ((cw_env && *cw_env) || extra_gib > 0) {
+      const char *cw = cw_env && *cw_env ? cw_env : "";
       std::vector<double> wk(n, 1.0);
       std::string spec(cw), item;
-      for (size_t i = 0; i <= spec.size(); ++i) {
+      for (size_t i = 0; i < spec.size() + (spec.empty() ? 0 : 1); ++i) {
         if (i < spec.size() && spec[i] != ',') { item += spec[i]; continue; }
         if (item.size() < 4 || item[0] != 'K' || item[2] != ':') throw std::invalid_argument("DS41_CLASS_WEIGHTS: K<w>:<weight>, e.g. K3:1.3");
         const int b = item[1] - '0';
@@ -1970,8 +1993,10 @@ private:
       }
       double dyn_bytes = 0, denom = 0;
       for (size_t k = 0; k < n; ++k) { dyn_bytes += double(vram[k] - pins[k]) * bytes[k]; denom += wk[k] * unpinned[k] * bytes[k]; }
+      dyn_bytes += extra_gib * double(1ull << 30);
       std::ostringstream note;
-      note << "mixed EXL3 store: DS41_CLASS_WEIGHTS=" << cw << ": dynamic slots";
+      note << "mixed EXL3 store: DS41_CLASS_WEIGHTS=" << (*cw ? cw : "1") << ", DS41_EXPERT_EXTRA_GIB=" << extra_gib
+           << ": dynamic slots";
       for (size_t k = 0; k < n; ++k) {
         const size_t dyn = denom > 0 ? std::min(unpinned[k], size_t(dyn_bytes * wk[k] * unpinned[k] / denom)) : 0;
         note << (k ? ", K" : " K") << widths[k] << " " << (vram[k] - pins[k]) << " -> " << dyn;

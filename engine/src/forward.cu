@@ -1911,6 +1911,7 @@ private:
     const size_t n = widths.size();
     class_widths = widths;
     std::array<int, 6> cls{};
+    cls.fill(-1);
     for (size_t k = 0; k < n; ++k) cls[widths[k]] = int(k);
     ec.expert_class.assign(ds41::expert_count, 0);
     for (ds41::ExpertId id = 0; id < 15360; ++id) ec.expert_class[id] = uint8_t(cls[width_of[id]]);
@@ -1948,9 +1949,38 @@ private:
     // plus the lookahead and the demotion reserve must fit in its unpinned slots, or acquire throws ("exceeds
     // unleased slot capacity of its size class"). Raise such a class to that floor, paid in bytes by the class with
     // the most dynamic bytes, so the VRAM spent on experts does not grow.
+    // s0ma change 19: DS41_CLASS_WEIGHTS="K3:1.3,K2:0.9" re-splits the dynamic VRAM between the width classes in bytes:
+    // class k gets the share w_k x (its unpinned experts) x (its record size) of the same dynamic bytes (w = 1 for every
+    // class gives back the count split above). Sero's first bench: per unpinned expert, K3 is demanded ~1.3x as often as
+    // K2 and takes 60% of the NVMe misses.
+    if (const char *cw = std::getenv("DS41_CLASS_WEIGHTS"); cw && *cw) {
+      std::vector<double> wk(n, 1.0);
+      std::string spec(cw), item;
+      for (size_t i = 0; i <= spec.size(); ++i) {
+        if (i < spec.size() && spec[i] != ',') { item += spec[i]; continue; }
+        if (item.size() < 4 || item[0] != 'K' || item[2] != ':') throw std::invalid_argument("DS41_CLASS_WEIGHTS: K<w>:<weight>, e.g. K3:1.3");
+        const int b = item[1] - '0';
+        const double v = std::stod(item.substr(3));
+        if (b < 2 || b > 5 || !(v > 0)) throw std::invalid_argument("DS41_CLASS_WEIGHTS: K2..K5 with positive weights");
+        if (cls[b] >= 0 && size_t(cls[b]) < n && widths[cls[b]] == b) wk[cls[b]] = v;
+        item.clear();
+      }
+      double dyn_bytes = 0, denom = 0;
+      for (size_t k = 0; k < n; ++k) { dyn_bytes += double(vram[k] - pins[k]) * bytes[k]; denom += wk[k] * unpinned[k] * bytes[k]; }
+      std::ostringstream note;
+      note << "mixed EXL3 store: DS41_CLASS_WEIGHTS=" << cw << ": dynamic slots";
+      for (size_t k = 0; k < n; ++k) {
+        const size_t dyn = denom > 0 ? std::min(unpinned[k], size_t(dyn_bytes * wk[k] * unpinned[k] / denom)) : 0;
+        note << (k ? ", K" : " K") << widths[k] << " " << (vram[k] - pins[k]) << " -> " << dyn;
+        vram[k] = pins[k] + dyn;
+      }
+      std::cerr << note.str() << "\n";
+    }
     std::string floor_note;
     for (size_t k = 0; k < n; ++k) {
-      const size_t floor_k = std::min(unpinned[k], 2 * std::min<size_t>(36, layer_max[k]) + 16);
+      // one layer's need set twice (the previous layer's lease may be held), plus the lookahead and this class's share
+      // of the demotion reserve (change 16 splits it by class)
+      const size_t floor_k = std::min(unpinned[k], 2 * std::min<size_t>(36, layer_max[k]) + 4);
       const size_t dyn = vram[k] - pins[k];
       if (dyn >= floor_k) continue;
       size_t donor = n;

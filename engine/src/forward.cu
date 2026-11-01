@@ -629,6 +629,20 @@ public:
         for (int l = 40; l < 43; ++l)
           placement.dynamic_slots_per_layer[l] = placement.host_slots_per_layer[l] = 0;
       }
+      if (exl3_mixed) {
+        // s0ma change 16: raising a small width class (paid in a wider class's bytes) can leave fewer slots than the
+        // placement's pins + budgets. The budgets are soft per-layer targets: trim the largest by one until they fit.
+        size_t planned = placement.vram_pins.size();
+        for (auto n : placement.dynamic_slots_per_layer) planned += n;
+        auto &d = placement.dynamic_slots_per_layer;
+        size_t trimmed = 0;
+        while (planned > ec.slots) {
+          auto big = std::max_element(d.begin(), d.begin() + 40);
+          if (*big == 0) break;
+          --*big; --planned; ++trimmed;
+        }
+        if (trimmed) std::cerr << "mixed EXL3 store: placement budgets trimmed by " << trimmed << " slots to the store's " << ec.slots << "\n";
+      }
       experts->place(placement);
     }
 #if DS41_MOE_SOURCE_API>=4

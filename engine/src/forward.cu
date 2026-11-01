@@ -220,12 +220,19 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::unique_ptr<ds41::OffloadStore> mtp_experts;
   bool exl3 = false;
   int exl3_bits_loaded = 3;
+  // s0ma change 12: each target layer's EXL3 width (2 or 3), from its records' size. A bank whose layers differ
+  // ("experts": "mixed") gets one store slot class per width; exl3_bits_loaded is then 0.
+  std::array<int, 40> layer_bits{};
+  bool exl3_mixed = false;
+  uint64_t expert_payload_bytes = 0;   // the target store's VRAM slots in bytes (all classes)
+  std::string mixed_k3_layers;         // for the log and stats: "9,12,17,..."
+  int expert_bits(int layer) const { return layer >= 0 && layer < 40 && layer_bits[layer] ? layer_bits[layer] : exl3_bits_loaded; }
   size_t expert_slot_bytes = 18808832;
   ds41::OffloadStore &spark_store() { return mtp_experts ? *mtp_experts : *experts; }
   // Target-layer expert GEMM. EXL3 jobs read BF16 rows; native jobs MXFP8 rows and scales.
   cudaError_t expert_gemm(const ds41::GemmJob *jobs, int count, ds41::Projection p,
-                          int n, int k, cudaStream_t s) {
-    return exl3 ? ds41::grouped_exl3(experts->table(), jobs, count, p, n, k, s)
+                          int n, int k, cudaStream_t s, int layer) {
+    return exl3 ? ds41::grouped_exl3_bits(experts->table(), jobs, count, p, n, k, expert_bits(layer), s)
                 : ds41::grouped_mxfp4_native_parallel(experts->table(), jobs, count, p, n, k, s);
   }
   std::unique_ptr<hotpath::FusedOps> fused;
@@ -583,7 +590,8 @@ public:
       for (auto &r : records) if (r.id >= 15360) mtp.push_back(r);
       records = ds41::load_records(c.exl3_experts);
       validate_k3_records(records, c.exl3_receipts);
-      expert_slot_bytes = (size_t(records.front().bytes) + 4095) / 4096 * 4096;
+      expert_slot_bytes = 0;
+      for (auto &r : records) expert_slot_bytes = std::max(expert_slot_bytes, (size_t(r.bytes) + 4095) / 4096 * 4096);
       make_mtp_store(std::move(mtp));
       vram_checkpoint("native_after_mtp_store");
     }
@@ -601,6 +609,8 @@ public:
     if(c.host_decay_interval>=0) ec.host_decay_interval=unsigned(c.host_decay_interval);
     host_cache_policy={{"recent_window",ec.host_recent_window},{"decay_interval",ec.host_decay_interval}};
 #endif
+    expert_payload_bytes = uint64_t(c.expert_slots) * expert_slot_bytes;
+    if (exl3_mixed) mixed_store_classes(ec, c);
     experts = std::make_unique<ds41::OffloadStore>(std::move(records), ec);
     vram_checkpoint("native_after_store");
     if (!c.placement.empty()) {
@@ -628,7 +638,8 @@ public:
     reset();
     if (rows_dense) check_rows_batched();
     std::cerr << "ds41d native M1 loaded; UNQUALIFIED; expert slots="
-              << c.expert_slots << (exl3 ? (exl3_bits_loaded == 2 ? " (EXL3 K2 target experts, native MTP store)"
+              << c.expert_slots << (exl3_mixed ? " (EXL3 mixed target experts: K3 in layers " + mixed_k3_layers + ", K2 elsewhere; native MTP store)"
+                                    : exl3 ? (exl3_bits_loaded == 2 ? " (EXL3 K2 target experts, native MTP store)"
                                                    : " (EXL3 K3 target experts, native MTP store)") : "") << "\n";
   }
   ~Native() override {
@@ -1003,7 +1014,7 @@ public:
     if(stale) j["moe_stats_error"]=stats_error;
     j["cpu_only_experts"]=0; // CPU backend is not integrated in this adapter.
     j["expert_kernel"]=exl3?"grouped_exl3 (target), grouped_mxfp4_native_parallel (MTP)":"grouped_mxfp4_native_parallel";
-    j["target_expert_format"]=exl3?(exl3_bits_loaded==2?"EXL3 K2 mul1":"EXL3 K3 mul1"):"MXFP4";
+    j["target_expert_format"]=exl3_mixed?"EXL3 mixed K2/K3 mul1 (K3 layers "+mixed_k3_layers+")":exl3?(exl3_bits_loaded==2?"EXL3 K2 mul1":"EXL3 K3 mul1"):"MXFP4";
     if(mtp_experts) j["mtp_expert_store"]="native MXFP4, 384 VRAM pins";
     j["xk_enabled"]=false; // Cache-only adapter never constructs DecodeBackend/XK.
     j["moe_demand_grouping"]="sorted unique logical-ID union per layer/verify";
@@ -1103,7 +1114,7 @@ public:
     j["prefill_staging_device_bytes"]=prefill_stage_bytes;
     j["target_device_requested_bytes"]=weight_gpu+arena+kv_bytes+prefill_bytes+prefill_stage_bytes;
     j["expert_slot_bytes"]=expert_slot_bytes; j["expert_slots"]=config.expert_slots;
-    j["expert_payload_device_bytes"]=uint64_t(config.expert_slots)*expert_slot_bytes+(mtp_experts?uint64_t(384)*18808832:0);
+    j["expert_payload_device_bytes"]=expert_payload_bytes+(mtp_experts?uint64_t(384)*18808832:0);
     j["moe_staging_pinned_host_bytes"]=uint64_t(8)*expert_slot_bytes+(mtp_experts?uint64_t(8)*18808832:0);
     j["engine_staging_pinned_host_bytes"]=(16+1)*(1<<20);
     j["graphs"]=graphs.size();
@@ -1732,14 +1743,14 @@ private:
         if (!exl3)
           CK(ds41::quantize_mxfp8(x.as<Bf16>(), aq.as<uint8_t>(),
                                   as.as<uint8_t>(), 1, H, stream));
-        CK(expert_gemm(jobs.as<ds41::GemmJob>(), 6, ds41::Projection::Gate, I, H, stream));
-        CK(expert_gemm(up_jobs.as<ds41::GemmJob>(), 6, ds41::Projection::Up, I, H, stream));
+        CK(expert_gemm(jobs.as<ds41::GemmJob>(), 6, ds41::Projection::Gate, I, H, stream, l));
+        CK(expert_gemm(up_jobs.as<ds41::GemmJob>(), 6, ds41::Projection::Up, I, H, stream, l));
         CK(ds41::swiglu(gate.as<Bf16>(), up.as<Bf16>(), route.as<float>(),
                         act.as<Bf16>(), 6, I, 10, stream));
         if (!exl3)
           CK(ds41::quantize_mxfp8(act.as<Bf16>(), eq.as<uint8_t>(),
                                   es.as<uint8_t>(), 6, I, stream));
-        CK(expert_gemm(down_jobs.as<ds41::GemmJob>(), 6, ds41::Projection::Down, H, I, stream));
+        CK(expert_gemm(down_jobs.as<ds41::GemmJob>(), 6, ds41::Projection::Down, H, I, stream, l));
         linear(p + ".shared_experts.w1", x.p, sg.p, I, H);
         linear(p + ".shared_experts.w3", x.p, su.p, I, H);
         CK(ds41::swiglu(sg.as<Bf16>(), su.as<Bf16>(), nullptr, sa.as<Bf16>(), 1,
@@ -1850,17 +1861,72 @@ private:
   // rewritten since then is refused. The digest itself is not recomputed at startup.
   // The same layout at K2 (scripts/k2_bank.py): trellis [k/16,n/16,32], records of 8,892,416 bytes. The width
   // comes from the records' size, is the same for every record, and selects the kernels (exl3_set_bits).
+  // s0ma change 12: a mixed bank's store gets one slot class per width (K2 records 8,892,416 bytes, K3 13,316,096),
+  // so a K2 expert never takes a K3-sized slot. VRAM: each class has the slots the placement gives its layers (pins
+  // plus dynamic budget, which a mixed placement states in its layers' own sizes; they must add up to
+  // --expert-slots). RAM: the tier's bytes split between the classes as the placement's per-layer host capacities
+  // are (its seeds), in each class's slot size.
+  void mixed_store_classes(ds41::OffloadStore::Config &ec, const Config &c) {
+    if (c.placement.empty()) throw std::invalid_argument("a mixed EXL3 bank needs its placement (--placement)");
+    const auto pl = ds41::load_placement(c.placement);
+    const size_t bytes[2] = {8892416, 13316096};
+    std::array<size_t, 40> cap{};
+    for (auto id : pl.vram_pins) if (id < 15360) ++cap[id / 384];
+    size_t vram[2] = {0, 0};
+    double host_w[2] = {0, 0};
+    std::array<size_t, 2> seeds{};
+    for (auto id : pl.host_residents) if (id < 15360) ++seeds[layer_bits[id / 384] == 3];
+    for (int l = 0; l < 40; ++l) {
+      const int k = layer_bits[l] == 3;
+      ec.layer_class[l] = uint8_t(k);
+      vram[k] += cap[l] + pl.dynamic_slots_per_layer[l];
+      host_w[k] += double(pl.host_slots_per_layer[l]) * bytes[k];
+    }
+    if (vram[0] + vram[1] != size_t(c.expert_slots))
+      throw std::invalid_argument("a mixed bank's placement must state every VRAM slot: its pins and budgets give " +
+                                  std::to_string(vram[0] + vram[1]) + ", --expert-slots is " + std::to_string(c.expert_slots));
+    if (host_w[0] + host_w[1] <= 0) host_w[0] = host_w[1] = 1;
+    ec.class_bytes = {bytes[0], bytes[1]};
+    ec.class_slots = {vram[0], vram[1]};
+    ec.class_host_slots = {0, 0};
+    for (int k = 0; k < 2; ++k) {
+      ec.class_host_slots[k] = size_t(double(c.host_bytes) * host_w[k] / (host_w[0] + host_w[1])) / bytes[k];
+      if (ec.class_host_slots[k] < seeds[k])
+        throw std::invalid_argument("the RAM tier's " + std::string(k ? "K3" : "K2") + " slots (" +
+                                    std::to_string(ec.class_host_slots[k]) + ") cannot hold the placement's " +
+                                    std::to_string(seeds[k]) + " seeds");
+    }
+    expert_payload_bytes = uint64_t(vram[0]) * bytes[0] + uint64_t(vram[1]) * bytes[1];
+    std::cerr << "mixed EXL3 store: VRAM " << vram[0] << " K2 + " << vram[1] << " K3 slots ("
+              << expert_payload_bytes / double(1ull << 30) << " GiB), RAM tier " << ec.class_host_slots[0] << " K2 + "
+              << ec.class_host_slots[1] << " K3 slots; K3 layers " << mixed_k3_layers << "\n";
+  }
   void validate_k3_records(const std::vector<ds41::Record> &records, const std::string &receipts) {
     if (records.empty()) throw std::runtime_error("EXL3 manifest is empty");
     constexpr uint64_t SB = 2 * (5120 + 2304);
     auto rec_of = [](uint64_t bits) { return (3 * (320 * 144 * 16 * bits * 2 + 2 * (5120 + 2304)) + 4095) / 4096 * 4096; };
-    const uint64_t bits = records.front().bytes == rec_of(2) ? 2 : 3;
-    const uint64_t REC = rec_of(bits), TB = 320 * 144 * 16 * bits * 2;
-    if (bits == 3 && REC != 13316096) throw std::logic_error("K3 record size");
-    if (ds41::exl3_set_bits(int(bits)) != cudaSuccess) throw std::runtime_error("EXL3 width not supported");
-    exl3_bits_loaded = int(bits);
-    const ds41::TensorView gate{0, TB}, gate_scale{TB, SB}, up{TB + SB, TB},
-        up_scale{2 * TB + SB, SB}, down{2 * TB + 2 * SB, TB}, down_scale{3 * TB + 2 * SB, SB};
+    if (rec_of(3) != 13316096) throw std::logic_error("K3 record size");
+    // s0ma change 12: the width is per layer (every record of a layer the same size); layers may differ.
+    for (auto &r : records) {
+      if (r.id >= 15360) throw std::runtime_error("EXL3 manifest duplicate/id");
+      const int b = r.bytes == rec_of(2) ? 2 : r.bytes == rec_of(3) ? 3 : 0;
+      if (!b) throw std::runtime_error("EXL3 record size is neither K2 nor K3: expert " + std::to_string(r.id));
+      int &lb = layer_bits[r.id / 384];
+      if (lb && lb != b) throw std::runtime_error("EXL3 layer mixes widths: layer " + std::to_string(r.id / 384));
+      lb = b;
+    }
+    int widths = 0;
+    for (int b : {2, 3}) widths += std::count(layer_bits.begin(), layer_bits.end(), b) > 0;
+    exl3_mixed = widths > 1;
+    exl3_bits_loaded = exl3_mixed ? 0 : layer_bits[0];
+    if (!exl3_mixed && ds41::exl3_set_bits(exl3_bits_loaded) != cudaSuccess) throw std::runtime_error("EXL3 width not supported");
+    for (int l = 0; l < 40; ++l)
+      if (layer_bits[l] == 3) mixed_k3_layers += (mixed_k3_layers.empty() ? "" : ",") + std::to_string(l);
+    auto views_of = [&](uint64_t bits) {
+      const uint64_t TB = 320 * 144 * 16 * bits * 2;
+      return std::array<ds41::TensorView, 6>{ds41::TensorView{0, TB}, ds41::TensorView{TB, SB}, ds41::TensorView{TB + SB, TB},
+          ds41::TensorView{2 * TB + SB, SB}, ds41::TensorView{2 * TB + 2 * SB, TB}, ds41::TensorView{3 * TB + 2 * SB, SB}};
+    };
     if (records.size() != 15360)
       throw std::runtime_error("EXL3 manifest must hold exactly the 15360 target-layer experts");
     if (receipts.empty())
@@ -1873,6 +1939,9 @@ private:
       if (r.id >= 15360 || seen[r.id]) throw std::runtime_error("EXL3 manifest duplicate/id");
       seen[r.id] = true;
       unsigned layer = r.id / 384, expert = r.id % 384;
+      const uint64_t REC = rec_of(layer_bits[layer]);
+      const auto v = views_of(layer_bits[layer]);
+      const auto &gate = v[0], &gate_scale = v[1], &up = v[2], &up_scale = v[3], &down = v[4], &down_scale = v[5];
       if (r.bytes != REC || !same(r.gate, gate) || !same(r.gate_scale, gate_scale) || !same(r.up, up) ||
           !same(r.up_scale, up_scale) || !same(r.down, down) || !same(r.down_scale, down_scale))
         throw std::runtime_error("EXL3 record layout mismatch: expert " + std::to_string(r.id));
@@ -1886,6 +1955,7 @@ private:
       else if (path != e.path) throw std::runtime_error("EXL3 layer spans several bank files");
     }
     for (auto &[layer, path] : bank) {
+      const uint64_t REC = rec_of(layer_bits[layer]);
       char name[32];
       std::snprintf(name, sizeof name, "bank-%02u.bin", layer);
       auto file = std::filesystem::path(path);

@@ -34,6 +34,10 @@ K2_EXPERT_SLOTS = 8602
 # row is cheap enough that longer drafts pay. STOP_Q 0.65 -> 0.2 and width 4 -> 6 took decode 54.7 -> 58.4 tok/s
 # (0.1: 56.1, 0.05: 55.4). Native and K3 keep their measured (published) drafting.
 K2_SPARK_WIDTH = '6'
+# "experts": "mixed" (s0ma change 12, scripts/mixed_bank.py): K3 in some layers, K2 in the rest, from the two banks.
+# The bank directory holds its manifest, receipts and placement; the placement states every VRAM slot (each K3
+# layer's capacity restated in 13.3 MB slots), and ds41d gives each width its own slot class. Drafting as K2.
+MIXED_PLACEMENT = None   # the bank's mixed-p80.placement unless set (the lab sets a trimmed copy)
 K2_ENV = {'DS41_SPARK_STOP_Q': '0.2'}
 # The measured host RAM tier. More RAM lowers NVMe reads (96 -> 104 GiB: +3.3% decode); larger tiers are untested.
 MAX_HOST_GIB = 104
@@ -120,11 +124,27 @@ def configuration():
         raise ValueError('gds must be "auto", true or false')
     if not (isinstance(cfg['max_context'], int) and 4096 <= cfg['max_context'] <= 1048576):
         raise ValueError('max_context must be 4096..1048576')
-    if cfg['experts'] not in ('native', 'k3', 'k2'):
-        raise ValueError('experts must be "native", "k3" or "k2"')
+    if cfg['experts'] not in ('native', 'k3', 'k2', 'mixed'):
+        raise ValueError('experts must be "native", "k3", "k2" or "mixed"')
     cfg['k3_bank'] = str((ROOT / Path(cfg['k3_bank']).expanduser()).resolve())
     cfg['k2_bank'] = str((ROOT / Path(cfg.get('k2_bank', 'models/k2-bank')).expanduser()).resolve())
+    cfg['mixed_bank'] = str((ROOT / Path(cfg.get('mixed_bank', 'models/mixed-bank')).expanduser()).resolve())
     return cfg
+
+
+def mixed_placement(cfg):
+    return Path(MIXED_PLACEMENT) if MIXED_PLACEMENT else Path(cfg['mixed_bank']) / 'mixed-p80.placement'
+
+
+def placement_slots(path):
+    """the target VRAM slots a placement states: pins and dynamic budgets of layers 0..39"""
+    n = 0
+    for x in Path(path).read_text().splitlines():
+        if x.startswith('vram ') and int(x.split()[1]) < 15360:
+            n += 1
+        elif x.startswith('budget ') and int(x.split()[1]) < 40:
+            n += int(x.split()[2])
+    return n
 
 
 def meminfo():
@@ -188,23 +208,29 @@ def command(cfg, socket):
     dist, assets = Path(cfg['build']) / 'dist', Path(cfg['assets'])
     k3 = cfg['experts'] == 'k3'
     k2 = cfg['experts'] == 'k2'
+    mixed = cfg['experts'] == 'mixed'
     cmd = [str(dist / 'ds41d'), 'serve', '--socket', str(socket),
            '--weights', cfg['weights'], '--receipt', str(assets / 'full-integrity.json'),
            '--auxiliary', str(assets / 'auxiliary.json'), '--engram', str(assets / 'engram.json'),
            '--rope', str(assets / 'rope.bin'), '--experts', str(assets / 'records.tsv'),
            '--engram-lib', str(dist / 'libds41_engram.so'), '--fused-head', str(dist / 'libds41_fuse_head.so'),
-           '--placement', str(K3_PLACEMENT if k3 else K2_PLACEMENT if k2 else PLACEMENT),
-           '--expert-slots', str(K3_EXPERT_SLOTS if k3 else K2_EXPERT_SLOTS if k2 else EXPERT_SLOTS),
+           '--placement', str(K3_PLACEMENT if k3 else K2_PLACEMENT if k2 else mixed_placement(cfg) if mixed else PLACEMENT),
+           '--expert-slots', str(K3_EXPERT_SLOTS if k3 else K2_EXPERT_SLOTS if k2 else
+                                 placement_slots(mixed_placement(cfg)) if mixed else EXPERT_SLOTS),
            '--host-gib', str(host_gib(cfg)), '--max-context', str(cfg['max_context'])] + ENGINE_FLAGS
     if k3:
         # the native manifest still supplies the drafter's experts; target layers come from the bank
         bank = Path(cfg['k3_bank'])
         cmd += ['--exl3-experts', str(bank / 'records-k3.tsv'), '--exl3-receipts', str(bank / 'receipts.json')]
-    if k2:
+    if k2 or mixed:
         # the first --spark-width is the profile's; one appended later (a lab A/B) still wins
         cmd[cmd.index('--spark-width') + 1] = K2_SPARK_WIDTH
+    if k2:
         bank = Path(cfg['k2_bank'])
         cmd += ['--exl3-experts', str(bank / 'records-k2.tsv'), '--exl3-receipts', str(bank / 'receipts.json')]
+    if mixed:
+        bank = Path(cfg['mixed_bank'])
+        cmd += ['--exl3-experts', str(bank / 'records-mixed.tsv'), '--exl3-receipts', str(bank / 'receipts.json')]
     return cmd
 
 
@@ -213,7 +239,7 @@ def environment(cfg, render=True):
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DS41_', 'CUFILE_'))}
     env.pop('LD_PRELOAD', None)
     env.update(ENGINE_ENV)
-    if cfg.get('experts') == 'k2':
+    if cfg.get('experts') in ('k2', 'mixed'):
         env.update(K2_ENV)
     # the pinned cuBLAS pair (dist/blas) before CUDA 13.4's own libraries (cudart, cuFile)
     env['LD_LIBRARY_PATH'] = f'{dist}:{dist}/blas:{cuda_lib()}'
@@ -244,6 +270,9 @@ def preflight(cfg):
         raise RuntimeError(f'No 3-bit expert bank at {cfg["k3_bank"]}: run scripts/k3_bank.py fetch {cfg["k3_bank"]}')
     if cfg['experts'] == 'k2' and not K2_PLACEMENT.exists():
         raise RuntimeError(f'No {K2_PLACEMENT.name}: run scripts/k2_bank.py placement')
+    if cfg['experts'] == 'mixed' and not (Path(cfg['mixed_bank']) / 'records-mixed.tsv').exists():
+        raise RuntimeError(f'No mixed bank at {cfg["mixed_bank"]}: run scripts/mixed_bank.py build {cfg["mixed_bank"]} '
+                           '--k2 K2_BANK --k3 K3_BANK')
     if cfg['experts'] == 'k2' and not (Path(cfg['k2_bank']) / 'records-k2.tsv').exists():
         raise RuntimeError(f'No 2-bit expert bank at {cfg["k2_bank"]}: run scripts/k2_bank.py fetch {cfg["k2_bank"]}')
     aux = json.loads((Path(cfg['assets']) / 'auxiliary.json').read_text())

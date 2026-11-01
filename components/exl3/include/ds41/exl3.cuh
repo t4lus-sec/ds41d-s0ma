@@ -19,4 +19,9 @@ cudaError_t grouped_exl3_prefill(const DeviceExpert* table, const GemmJob* jobs,
 // it decodes that width. Not thread-safe against concurrent launches (the engine sets it at load).
 cudaError_t exl3_set_bits(int bits);
 int exl3_bits();
+// s0ma change 12: the same launches at an explicit width (2 or 3), for a bank whose layers differ in width.
+cudaError_t grouped_exl3_bits(const DeviceExpert* table, const GemmJob* jobs, int count,
+                              Projection projection, int n, int k, int bits, cudaStream_t stream);
+cudaError_t grouped_exl3_prefill_bits(const DeviceExpert* table, const GemmJob* jobs, int count,
+                              Projection projection, int n, int k, int max_tokens, int bits, cudaStream_t stream);
 }

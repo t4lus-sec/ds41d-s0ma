@@ -243,8 +243,11 @@ template<int K,int BITS> cudaError_t launch_decode(const DeviceExpert* t,const G
 }
 }
 cudaError_t grouped_exl3(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,cudaStream_t s){
-    if(!valid(t,j,count,p,n,k))return cudaErrorInvalidValue;if(!count)return cudaSuccess;
-    if(g_bits==2){
+    return grouped_exl3_bits(t,j,count,p,n,k,g_bits,s);
+}
+cudaError_t grouped_exl3_bits(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,int bits,cudaStream_t s){
+    if(!valid(t,j,count,p,n,k) || (bits!=2 && bits!=3))return cudaErrorInvalidValue;if(!count)return cudaSuccess;
+    if(bits==2){
         if(k==5120)return launch_decode<5120,2>(t,j,count,p,n,s);
         if(k==2304)return launch_decode<2304,2>(t,j,count,p,n,s);
         if(k==256)return launch_decode<256,2>(t,j,count,p,n,s);
@@ -258,8 +261,11 @@ cudaError_t grouped_exl3(const DeviceExpert* t,const GemmJob* j,int count,Projec
     return cudaErrorNotSupported;
 }
 cudaError_t grouped_exl3_prefill(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,int max_tokens,cudaStream_t s){
-    if(!valid(t,j,count,p,n,k)||max_tokens<1||max_tokens>256)return cudaErrorInvalidValue;if(!count)return cudaSuccess;
-    if(g_bits==2)exl3_detail::prefill<2><<<dim3(n/128,count,(max_tokens+63)/64),256,0,s>>>(t,j,int(p),n,k,max_tokens);
+    return grouped_exl3_prefill_bits(t,j,count,p,n,k,max_tokens,g_bits,s);
+}
+cudaError_t grouped_exl3_prefill_bits(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,int max_tokens,int bits,cudaStream_t s){
+    if(!valid(t,j,count,p,n,k)||max_tokens<1||max_tokens>256||(bits!=2&&bits!=3))return cudaErrorInvalidValue;if(!count)return cudaSuccess;
+    if(bits==2)exl3_detail::prefill<2><<<dim3(n/128,count,(max_tokens+63)/64),256,0,s>>>(t,j,int(p),n,k,max_tokens);
     else exl3_detail::prefill<3><<<dim3(n/128,count,(max_tokens+63)/64),256,0,s>>>(t,j,int(p),n,k,max_tokens);
     return cudaGetLastError();
 }

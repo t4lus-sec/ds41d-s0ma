@@ -104,7 +104,13 @@ public:
     // Opt-in exclusive tiers. reserve() evicts policy victims into draining slots until
     // empty+draining >= target and returns them (evicted = id). A draining slot has no
     // residency and is not allocatable until drained(slot). Soft (non-hard) pools only.
-    std::vector<Allocation> reserve(size_t target, const std::unordered_set<ExpertId>& wanted);
+    std::vector<Allocation> reserve(size_t target, const std::unordered_set<ExpertId>& wanted, int cls = -1);
+    // s0ma change 12: slot classes for records of several sizes (a mixed EXL3 bank). slot_class[s] is slot s's
+    // class, layer_class[l] the class of layer l's records; an expert only ever occupies a slot of its layer's
+    // class. With cls >= 0, reserve() counts and frees slots of that class only. Before policy()/use.
+    void classes(std::vector<uint8_t> slot_class, const std::array<uint8_t,43>& layer_class);
+    bool classed() const { return classed_; }
+    int class_of(ExpertId id) const;
     void drained(size_t slot);
     // Host pool: experts resident in the VRAM peer score 0, so duplicates are evicted first.
     void exclusive(bool enabled);
@@ -126,7 +132,11 @@ private:
     // trigger forty times as much LFU decay or shorten a six-step recent window.
     std::array<uint64_t,43> layer_clocks_{};
     bool fast_=false, host_=false, exclusive_=false;
-    int scan_victim(const std::unordered_set<ExpertId>& wanted, const std::array<size_t,43>& counts, int layer) const;
+    int scan_victim(const std::unordered_set<ExpertId>& wanted, const std::array<size_t,43>& counts, int layer, int cls = -1) const;
+    bool classed_=false;
+    std::vector<uint8_t> slot_class_;
+    std::array<uint8_t,43> layer_class_{};
+    bool fits(size_t slot, ExpertId e) const;
     const SlotPool* peer_=nullptr;
     std::array<bool,43> late_{}, dirty_{};
     std::array<int,43> best_any_{}, best_old_{};
@@ -136,7 +146,7 @@ private:
     uint64_t score(ExpertId id) const;
     bool less_slot(size_t a, size_t b) const;
     int fast_victim(const std::unordered_set<ExpertId>& wanted,
-                    const std::array<size_t,43>& counts);
+                    const std::array<size_t,43>& counts, int cls = -1);
 };
 
 // Width-one, token-major policy controller. Before/after are paired once per

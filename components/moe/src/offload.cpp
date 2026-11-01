@@ -63,6 +63,11 @@ struct OffloadStore::Impl {
     std::shared_ptr<HostBuffer> host_arena;
     std::unique_ptr<HostBuffer> staging, entries, generations;
     size_t slot_bytes=0, host_bytes=0;
+    // s0ma change 12: byte offsets of each VRAM and RAM-tier slot (slot * slot_bytes unless slot classes are set)
+    std::vector<size_t> vram_offsets, host_offsets;
+    size_t vram_total=0, host_total=0, host_slot_count=0;
+    size_t voff(size_t slot)const{return vram_offsets.empty()?slot*slot_bytes:vram_offsets[slot];}
+    size_t hoff(size_t slot)const{return host_offsets.empty()?slot*slot_bytes:host_offsets[slot];}
     uint8_t* vram=nullptr;
     DeviceExpert* table=nullptr;
     uint32_t* ready=nullptr;
@@ -168,7 +173,28 @@ struct OffloadStore::Impl {
             slot_bytes=std::max(slot_bytes,(r.bytes+4095)/4096*4096);
         }
         if(!std::isfinite(cfg.refill_gbps) || cfg.refill_gbps<=0)throw std::invalid_argument("refill rate");
-        if(cfg.host_budget_bytes/slot_bytes)host_pool=std::make_unique<SlotPool>(cfg.host_budget_bytes/slot_bytes,cfg.host_recent_window,cfg.host_decay_interval,cfg.distinct_lfu);
+        vram_total=slot_bytes*cfg.slots;host_slot_count=cfg.host_budget_bytes/slot_bytes;host_total=cfg.host_budget_bytes;
+        if(!cfg.class_bytes.empty()) {
+            const size_t n=cfg.class_bytes.size();
+            if(n>255 || cfg.class_slots.size()!=n || cfg.class_host_slots.size()!=n)throw std::invalid_argument("slot classes: sizes, VRAM and RAM counts per class");
+            size_t vs=0,hb=0;
+            for(size_t c=0;c<n;++c){if(!cfg.class_bytes[c] || cfg.class_bytes[c]%4096)throw std::invalid_argument("slot class size");vs+=cfg.class_slots[c];hb+=cfg.class_host_slots[c]*cfg.class_bytes[c];}
+            if(vs!=cfg.slots)throw std::invalid_argument("slot classes must add up to the VRAM slots");
+            if(hb>cfg.host_budget_bytes)throw std::invalid_argument("slot classes exceed the RAM tier");
+            for(auto& [id,r]:records){
+                auto c=cfg.layer_class[expert_layer(id)];
+                if(c>=n || r.bytes>cfg.class_bytes[c])throw std::invalid_argument("record larger than its layer's slot class");
+            }
+            std::vector<uint8_t> vc,hc;vram_total=0;host_total=0;
+            for(size_t c=0;c<n;++c){
+                for(size_t j=0;j<cfg.class_slots[c];++j){vram_offsets.push_back(vram_total);vram_total+=cfg.class_bytes[c];vc.push_back(uint8_t(c));}
+                for(size_t j=0;j<cfg.class_host_slots[c];++j){host_offsets.push_back(host_total);host_total+=cfg.class_bytes[c];hc.push_back(uint8_t(c));}
+            }
+            host_slot_count=hc.size();
+            pool.classes(vc,cfg.layer_class);
+            if(host_slot_count){host_pool=std::make_unique<SlotPool>(host_slot_count,cfg.host_recent_window,cfg.host_decay_interval,cfg.distinct_lfu);host_pool->classes(hc,cfg.layer_class);}
+        }
+        else if(host_slot_count)host_pool=std::make_unique<SlotPool>(host_slot_count,cfg.host_recent_window,cfg.host_decay_interval,cfg.distinct_lfu);
         policy_options={flag("DS41_MOE_DECAY256"),flag("DS41_MOE_DRIFT_0_50"),flag("DS41_MOE_FAST_MINIMA")};
         // Opt-in chunk-level NVMe->H2D pipelining: upload each O_DIRECT chunk as it lands; publish the slot
         // (readiness/events/notify) only after the record's last chunk. Same bytes, earlier copies.
@@ -197,10 +223,10 @@ struct OffloadStore::Impl {
         if(demote)ck(cudaStreamCreateWithFlags(&demote_stream,cudaStreamNonBlocking));
         ck(cudaEventCreateWithFlags(&speculative_done,cudaEventDisableTiming));
         ck(cudaEventCreateWithFlags(&copy_idle,cudaEventDisableTiming));
-        ck(cudaMalloc(&vram,slot_bytes*cfg.slots));
+        ck(cudaMalloc(&vram,vram_total));
         if(flag("DS41_MOE_GDS")) {
             unsigned threads=8;if(const char* t=std::getenv("DS41_MOE_GDS_THREADS"))threads=unsigned(std::stoul(t));
-            gds=std::make_unique<GdsReader>(vram,slot_bytes*cfg.slots,cfg.io_chunk_bytes?cfg.io_chunk_bytes:size_t(2)<<20,threads);
+            gds=std::make_unique<GdsReader>(vram,vram_total,cfg.io_chunk_bytes?cfg.io_chunk_bytes:size_t(2)<<20,threads);
         }
         ck(cudaMalloc(&table,expert_count*sizeof(DeviceExpert)));
         ck(cudaMemset(table,0,expert_count*sizeof(DeviceExpert)));
@@ -352,7 +378,7 @@ struct OffloadStore::Impl {
                 auto& r=records.at(a.id);
                 known_ready[a.slot]=false;
                 uint32_t generation=++gens[a.slot];if(!generation)generation=++gens[a.slot];
-                auto* base=vram+a.slot*slot_bytes;
+                auto* base=vram+voff(a.slot);
                 auto& v=views[a.id];
                 v={base+r.gate.offset,base+r.gate_scale.offset,base+r.up.offset,base+r.up_scale.offset,base+r.down.offset,base+r.down_scale.offset,
                    cfg.ready_flags?ready+a.slot:nullptr,generation,int32_t(a.slot)};
@@ -403,7 +429,7 @@ struct OffloadStore::Impl {
             if(gds && batch_callback && !is_prefetch && !disk.empty()) {
                 std::vector<const Record*> direct;std::vector<size_t> offsets;
                 for(auto a:disk) {
-                    auto& r=records.at(a.id);direct.push_back(&r);offsets.push_back(a.slot*slot_bytes);
+                    auto& r=records.at(a.id);direct.push_back(&r);offsets.push_back(voff(a.slot));
                     for(auto& e:r.extents){counters.nvme_bytes+=e.bytes;counters.layers[expert_layer(a.id)].nvme_bytes+=e.bytes;}
                 }
                 auto io_start=Clock::now();
@@ -424,7 +450,7 @@ struct OffloadStore::Impl {
                 void* destination=nullptr;
                 if(cfg.dynamic_host && allow_host_admission && !is_prefetch && host_pool && !((demote || gds) && batch_callback)){
                     auto slot=admit_host(a.id,false);
-                    if(slot>=0){destination=static_cast<char*>(host_arena->data())+size_t(slot)*slot_bytes;host_holds.push_back(host_pool->retain(a.id));}
+                    if(slot>=0){destination=static_cast<char*>(host_arena->data())+hoff(size_t(slot));host_holds.push_back(host_pool->retain(a.id));}
                 }
                 fixed.push_back(destination);
                 for(auto& e:r.extents){counters.nvme_bytes+=e.bytes;counters.layers[expert_layer(a.id)].nvme_bytes+=e.bytes;if(is_prefetch)counters.prefetch_nvme_bytes+=e.bytes;}
@@ -445,7 +471,7 @@ struct OffloadStore::Impl {
                     if(dst>=record_bytes)return;
                     const size_t n=std::min<size_t>(bytes,record_bytes-dst);
                     char* src=static_cast<char*>(fixed[j]?fixed[j]:ring[b]);
-                    ck(cudaMemcpyAsync(vram+disk[j].slot*slot_bytes+dst,src+dst,n,cudaMemcpyHostToDevice,copy));
+                    ck(cudaMemcpyAsync(vram+voff(disk[j].slot)+dst,src+dst,n,cudaMemcpyHostToDevice,copy));
                 },ring_recycle,cfg.io_chunk_bytes);
             } else reader.stream_mixed(refs,ring,fixed,record_ready,ring_recycle,cfg.io_chunk_bytes);
             counters.io_ns+=ns(Clock::now()-io_start);
@@ -494,7 +520,7 @@ struct OffloadStore::Impl {
             int slot=admit_host(id,true,&held);
             if(slot<0)break;
             if(!slots.insert(slot).second){host_pool->release(held);auto e=std::make_exception_ptr(std::logic_error("warm_host reused a slot within one batch"));fail(e);std::rethrow_exception(e);}
-            refs.push_back(&record);fixed.push_back(static_cast<char*>(host_arena->data())+size_t(slot)*slot_bytes);
+            refs.push_back(&record);fixed.push_back(static_cast<char*>(host_arena->data())+hoff(size_t(slot)));
             budget-=bytes;counters.refill_bytes+=bytes;counters.nvme_bytes+=bytes;counters.layers[expert_layer(id)].nvme_bytes+=bytes;
         }
         if(refs.empty()){if(!held.empty())host_pool->release(held);return 0;}
@@ -508,7 +534,10 @@ struct OffloadStore::Impl {
         // Copy-backs share host DRAM bandwidth with H2D demand: start them only after this
         // demand's uploads, i.e. in the compute window that follows (DS41_MOE_DEMOTE_EAGER=1 skips).
         bool waited=demote_eager;
-        for(auto v:pool.reserve(demote_reserve,wanted)) {
+        std::vector<SlotPool::Allocation> victims;
+        if(!pool.classed())victims=pool.reserve(demote_reserve,wanted);
+        else for(size_t c=0;c<cfg.class_bytes.size();++c){auto v=pool.reserve(demote_reserve,wanted,int(c));victims.insert(victims.end(),v.begin(),v.end());}
+        for(auto v:victims) {
             auto x=ExpertId(v.evicted);
             ++counters.evictions;++counters.vram.evictions;
             if(prefetched.erase(x)){++counters.prefetch_wasted;counters.vram.wasted_bytes+=records.at(x).bytes;}
@@ -520,7 +549,7 @@ struct OffloadStore::Impl {
             auto rc=cudaEventQuery(slot_copy[v.slot]);
             if(rc==cudaErrorNotReady)ck(cudaStreamWaitEvent(demote_stream,slot_copy[v.slot],0));else ck(rc);
             if(!waited){ck(cudaStreamWaitEvent(demote_stream,copy_idle,0));waited=true;}
-            ck(cudaMemcpyAsync(static_cast<char*>(host_arena->data())+size_t(hs)*slot_bytes,vram+v.slot*slot_bytes,
+            ck(cudaMemcpyAsync(static_cast<char*>(host_arena->data())+hoff(size_t(hs)),vram+voff(v.slot),
                 records.at(x).bytes,cudaMemcpyDeviceToHost,demote_stream));
             cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,demote_stream));
             demoting[x]=done;draining.push_back({v.slot,x,done,std::move(held)});
@@ -534,9 +563,9 @@ struct OffloadStore::Impl {
         if(policy_audit.is_open())audit_ram.insert(audit_ram.end(),a.begin(),a.end());
         auto v=a.front();
         if(!v.hit){
-            if(!host_arena)host_arena=std::make_shared<HostBuffer>(cfg.host_budget_bytes,true);
+            if(!host_arena)host_arena=std::make_shared<HostBuffer>(host_total,true);
             if(v.evicted>=0){host.erase(ExpertId(v.evicted));++counters.ram.evictions;if(host_prefetched.erase(ExpertId(v.evicted)))counters.ram.wasted_bytes+=records.at(ExpertId(v.evicted)).bytes;}
-            host[id]=v.slot*slot_bytes;++counters.ram.promotions;
+            host[id]=hoff(v.slot);++counters.ram.promotions;
             if(speculative)host_prefetched.insert(id);
         }
         if(hold)hold->insert(hold->end(),a.begin(),a.end());else host_pool->release(a);
@@ -550,7 +579,7 @@ struct OffloadStore::Impl {
     }
     void upload(const SlotPool::Allocation& a,void* src,size_t bytes,bool is_prefetch,bool copy_bytes=true) {
         size_t chunk=cfg.h2d_chunk_bytes?cfg.h2d_chunk_bytes:bytes;
-        if(copy_bytes)for(size_t off=0;off<bytes;off+=chunk)ck(cudaMemcpyAsync(vram+a.slot*slot_bytes+off,static_cast<char*>(src)+off,std::min(chunk,bytes-off),cudaMemcpyHostToDevice,copy));
+        if(copy_bytes)for(size_t off=0;off<bytes;off+=chunk)ck(cudaMemcpyAsync(vram+voff(a.slot)+off,static_cast<char*>(src)+off,std::min(chunk,bytes-off),cudaMemcpyHostToDevice,copy));
         counters.h2d_bytes+=bytes;counters.layers[expert_layer(a.id)].h2d_bytes+=bytes;
         if(is_prefetch)counters.prefetch_h2d_bytes+=bytes;
         if(cfg.ready_flags)ck(cudaMemcpyAsync(ready+a.slot,static_cast<uint32_t*>(generations->data())+a.slot,sizeof(uint32_t),cudaMemcpyHostToDevice,copy));
@@ -641,7 +670,7 @@ OffloadStore::PrefetchTicket OffloadStore::refill_host(std::vector<ExpertId> ids
                 if(!skip){
                     int slot=impl_->admit_host(id,true);if(slot<0)skip=true;
                     else {
-                        try{impl_->reader.read({&record},{static_cast<char*>(impl_->host_arena->data())+size_t(slot)*impl_->slot_bytes});}
+                        try{impl_->reader.read({&record},{static_cast<char*>(impl_->host_arena->data())+impl_->hoff(size_t(slot))});}
                         catch(...){impl_->fail(std::current_exception());throw;}
                         state->budget-=bytes;impl_->counters.refill_bytes+=bytes;impl_->counters.nvme_bytes+=bytes;
                         impl_->counters.layers[expert_layer(id)].nvme_bytes+=bytes;
@@ -695,7 +724,7 @@ void OffloadStore::pin_host(std::vector<ExpertId> ids) {
             bool hit=impl_->host.count(id);int slot=impl_->admit_host(id,false);
             if(slot<0)throw std::runtime_error("pinned host budget exceeded");
             impl_->host_pool->pin(id);pinned.push_back(id);
-            if(!hit)try{impl_->reader.read({&impl_->records.at(id)},{static_cast<char*>(impl_->host_arena->data())+size_t(slot)*impl_->slot_bytes});}catch(...){impl_->fail(std::current_exception());throw;}
+            if(!hit)try{impl_->reader.read({&impl_->records.at(id)},{static_cast<char*>(impl_->host_arena->data())+impl_->hoff(size_t(slot))});}catch(...){impl_->fail(std::current_exception());throw;}
         }
     }).get();
 }
@@ -732,7 +761,7 @@ void OffloadStore::place(const Placement& input) {
     // Placement is a startup operation; fixed allocations cannot grow here.
     impl_->submit([this,p]{
         if(!impl_->live.empty() || !impl_->retired.empty())throw std::logic_error("placement requires quiescent startup store");
-        if(p.vram_pins.size()>impl_->cfg.slots || p.host_residents.size()>impl_->cfg.host_budget_bytes/impl_->slot_bytes)
+        if(p.vram_pins.size()>impl_->cfg.slots || p.host_residents.size()>impl_->host_slot_count)
             throw std::runtime_error("placement exceeds configured tier capacity");
         std::set<ExpertId> selected;std::array<size_t,43> pins{};size_t planned=p.vram_pins.size();
         for(auto n:p.dynamic_slots_per_layer)planned+=n;

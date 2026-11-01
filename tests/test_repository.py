@@ -168,6 +168,31 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(run.environment(cfg, render=False)['DS41_SPARK_STOP_Q'], '0.2')
         self.assertEqual(run.environment(dict(cfg, experts='native'), render=False)['DS41_SPARK_STOP_Q'], '0.65')
 
+    def test_mixed_profile(self):
+        import tempfile
+        import mixed_bank
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / 'k2.placement'
+            src.write_text('pools soft\n' + ''.join(f'vram {l * 384 + e}\n' for l in range(40) for e in range(10)) +
+                           ''.join(f'budget {l} 200\n' for l in range(43)) + 'host 7\nhost_budget 0 1\n')
+            text, slots = mixed_bank.placement(src, {9, 12})
+            budgets = {int(x.split()[1]): int(x.split()[2]) for x in text if x.startswith('budget ')}
+            self.assertEqual(budgets[9], (210 * 8892416 // 13316096) - 10)
+            self.assertEqual(budgets[0], 200)
+            self.assertEqual(slots, 38 * 210 + 2 * (210 * 8892416 // 13316096))
+            out = Path(d) / 'mixed-p80.placement'
+            out.write_text('\n'.join(text) + '\n')
+            self.assertEqual(run.placement_slots(out), slots)
+            self.assertEqual(mixed_bank.parse_layers('9,12,23-25'), [9, 12, 23, 24, 25])
+            cfg = dict(self.config(), experts='mixed', mixed_bank=d, gds=False)
+            with patch.object(run, 'MIXED_PLACEMENT', str(out)), \
+                    patch.object(run, 'meminfo', return_value={'MemTotal': 126573804 * 1024}):
+                cmd = run.command(cfg, Path('/run/ds41/engine.sock'))
+            self.assertEqual(cmd[cmd.index('--expert-slots') + 1], str(slots))
+            self.assertEqual(cmd[cmd.index('--exl3-experts') + 1], str(Path(d) / 'records-mixed.tsv'))
+            self.assertEqual(cmd[cmd.index('--spark-width') + 1], '6')
+            self.assertEqual(run.environment(cfg, render=False)['DS41_SPARK_STOP_Q'], '0.2')
+
     def test_environment(self):
         cfg = dict(self.config(), gds=False)
         env = run.environment(cfg, render=False)
@@ -245,7 +270,8 @@ class ProfileTests(unittest.TestCase):
         # (with s0ma's K2 change the sizes are computed from the width; K3 is still checked to be 13,316,096)
         self.assertIn('auto rec_of = [](uint64_t bits) { return (3 * (320 * 144 * 16 * bits * 2 + 2 * (5120 + 2304)) '
                       '+ 4095) / 4096 * 4096; };', forward)
-        self.assertIn('if (bits == 3 && REC != 13316096) throw std::logic_error("K3 record size");', forward)
+        # (s0ma change 12: the width per layer; K3 is still checked to be 13,316,096)
+        self.assertIn('if (rec_of(3) != 13316096) throw std::logic_error("K3 record size");', forward)
         import k2_bank
         v = k2_bank.VIEWS
         self.assertEqual(k2_bank.REC, 8892416)

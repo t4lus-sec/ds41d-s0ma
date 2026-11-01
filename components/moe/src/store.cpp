@@ -34,6 +34,13 @@ void SlotPool::policy(const Placement& p) {
     }
     budgets_=std::any_of(layer_budgets_.begin(),layer_budgets_.end(),[](size_t n){return n!=0;});
 }
+void SlotPool::classes(std::vector<uint8_t> slot_class,const std::array<uint8_t,43>& layer_class){
+    if(slot_class.size()!=slots_.size())throw std::invalid_argument("slot classes must cover every slot");
+    for(const auto& s:slots_)if(s.id>=0)throw std::logic_error("slot classes require an empty pool");
+    slot_class_=std::move(slot_class);layer_class_=layer_class;classed_=true;dirty_.fill(true);
+}
+int SlotPool::class_of(ExpertId id)const{return classed_?int(layer_class_[layer_of(id)]):-1;}
+bool SlotPool::fits(size_t slot,ExpertId e)const{return !classed_ || slot_class_[slot]==layer_class_[layer_of(e)];}
 void SlotPool::reset_history(){dirty_.fill(true);std::fill(frequency_.begin(),frequency_.end(),0);std::fill(last_use_.begin(),last_use_.end(),0);layer_clocks_.fill(0);clock_=0;}
 void SlotPool::touch(const std::vector<ExpertId>& ids){
     std::vector<ExpertId> unique;std::unordered_set<ExpertId> seen;
@@ -85,6 +92,12 @@ std::vector<SlotPool::Allocation> SlotPool::acquire(const std::vector<ExpertId>&
         for(unsigned l=0;l<43;++l)if(need[l]>avail[l])throw std::runtime_error("need set exceeds hard layer capacity");
     }
     if (ids.size() > available) throw std::runtime_error("need set exceeds unleased slot capacity; split the batch");
+    if(classed_){
+        std::array<size_t,256> need{},avail{};
+        for(auto e:ids)++need[layer_class_[layer_of(e)]];
+        for(size_t j=0;j<slots_.size();++j){const auto& s=slots_[j];if(s.draining)continue;if(s.id<0 || wanted.count(s.id) || (!s.pinned && !s.leases && s.retention.use_count()<=1))++avail[slot_class_[j]];}
+        for(size_t c=0;c<need.size();++c)if(need[c]>avail[c])throw std::runtime_error("need set exceeds unleased slot capacity of its size class; split the batch");
+    }
     for(auto e:ids)dirty_[layer_of(e)]=true;
     if(!prefetch)touch(input);
     std::array<size_t,43> layer_counts{};
@@ -95,10 +108,10 @@ std::vector<SlotPool::Allocation> SlotPool::acquire(const std::vector<ExpertId>&
         bool hit = slot >= 0;
         int64_t evicted=-1;
         if (!hit) {
-            for (size_t s = 0; s < slots_.size(); ++s) if (slots_[s].id < 0 && !slots_[s].draining && (!hard_ || slot_layers_[s]==layer_of(e))) { slot = s; break; }
+            for (size_t s = 0; s < slots_.size(); ++s) if (slots_[s].id < 0 && !slots_[s].draining && (!hard_ || slot_layers_[s]==layer_of(e)) && fits(s,e)) { slot = s; break; }
             if (slot < 0) {
-                if(fast_ && distinct_ && !hard_)slot=fast_victim(wanted,layer_counts);
-                else slot=scan_victim(wanted,layer_counts,hard_?int(layer_of(e)):-1);
+                if(fast_ && distinct_ && !hard_)slot=fast_victim(wanted,layer_counts,class_of(e));
+                else slot=scan_victim(wanted,layer_counts,hard_?int(layer_of(e)):-1,class_of(e));
             }
             if (slot < 0) throw std::logic_error("capacity precheck disagreed");
             evicted=slots_[slot].id;
@@ -111,12 +124,13 @@ std::vector<SlotPool::Allocation> SlotPool::acquire(const std::vector<ExpertId>&
     }
     return result;
 }
-int SlotPool::scan_victim(const std::unordered_set<ExpertId>& wanted,const std::array<size_t,43>& layer_counts,int layer)const {
+int SlotPool::scan_victim(const std::unordered_set<ExpertId>& wanted,const std::array<size_t,43>& layer_counts,int layer,int cls)const {
     int slot=-1;
     for (unsigned pass = 0; pass != 2 && slot < 0; ++pass) {
         for (size_t s = 0; s < slots_.size(); ++s) {
             const auto& c = slots_[s];
             if (c.id < 0) continue;
+            if (cls >= 0 && classed_ && slot_class_[s] != unsigned(cls)) continue;
             if (c.pinned || c.leases || c.retention.use_count()>1 || wanted.count(c.id) || (layer>=0 && slot_layers_[s]!=unsigned(layer))) continue;
             if (!pass && recent_ && last_use_[c.id] && last_use_[c.id] + recent_ >= layer_clocks_[layer_of(c.id)]) continue;
             bool over=budgets_ && layer_counts[layer_of(c.id)]>layer_budgets_[layer_of(c.id)];
@@ -127,16 +141,17 @@ int SlotPool::scan_victim(const std::unordered_set<ExpertId>& wanted,const std::
     }
     return slot;
 }
-std::vector<SlotPool::Allocation> SlotPool::reserve(size_t target,const std::unordered_set<ExpertId>& wanted) {
+std::vector<SlotPool::Allocation> SlotPool::reserve(size_t target,const std::unordered_set<ExpertId>& wanted,int cls) {
     std::vector<Allocation> out;
     if(hard_)throw std::logic_error("reserve requires soft layer budgets");
+    if(!classed_)cls=-1;
     size_t idle=0;
-    for(const auto& s:slots_)if(s.id<0)++idle; // empty or draining
+    for(size_t j=0;j<slots_.size();++j)if(slots_[j].id<0 && (cls<0 || slot_class_[j]==unsigned(cls)))++idle; // empty or draining
     if(idle>=target)return out;
     std::array<size_t,43> layer_counts{};
     for(const auto& s:slots_)if(s.id>=0 && !s.pinned)++layer_counts[layer_of(s.id)];
     while(idle<target) {
-        int slot=fast_ && distinct_?fast_victim(wanted,layer_counts):scan_victim(wanted,layer_counts,-1);
+        int slot=fast_ && distinct_?fast_victim(wanted,layer_counts,cls):scan_victim(wanted,layer_counts,-1,cls);
         if(slot<0)break;
         auto e=ExpertId(slots_[slot].id);
         dirty_[layer_of(e)]=true;++epochs_[layer_of(e)];--layer_counts[layer_of(e)];residency_[e]=-1;
@@ -190,7 +205,7 @@ bool SlotPool::less_slot(size_t a,size_t b)const {
     return std::make_tuple(score(slots_[a].id),slots_[a].stamp,a)<
            std::make_tuple(score(slots_[b].id),slots_[b].stamp,b);
 }
-int SlotPool::fast_victim(const std::unordered_set<ExpertId>& wanted,const std::array<size_t,43>& counts) {
+int SlotPool::fast_victim(const std::unordered_set<ExpertId>& wanted,const std::array<size_t,43>& counts,int cls) {
     for(unsigned l=0;l<43;++l) {
         auto retention=(*retention_epochs_)[l].load(std::memory_order_acquire);
         bool peer_change=(late_[l] || exclusive_) && peer_ && peer_epochs_[l]!=peer_->epochs_[l];
@@ -210,6 +225,7 @@ int SlotPool::fast_victim(const std::unordered_set<ExpertId>& wanted,const std::
     for(unsigned pass=0;pass<2;++pass) {
         int best=-1;bool best_over=false;
         for(unsigned l=0;l<43;++l) {
+            if(cls>=0 && classed_ && layer_class_[l]!=unsigned(cls))continue;   // a layer's residents are all its class
             int j=pass?best_any_[l]:best_old_[l];if(j<0)continue;
             bool over=budgets_ && counts[l]>layer_budgets_[l];
             if(best<0 || (over && !best_over) || (over==best_over && less_slot(j,best))){best=j;best_over=over;}

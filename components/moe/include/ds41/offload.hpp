@@ -21,6 +21,12 @@ public:
         unsigned host_recent_window = 6, host_decay_interval = 32;
         // Explicit idle-window refills only; conservative vs measured 14.17 GB/s.
         double refill_gbps = 8.0;
+        // s0ma change 12: slot classes for records of several sizes (a mixed EXL3 bank, e.g. K2 and K3 layers).
+        // Empty: one class, every slot sized for the largest record (as before). Otherwise class c's slots are
+        // class_bytes[c] each (a multiple of 4096): class_slots[c] in VRAM (summing to slots), class_host_slots[c]
+        // in the RAM tier (their bytes within host_budget_bytes); layer l's records use class layer_class[l].
+        std::vector<size_t> class_bytes, class_slots, class_host_slots;
+        std::array<uint8_t,43> layer_class{};
     };
     struct CachePolicy {
         bool decay256=false, drift_0_50=false, fast_minima=false;

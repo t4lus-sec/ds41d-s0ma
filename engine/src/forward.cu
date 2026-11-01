@@ -305,15 +305,36 @@ class Native final : public Forward, public hotpath::GateEvidence {
       }
       CK(cudaMemcpy(x.p, host.data(), host.size(), cudaMemcpyHostToDevice));
       for (int rows = 2; rows <= 8; ++rows) {
-        for (int r = 0; r < rows; ++r)
-          CK(ds41_dense_cublas(blas, x.as<char>(r * k * el), ptr, y1.as<char>(r * n * el), 1, n, k, f32, 1, stream));
-        CK(ds41_dense_cublas_rows(blas, x.p, ptr, y2.p, rows, n, k, f32, stream));
-        CK(cudaStreamSynchronize(stream));
-        std::vector<char> a(size_t(rows) * n * el), b(a.size());
-        CK(cudaMemcpy(a.data(), y1.p, a.size(), cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(b.data(), y2.p, b.size(), cudaMemcpyDeviceToHost));
+        // s0ma change 8: compare both paths eagerly AND inside a stream capture, as the hot path runs them (eager
+        // before its graphs are ready, captured after). cuBLAS may pick other kernels while capturing, so a shape is
+        // batched only if one call equals one call a row in both modes.
+        bool same_both = true;
+        for (int captured = 0; captured <= 1 && same_both; ++captured) {
+          auto enqueue = [&](bool batched) {
+            if (batched) CK(ds41_dense_cublas_rows(blas, x.p, ptr, y2.p, rows, n, k, f32, stream));
+            else for (int r = 0; r < rows; ++r)
+              CK(ds41_dense_cublas(blas, x.as<char>(r * k * el), ptr, y1.as<char>(r * n * el), 1, n, k, f32, 1, stream));
+          };
+          for (int batched = 0; batched <= 1; ++batched) {
+            if (!captured) { enqueue(batched); continue; }
+            cudaGraph_t g = nullptr; cudaGraphExec_t ge = nullptr;
+            CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            try { enqueue(batched); } catch (...) { cudaStreamEndCapture(stream, &g); if (g) cudaGraphDestroy(g); throw; }
+            CK(cudaStreamEndCapture(stream, &g));
+            CK(cudaGraphInstantiate(&ge, g, 0));
+            CK(cudaGraphLaunch(ge, stream));
+            CK(cudaStreamSynchronize(stream));
+            cudaGraphExecDestroy(ge); cudaGraphDestroy(g);
+          }
+          CK(cudaStreamSynchronize(stream));
+          std::vector<char> a(size_t(rows) * n * el), b(a.size());
+          CK(cudaMemcpy(a.data(), y1.p, a.size(), cudaMemcpyDeviceToHost));
+          CK(cudaMemcpy(b.data(), y2.p, b.size(), cudaMemcpyDeviceToHost));
+          same_both = std::memcmp(a.data(), b.data(), a.size()) == 0;
+          CK(cudaMemsetAsync(y1.p, 0, a.size(), stream)); CK(cudaMemsetAsync(y2.p, 0xff, b.size(), stream));
+        }
         ++tested;
-        if (std::memcmp(a.data(), b.data(), a.size()) == 0) rows_exact.insert({n, k, f32, rows});
+        if (same_both) rows_exact.insert({n, k, f32, rows});
         else inexact.push_back(std::to_string(n) + "x" + std::to_string(k) + (f32 ? " F32" : " BF16") + " rows " +
                                std::to_string(rows));
       }
@@ -901,6 +922,10 @@ public:
               {"expert_nvme_misses", s.nvme_misses - initial_stats.nvme_misses},
               {"expert_h2d_bytes", s.h2d_bytes - initial_stats.h2d_bytes},
               {"expert_nvme_bytes", s.nvme_bytes - initial_stats.nvme_bytes},
+              {"expert_spec_reads", s.spec_reads - initial_stats.spec_reads},     // s0ma change 8
+              {"expert_spec_hits", s.spec_hits - initial_stats.spec_hits},
+              {"expert_spec_waits", s.spec_waits - initial_stats.spec_waits},
+              {"expert_spec_dropped", s.spec_dropped - initial_stats.spec_dropped},
               {"need_host_ms", io_ms},
               {"route_wait_ms", route_ms},
               {"engram_read_ms", engram_ms},

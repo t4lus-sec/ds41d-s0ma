@@ -27,10 +27,16 @@
         "src/prefill/native.inc",
         "src/server.cpp",
         "src/vision.cu",
-        "tests/vision_probe.cpp"
+        "tests/vision_probe.cpp",
+        "include/ds41/ops.cuh",
+        "src/draft_draw.cu",
+        "src/ops.cu",
+        "src/spark_bridge.cpp",
+        "src/speculation.cpp",
+        "third_party/include/ds41/dense.h"
       ],
-      "files": 74,
-      "tree_sha256": "6a114c81625e58e8680cb60d59dee29f1e3b37a133492ef184b1d3e037442ef4"
+      "files": 75,
+      "tree_sha256": "6e6f77c2cdeb87bdbaa2358a0d711080d574d3b4e0507205f936ee890eb0ed9c"
     },
     {
       "path": "components/moe",
@@ -43,7 +49,11 @@
         "CMakeLists.txt"
       ],
       "files": 14,
-      "tree_sha256": "4c97d6b4a08728982c80b1e3ce15157127f0255e79f673ed0a312365ac8fcb78"
+      "tree_sha256": "81fe3b5a81b64b15eda1c7dfcb407496331294e338110ff1f5c866c8837f8953",
+      "release_source_changes": [
+        "include/ds41/store.hpp",
+        "src/offload.cpp"
+      ]
     },
     {
       "path": "components/dense",
@@ -56,7 +66,12 @@
         "CMakeLists.txt"
       ],
       "files": 14,
-      "tree_sha256": "55296f6df6c53e1e37c969a2f0bf9284c1ca910c9000e91537df1ee9c31470b6"
+      "tree_sha256": "55296f6df6c53e1e37c969a2f0bf9284c1ca910c9000e91537df1ee9c31470b6",
+      "release_source_changes": [
+        "include/ds41/dense.h",
+        "src/ops.cu",
+        "tests/rows_check.cu"
+      ]
     },
     {
       "path": "components/attn",
@@ -108,7 +123,13 @@
         "CMakeLists.txt"
       ],
       "files": 6,
-      "tree_sha256": "82378e0a2a288af9e07d82f765cb5bef81afcfbedd930061dbc3623f98c53858"
+      "tree_sha256": "82378e0a2a288af9e07d82f765cb5bef81afcfbedd930061dbc3623f98c53858",
+      "release_source_changes": [
+        "include/ds41/exl3.cuh",
+        "src/device.cuh",
+        "src/exl3.cu",
+        "tests/exl3_check.cu"
+      ]
     }
   ],
   "dependencies": {

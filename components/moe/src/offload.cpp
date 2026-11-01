@@ -95,6 +95,69 @@ struct OffloadStore::Impl {
     bool has_speculative()const {for(const auto& q:speculative)if(!q.empty())return true;return false;}
     bool stopping=false;
     std::thread worker;
+    // s0ma change 8: speculative NVMe reads. A side thread with its own io_uring reads predicted NVMe-tier
+    // records into spec_n pinned slots while the drive is idle (it waits while a demand read is on the drive);
+    // a demand miss found there uploads from the slot like a RAM hit. Placement and I/O only: no math changes.
+    struct SpecSlot { ExpertId id=0; int state=0; int pins=0; uint64_t used=0; };   // state 0 empty, 1 reading, 2 ready
+    size_t spec_n=0;
+    std::unique_ptr<HostBuffer> spec_buf;
+    std::unique_ptr<DirectReader> spec_reader;
+    std::vector<SpecSlot> spec_slots;
+    std::unordered_map<ExpertId,size_t> spec_where;
+    std::deque<ExpertId> spec_queue;
+    std::mutex spec_m;
+    std::condition_variable spec_cv;
+    std::atomic<int> demand_io{0};
+    bool spec_stop=false;
+    uint64_t spec_tick=0;
+    std::thread spec_thread;
+    struct SpecRelease { size_t slot; cudaEvent_t event; };
+    std::deque<SpecRelease> spec_release;   // worker only
+    std::atomic<uint64_t> spec_reads{0},spec_hits{0},spec_waits{0},spec_dropped{0},spec_queued{0};
+    void spec_loop() {
+        for(;;) {
+            ExpertId id=0;size_t s=0;
+            {
+                std::unique_lock<std::mutex> l(spec_m);
+                spec_cv.wait(l,[this]{return spec_stop || !spec_queue.empty();});
+                if(spec_stop)return;
+                id=spec_queue.front();spec_queue.pop_front();
+                if(spec_where.count(id))continue;
+                size_t best=spec_n;
+                for(size_t j=0;j<spec_n;++j){
+                    auto& x=spec_slots[j];
+                    if(x.state==0){best=j;break;}
+                    if(x.state==2 && !x.pins && (best==spec_n || x.used<spec_slots[best].used))best=j;
+                }
+                if(best==spec_n){++spec_dropped;continue;}
+                auto& x=spec_slots[best];
+                if(x.state==2)spec_where.erase(x.id);
+                x.id=id;x.state=1;x.pins=0;x.used=++spec_tick;spec_where[id]=best;s=best;
+            }
+            // Demand first: while a demand read is on the drive, wait (bounded at 20 ms).
+            for(int i=0;i<400 && demand_io.load()>0;++i)std::this_thread::sleep_for(std::chrono::microseconds(50));
+            bool ok=true;
+            try{spec_reader->read({&records.at(id)},{static_cast<char*>(spec_buf->data())+s*slot_bytes});}catch(...){ok=false;}
+            {
+                std::lock_guard<std::mutex> l(spec_m);
+                auto& x=spec_slots[s];
+                if(ok){x.state=2;++spec_reads;}else{x.state=0;spec_where.erase(id);}
+            }
+            spec_cv.notify_all();
+        }
+    }
+    void spec_enqueue(const std::vector<ExpertId>& ids) {   // worker: ids already known to be NVMe-tier
+        if(!spec_n || ids.empty())return;
+        {
+            std::lock_guard<std::mutex> l(spec_m);
+            for(auto id:ids){
+                if(spec_where.count(id) || std::find(spec_queue.begin(),spec_queue.end(),id)!=spec_queue.end())continue;
+                spec_queue.push_back(id);++spec_queued;
+                while(spec_queue.size()>spec_n){spec_queue.pop_front();++spec_dropped;}
+            }
+        }
+        spec_cv.notify_all();
+    }
 
     Impl(std::vector<Record> input,Config c) : cfg(c),pool(c.slots,c.recent_window,c.decay_interval,c.distinct_lfu),reader(c.io_depth) {
         if ((cfg.io_chunk_bytes && cfg.io_chunk_bytes%4096) || !cfg.staging_slots || !cfg.prefetch_batch || input.empty()) throw std::invalid_argument("empty records/staging/prefetch batch");
@@ -147,6 +210,14 @@ struct OffloadStore::Impl {
         staging=std::make_unique<HostBuffer>(slot_bytes*cfg.staging_slots,true);
         staging_copy.resize(cfg.staging_slots,nullptr);
         for(auto& e:staging_copy)ck(cudaEventCreateWithFlags(&e,cudaEventDisableTiming));
+        if(const char* v=std::getenv("DS41_MOE_SPEC_NVME"))spec_n=std::stoul(v);
+        if(spec_n){
+            if(spec_n>256)throw std::invalid_argument("DS41_MOE_SPEC_NVME: at most 256 slots");
+            spec_buf=std::make_unique<HostBuffer>(slot_bytes*spec_n,true);
+            spec_reader=std::make_unique<DirectReader>(32);
+            spec_slots.resize(spec_n);
+            spec_thread=std::thread([this]{spec_loop();});
+        }
         entries=std::make_unique<HostBuffer>(expert_count*sizeof(DeviceExpert),true);
         generations=std::make_unique<HostBuffer>(cfg.slots*sizeof(uint32_t),true);
         worker=std::thread([this]{
@@ -179,8 +250,10 @@ struct OffloadStore::Impl {
         guard.active=false;
     }
     ~Impl() {
+        if(spec_thread.joinable()){{std::lock_guard<std::mutex> l(spec_m);spec_stop=true;}spec_cv.notify_all();spec_thread.join();}
         {std::lock_guard<std::mutex> lock(mutex);stopping=true;}cv.notify_one();
         if(worker.joinable())worker.join();
+        for(auto& r:spec_release){cudaEventSynchronize(r.event);cudaEventDestroy(r.event);}
         // The caller must retire graph consumers before destruction. Waiting
         // here also prevents unregistering host sources still used by DMA.
         for(auto& r:retired){cudaEventSynchronize(r.event);cudaEventDestroy(r.event);}
@@ -222,6 +295,11 @@ struct OffloadStore::Impl {
         cv.notify_one();return future;
     }
     void collect(bool wait) {
+        for(auto it=spec_release.begin();it!=spec_release.end();){
+            auto rc=cudaEventQuery(it->event);if(rc==cudaErrorNotReady){++it;continue;}ck(rc);
+            {std::lock_guard<std::mutex> l(spec_m);--spec_slots[it->slot].pins;}
+            ck(cudaEventDestroy(it->event));it=spec_release.erase(it);
+        }
         for(auto it=draining.begin();it!=draining.end();) {
             auto rc=cudaEventQuery(it->event);if(rc==cudaErrorNotReady){++it;continue;}ck(rc);
             pool.drained(it->slot);if(!it->held.empty())host_pool->release(it->held);
@@ -299,6 +377,29 @@ struct OffloadStore::Impl {
                 upload(a,static_cast<char*>(host_arena->data())+h->second,records.at(a.id).bytes,is_prefetch);
                 if(streaming)notify(a);
             }
+            if(spec_n && !is_prefetch && !disk.empty()) {
+                std::vector<SlotPool::Allocation> rest;
+                for(auto a:disk){
+                    size_t s=SIZE_MAX;
+                    {
+                        std::unique_lock<std::mutex> l(spec_m);
+                        auto it=spec_where.find(a.id);
+                        if(it!=spec_where.end() && spec_slots[it->second].state==1){
+                            ++spec_waits;   // in flight: finishing it is sooner than a fresh read
+                            spec_cv.wait(l,[&]{auto f=spec_where.find(a.id);return f==spec_where.end() || spec_slots[f->second].state!=1;});
+                            it=spec_where.find(a.id);
+                        }
+                        if(it!=spec_where.end() && spec_slots[it->second].state==2){s=it->second;++spec_slots[s].pins;spec_slots[s].used=++spec_tick;}
+                    }
+                    if(s==SIZE_MAX){rest.push_back(a);continue;}
+                    ++spec_hits;
+                    upload(a,static_cast<char*>(spec_buf->data())+s*slot_bytes,records.at(a.id).bytes,false);
+                    cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,copy));
+                    spec_release.push_back({s,done});
+                    if(streaming)notify(a);
+                }
+                disk.swap(rest);
+            }
             if(gds && batch_callback && !is_prefetch && !disk.empty()) {
                 std::vector<const Record*> direct;std::vector<size_t> offsets;
                 for(auto a:disk) {
@@ -330,6 +431,7 @@ struct OffloadStore::Impl {
             }
             for(size_t j=0;j<std::min(cfg.staging_slots,disk.size());++j)ring.push_back(static_cast<char*>(staging->data())+j*slot_bytes);
             auto io_start=Clock::now();
+            struct DemandIo{std::atomic<int>& n;bool on;DemandIo(std::atomic<int>& c,bool o):n(c),on(o){if(on)++n;}~DemandIo(){if(on)--n;}} demand_io_guard(demand_io,!refs.empty() && !is_prefetch);
             auto record_ready=[&](size_t j,size_t b){
                 auto a=disk[j];upload(a,fixed[j]?fixed[j]:ring[b],refs[j]->bytes,is_prefetch,!chunk_upload);
                 if(!fixed[j])ck(cudaEventRecord(staging_copy[b],copy));
@@ -501,7 +603,9 @@ OffloadStore::PrefetchTicket OffloadStore::prefetch_impl(std::vector<ExpertId> i
         impl_->submit([this,chunk=std::move(chunk),state,last,ram_only]()mutable{
             if(state->cancelled->load() || state->error){state->result.cancelled+=chunk.size();impl_->counters.prefetch_cancelled+=chunk.size();}
             else try{
-                if(ram_only){auto end=std::remove_if(chunk.begin(),chunk.end(),[this](ExpertId id){impl_->records.at(id);return !impl_->host.count(id) && impl_->pool.residency(id)<0;});size_t n=chunk.end()-end;chunk.erase(end,chunk.end());state->result.cancelled+=n;impl_->counters.prefetch_cancelled+=n;}
+                if(ram_only){auto end=std::remove_if(chunk.begin(),chunk.end(),[this](ExpertId id){impl_->records.at(id);return !impl_->host.count(id) && impl_->pool.residency(id)<0;});size_t n=chunk.end()-end;
+                    impl_->spec_enqueue(std::vector<ExpertId>(end,chunk.end()));   // s0ma change 8 (no-op unless DS41_MOE_SPEC_NVME)
+                    chunk.erase(end,chunk.end());state->result.cancelled+=n;impl_->counters.prefetch_cancelled+=n;}
                 if(auto e=impl_->error())std::rethrow_exception(e);if(!chunk.empty())impl_->load(chunk,nullptr,true);state->result.submitted+=chunk.size();}catch(...){state->error=std::current_exception();}
             if(last){if(state->error)state->promise.set_exception(state->error);else state->promise.set_value(state->result);}
         },int(priority));
@@ -655,5 +759,6 @@ void OffloadStore::check_error(){if(auto e=impl_->error())std::rethrow_exception
 std::vector<uint8_t> OffloadStore::residency_snapshot(){return impl_->submit([this]{std::vector<uint8_t> result(expert_count);for(auto [id,record]:impl_->records)result[id]=(impl_->pool.residency(id)>=0?1:0)|(impl_->host.count(id)?2:0);return result;}).get();}
 const DeviceExpert* OffloadStore::table()const{return impl_->table;}
 int OffloadStore::residency(ExpertId id){return impl_->submit([this,id]{return impl_->pool.residency(id);}).get();}
-Stats OffloadStore::stats(){return impl_->submit([this]{return impl_->counters;}).get();}
+Stats OffloadStore::stats(){return impl_->submit([this]{auto s=impl_->counters;s.spec_reads=impl_->spec_reads;s.spec_hits=impl_->spec_hits;
+    s.spec_waits=impl_->spec_waits;s.spec_dropped=impl_->spec_dropped;s.spec_queued=impl_->spec_queued;return s;}).get();}
 } // namespace ds41

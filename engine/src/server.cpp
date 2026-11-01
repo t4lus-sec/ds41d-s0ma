@@ -747,7 +747,8 @@ public:
     for (const char *key :
          {"expert_vram_hits", "expert_host_hits", "expert_nvme_misses",
           "expert_h2d_bytes", "expert_nvme_bytes", "mtp_expert_requests",
-          "mtp_expert_vram_hits", "mtp_expert_host_hits", "mtp_expert_nvme_misses"}) {
+          "mtp_expert_vram_hits", "mtp_expert_host_hits", "mtp_expert_nvme_misses",
+          "expert_spec_reads", "expert_spec_hits", "expert_spec_waits", "expert_spec_dropped"}) {
       if (!after.contains(key))
         continue;
       uint64_t a = after.at(key).get<uint64_t>(),

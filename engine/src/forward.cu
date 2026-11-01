@@ -278,7 +278,54 @@ class Native final : public Forward, public hotpath::GateEvidence {
   const bool prefill_chunk_fit = [] { const char *v = std::getenv("DS41_PREFILL_CHUNK_FIT"); return v && std::string(v) == "1"; }();
   // s0ma leg 26: a verify step's per-row cuBLAS rows, hyper-connection mixes and route weights in one launch each,
   // every row computed as on its own (DS41_ROWS_BATCHED=1; tokens checked identical by the lab's benchmark).
-  const bool rows_batched = [] { const char *v = std::getenv("DS41_ROWS_BATCHED"); return v && std::string(v) == "1"; }();
+  // s0ma change 10: "1" (or "all") batches all three; a comma list picks parts: dense (cuBLAS rows), hc (the mixes'
+  // promotion and Sinkhorn), route (route weights), to find which one changes tokens.
+  const int rows_parts = [] {
+    const char *v = std::getenv("DS41_ROWS_BATCHED");
+    if (!v || !*v || std::string(v) == "0") return 0;
+    if (std::string(v) == "1" || std::string(v) == "all") return 7;
+    int parts = 0; std::string s(v), part;
+    for (size_t i = 0; i <= s.size(); ++i) {
+      if (i < s.size() && s[i] != ',') { part += s[i]; continue; }
+      if (part == "dense") parts |= 1; else if (part == "hc") parts |= 2; else if (part == "route") parts |= 4;
+      else throw std::invalid_argument("DS41_ROWS_BATCHED: 1, all, or a comma list of dense, hc, route");
+      part.clear();
+    }
+    return parts;
+  }();
+  const bool rows_batched = rows_parts != 0;
+  const bool rows_dense = rows_parts & 1, rows_hc = rows_parts & 2, rows_route = rows_parts & 4;
+  // s0ma change 10: DS41_ROWS_VERIFY=1 recomputes every batched cuBLAS call one row at a time outside graph capture
+  // and logs the shapes where the bits differ ("rows verify: ..." on stderr). A diagnostic: it syncs every call.
+  const bool rows_verify = [] { const char *v = std::getenv("DS41_ROWS_VERIFY"); return v && std::string(v) == "1"; }();
+  Device rows_verify_buf;
+  uint64_t rows_verify_calls = 0, rows_verify_bad = 0;
+  std::set<std::tuple<int, int, int, int>> rows_verify_seen;
+  static bool aligned256(const void *p) { return (reinterpret_cast<uintptr_t>(p) & 255) == 0; }
+  void rows_verify_call(const void *in, const void *weight, const void *out, int n, int k, bool f32, int m) {
+    cudaStreamCaptureStatus cs;
+    CK(cudaStreamIsCapturing(stream, &cs));
+    if (cs != cudaStreamCaptureStatusNone) return;
+    const size_t el = f32 ? 4 : 2, bytes = size_t(m) * n * el;
+    if (rows_verify_buf.bytes < bytes) rows_verify_buf.resize(bytes);
+    for (int r = 0; r < m; ++r)
+      CK(ds41_dense_cublas(blas, static_cast<const char *>(in) + size_t(r) * k * el, weight,
+                           rows_verify_buf.as<char>(size_t(r) * n * el), 1, n, k, f32, 1, stream));
+    std::vector<char> a(bytes), b(bytes);
+    CK(cudaMemcpyAsync(a.data(), out, bytes, cudaMemcpyDeviceToHost, stream));
+    CK(cudaMemcpyAsync(b.data(), rows_verify_buf.p, bytes, cudaMemcpyDeviceToHost, stream));
+    CK(cudaStreamSynchronize(stream));
+    ++rows_verify_calls;
+    if (std::memcmp(a.data(), b.data(), bytes)) {
+      ++rows_verify_bad;
+      if (rows_verify_seen.insert({n, k, int(f32), m}).second)
+        std::cerr << "rows verify: DIFFERS " << n << "x" << k << (f32 ? " F32" : " BF16") << " rows " << m
+                  << " (in " << (aligned256(in) ? "" : "un") << "aligned, out " << (aligned256(out) ? "" : "un")
+                  << "aligned)\n";
+    }
+    if (rows_verify_calls % 5000 == 0)
+      std::cerr << "rows verify: " << rows_verify_calls << " batched calls checked, " << rows_verify_bad << " differ\n";
+  }
   // (N, K, F32?, rows) for which one batched call gave the same bits as one M=1 call a row, tested at load on every
   // F32/BF16 matrix shape of the checkpoint (cuBLAS picks its kernel by shape and batch count, not by the data).
   std::set<std::tuple<int, int, int, int>> rows_exact;
@@ -570,7 +617,7 @@ public:
       consumer_readiness=std::make_unique<hotpath::ConsumerReadiness>();
     }
     reset();
-    if (rows_batched) check_rows_batched();
+    if (rows_dense) check_rows_batched();
     std::cerr << "ds41d native M1 loaded; UNQUALIFIED; expert slots="
               << c.expert_slots << (exl3 ? (exl3_bits_loaded == 2 ? " (EXL3 K2 target experts, native MTP store)"
                                                    : " (EXL3 K3 target experts, native MTP store)") : "") << "\n";

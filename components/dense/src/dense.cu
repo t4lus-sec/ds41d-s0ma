@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include "ds41/dense.h"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -5,7 +14,7 @@
 namespace {
 using bf16=__nv_bfloat16;
 __device__ __forceinline__ float e8(uint8_t x){return x==0?__uint_as_float(0x00400000):x==255?__uint_as_float(0x7fffffff):__uint_as_float(uint32_t(x)<<23);}
-__global__ void quant(const bf16* x,uint8_t* a,uint8_t* s,int groups){
+__global__ void quant(const bf16* x,uint8_t* a,uint8_t* s,int groups){DS41_PDL_WAIT();
  int g=(blockIdx.x*blockDim.x+threadIdx.x)/32,lane=threadIdx.x&31;if(g>=groups)return;
  float v=__bfloat162float(x[g*32+lane]),vmax=fabsf(v);
  for(int d=16;d;d>>=1)vmax=fmaxf(vmax,__shfl_xor_sync(0xffffffff,vmax,d));
@@ -22,7 +31,7 @@ __device__ __forceinline__ void mma_scaled(float (&c)[4],const uint32_t (&a)[4],
  asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %11, {0, 0};"
  :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3]):"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b[0]),"r"(b[1]),"r"(sa),"r"(sb));
 }
-__global__ void basic(const uint8_t* x,const uint8_t* xs,const uint8_t* w,const uint8_t* ws,bf16* y,int M,int N,int K){
+__global__ void basic(const uint8_t* x,const uint8_t* xs,const uint8_t* w,const uint8_t* ws,bf16* y,int M,int N,int K){DS41_PDL_WAIT();
  int lane=threadIdx.x&31,warp=threadIdx.x>>5,g=lane>>2,t=lane&3,row=blockIdx.x*64+warp*16+g,ng=K/32;
  float acc[4]={0,0,0,0};
  for(int j=0;j<ng;++j){uint32_t a[4]={0,0,0,0},b[2]={0,0};
@@ -35,7 +44,7 @@ __global__ void basic(const uint8_t* x,const uint8_t* xs,const uint8_t* w,const 
 }
 // Every k32 dot is retained individually. The warp carry is serial in ascending K, never split-K sums.
 template<int K,int Warps=8,bool Native=false,int NativeCols=8>
-__global__ void __launch_bounds__(Warps*32,1) parallel(const uint8_t* x,const uint8_t* xs,const uint8_t* w,const uint8_t* ws,bf16* y,int M,int N){
+__global__ void __launch_bounds__(Warps*32,1) parallel(const uint8_t* x,const uint8_t* xs,const uint8_t* w,const uint8_t* ws,bf16* y,int M,int N){DS41_PDL_WAIT();
  constexpr int ng=K/32,G=(ng+Warps-1)/Warps,Cols=Native?NativeCols:16,Count=Native?2:4;
  __shared__ float carry[Warps][32*Count];
  int lane=threadIdx.x&31,warp=threadIdx.x>>5,g=lane>>2,t=lane&3,n0=blockIdx.x*Cols;
@@ -74,7 +83,7 @@ __global__ void __launch_bounds__(Warps*32,1) parallel(const uint8_t* x,const ui
    else for(int hr=0;hr<2;++hr)for(int cc=0;cc<2;++cc){int token=t*2+cc;if(n0+g+hr*8<N&&token<M)y[token*N+n0+g+hr*8]=__float2bfloat16_rn(acc[hr*2+cc]);}}
  }__syncthreads();}
 }
-__global__ void dequant(const uint8_t*w,const uint8_t*ws,bf16*y,int N,int K,bool activation){size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(size_t)N*K)return;
+__global__ void dequant(const uint8_t*w,const uint8_t*ws,bf16*y,int N,int K,bool activation){DS41_PDL_WAIT();size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(size_t)N*K)return;
  __nv_fp8_e4m3 f;f.__x=w[i];int row=i/K,col=i%K,si=(activation?row:row/32)*(K/32)+col/32;y[i]=__float2bfloat16_rn(__fmul_rn(float(f),e8(ws[si])));
 }
 }

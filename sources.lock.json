@@ -35,8 +35,8 @@
         "src/speculation.cpp",
         "third_party/include/ds41/dense.h"
       ],
-      "files": 76,
-      "tree_sha256": "6de7468e2a37e62873b4da7fa0af84b1f7ae7a36da947513811a7b35f6d1925a"
+      "files": 78,
+      "tree_sha256": "9e1d0d47ec50765003b569350da638e03d7bbd6e68de4fd9d8c563dbc2d5d8d4"
     },
     {
       "path": "components/moe",
@@ -49,7 +49,7 @@
         "CMakeLists.txt"
       ],
       "files": 14,
-      "tree_sha256": "32135be62ea9a42331b77f2f708ed952c6335ba1ef21c3dfd8843c2082535a07",
+      "tree_sha256": "cd4342e47115c2179cce0d398ed38f4b9f972847f0d73ab7beca81a73e346ac4",
       "release_source_changes": [
         "include/ds41/store.hpp",
         "src/offload.cpp",
@@ -68,7 +68,7 @@
         "CMakeLists.txt"
       ],
       "files": 14,
-      "tree_sha256": "55296f6df6c53e1e37c969a2f0bf9284c1ca910c9000e91537df1ee9c31470b6",
+      "tree_sha256": "26f7bbb6e4494a69822d78a453a8282ce452a060f9bd26a472171a4db628cec0",
       "release_source_changes": [
         "include/ds41/dense.h",
         "src/ops.cu",
@@ -86,7 +86,7 @@
         "build.sh"
       ],
       "files": 13,
-      "tree_sha256": "dcd4805b0e9b01b60be2eff31e75028b28451a4669c94f38102e912c970a490f"
+      "tree_sha256": "9fda0919470983bc6fb3914d8ee3e48f6c63c0a5d9f63d9476eaeb97484a36f9"
     },
     {
       "path": "components/spark-policy",
@@ -112,7 +112,7 @@
         "CMakeLists.txt"
       ],
       "files": 5,
-      "tree_sha256": "ba1601bcfbf774fad4ac421f1092bdeaebe4ca96e3e9955116fb48f49bf67e51"
+      "tree_sha256": "0b08de872f82ab757ad98104c955a773a36531c045e90af420be57b61201b0d3"
     },
     {
       "path": "components/exl3",
@@ -125,7 +125,7 @@
         "CMakeLists.txt"
       ],
       "files": 6,
-      "tree_sha256": "c5009d6ceb5d33b793e3034083902f861baada696ba00265d368bdcfb790606a",
+      "tree_sha256": "7290a22a8642cd9d7c118856ea9fa16315f1b41f65b2f2f85cb6470d0b29f2f9",
       "release_source_changes": [
         "include/ds41/exl3.cuh",
         "src/device.cuh",

@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include "ds41/hotpath/kernels.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -5,14 +14,14 @@ namespace ds41e::hotpath {
 namespace {
 using B = __nv_bfloat16;
 constexpr int H = 5120;
-__global__ void embed(const B *table, const int *tokens, B *h, float *pre) {
+__global__ void embed(const B *table, const int *tokens, B *h, float *pre) {DS41_PDL_WAIT();
   int row = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < 4 * H) h[row * 4 * H + i] = table[tokens[row] * H + i % H];
   if (i < 4) pre[row * 4 + i] = i == 0 ? 1.f : 0.f;
 }
 __global__ void gather(const uint8_t *x, const uint8_t *s, const float *w,
                        const int *source, const int *slots, uint8_t *out,
-                       uint8_t *os, float *ow) {
+                       uint8_t *os, float *ow) {DS41_PDL_WAIT();
   int r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < H) out[r * H + i] = x[source[r] * H + i];
   if (i < H / 32) os[r * (H / 32) + i] = s[source[r] * (H / 32) + i];
@@ -20,16 +29,16 @@ __global__ void gather(const uint8_t *x, const uint8_t *s, const float *w,
 }
 // EXL3 experts take BF16 rows: the same route gather without FP8 quantization.
 __global__ void gather_bf16(const B *x, const float *w, const int *source,
-                            const int *slots, B *out, float *ow) {
+                            const int *slots, B *out, float *ow) {DS41_PDL_WAIT();
   int r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < H) out[r * H + i] = x[source[r] * H + i];
   if (!i) ow[r] = w[slots[r]];
 }
-__global__ void scatter(const B *in, const int *slots, B *out) {
+__global__ void scatter(const B *in, const int *slots, B *out) {DS41_PDL_WAIT();
   int r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < H) out[slots[r] * H + i] = in[r * H + i];
 }
-__global__ void capture(const B *h, B *out, int layer) {
+__global__ void capture(const B *h, B *out, int layer) {DS41_PDL_WAIT();
   int r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= H) return;
   h += r * 4 * H;
@@ -38,7 +47,7 @@ __global__ void capture(const B *h, B *out, int layer) {
       __bfloat162float(h[3*H+i]));
   out[(r * 3 + layer) * H + i] = __float2bfloat16_rn(__fmul_rn(sum, .25f));
 }
-__global__ void rms(const B *x,const B *w,B *y,int k) {
+__global__ void rms(const B *x,const B *w,B *y,int k) {DS41_PDL_WAIT();
   __shared__ float sh[512];
   int r=blockIdx.x,t=threadIdx.x;
   float v[4]={0,0,0,0};
@@ -62,7 +71,7 @@ __global__ void rms(const B *x,const B *w,B *y,int k) {
       __fmul_rn(__fmul_rn(__bfloat162float(x[r*k+i]),sh[0]),__bfloat162float(w[i])));
 }
 __global__ void activation(const B *gate,const B *up,const float *weights,
-                           const int *rows,uint8_t *q,uint8_t *s,int groups) {
+                           const int *rows,uint8_t *q,uint8_t *s,int groups) {DS41_PDL_WAIT();
   int group=blockIdx.x*4+threadIdx.x/32,lane=threadIdx.x%32;
   if(group>=groups) return;
   int row=rows[blockIdx.y],col=group*32+lane,off=row*2304+col;
@@ -81,7 +90,7 @@ __global__ void activation(const B *gate,const B *up,const float *weights,
 }
 // activation() up to its BF16 rounding, which is the EXL3 down projection's input.
 __global__ void activation_bf16(const B *gate,const B *up,const float *weights,
-                                const int *rows,B *out) {
+                                const int *rows,B *out) {DS41_PDL_WAIT();
   int row=rows[blockIdx.y],col=blockIdx.x*blockDim.x+threadIdx.x;
   if(col>=2304) return;
   int off=row*2304+col;
@@ -91,7 +100,7 @@ __global__ void activation_bf16(const B *gate,const B *up,const float *weights,
   out[off]=__float2bfloat16_rn(__fmul_rn(weights[row],z));
 }
 __global__ void frequencies(const float *table,float *main,float *compressed,
-                            const int64_t *position,int rows,int context) {
+                            const int64_t *position,int rows,int context) {DS41_PDL_WAIT();
   int i=threadIdx.x+blockIdx.x*blockDim.x;
   if(i>=rows*64) return;
   int r=i/64,d=i%64;int64_t p=*position+r;
@@ -101,13 +110,13 @@ __global__ void frequencies(const float *table,float *main,float *compressed,
   compressed[r*64+d]=table[(context+cp)*64+d];
 }
 __global__ void store(const uint8_t *records,uint8_t *global,const int64_t *position,
-                      int rows,int bytes,int ratio) {
+                      int rows,int bytes,int ratio) {DS41_PDL_WAIT();
   int i=threadIdx.x+blockIdx.x*blockDim.x;
   if(i>=rows*bytes) return;
   int r=i/bytes;int64_t p=*position+r;
   if((p+1)%ratio==0) global[((p+1)/ratio-1)*bytes+i%bytes]=records[i];
 }
-__global__ void aux(const int *visible,int *out,int rows,int divisor,int fixed) {
+__global__ void aux(const int *visible,int *out,int rows,int divisor,int fixed) {DS41_PDL_WAIT();
   int r=threadIdx.x;
   if(r<rows) out[r]=fixed>=0?fixed:(visible[r]+divisor-1)/divisor;
 }

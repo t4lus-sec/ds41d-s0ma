@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include "ds41/attention.h"
 #include "ds41/blas_runtime.hpp"
 #include "ds41/hotpath/kernels.cuh"
@@ -44,7 +53,7 @@ namespace {
 // expert uploads (H2D) and RAM demotions (D2H). Mapped pinned memory avoids both engines.
 // Batched zero-copy: block i copies segment i; the segment table itself lives in mapped pinned memory.
 struct ZcSeg { const unsigned char *src; unsigned char *dst; unsigned long long n; };
-__global__ void zc_multi(const ZcSeg *__restrict__ segs, int count) {
+__global__ void zc_multi(const ZcSeg *__restrict__ segs, int count) {DS41_PDL_WAIT();
   for (int s = blockIdx.x; s < count; s += gridDim.x) {
     const ZcSeg g = segs[s];
     for (size_t i = size_t(threadIdx.x) * 16; i < g.n; i += size_t(blockDim.x) * 16) {
@@ -55,7 +64,7 @@ __global__ void zc_multi(const ZcSeg *__restrict__ segs, int count) {
     }
   }
 }
-__global__ void zc_copy(const unsigned char *__restrict__ src, unsigned char *__restrict__ dst, size_t n) {
+__global__ void zc_copy(const unsigned char *__restrict__ src, unsigned char *__restrict__ dst, size_t n) {DS41_PDL_WAIT();
   const size_t stride = size_t(gridDim.x) * blockDim.x * 16;
   for (size_t i = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 16; i < n; i += stride) {
     if (i + 16 <= n && !(reinterpret_cast<uintptr_t>(src + i) & 15) && !(reinterpret_cast<uintptr_t>(dst + i) & 15))
@@ -148,6 +157,9 @@ struct Phase {
       cudaEventDestroy(end);
   }
 };
+// s0ma change 32 (N4): programmatic edges between ds41d's own kernels in each captured graph (pdl_graph.cpp)
+extern "C" int ds41_pdl_mode();
+extern "C" int ds41_pdl_rewrite(cudaGraph_t graph, int mode, size_t *edges);
 struct Graph {
   cudaGraph_t graph = nullptr;
   cudaGraphExec_t exec = nullptr;
@@ -254,6 +266,8 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::map<std::string, std::unique_ptr<Graph>> graphs;
   uint64_t graph_replays = 0, initial_replays = 0;
   uint64_t graph_captures = 0, initial_captures = 0;
+  uint64_t pdl_edges = 0, pdl_graphs = 0;   // s0ma change 32
+  bool pdl_off = false;
   uint64_t graph_evictions = 0, initial_evictions = 0;
   std::array<std::array<int,40>,6> attention_scan_bucket{};
   bool graph_ready = false;
@@ -1152,6 +1166,12 @@ public:
     j["graph_captures"] = graph_captures - initial_captures;
     j["graph_evictions"] = graph_evictions - initial_evictions;
     j["graph_replays"] = graph_replays - initial_replays;
+    if (ds41_pdl_mode() > 0) {   // s0ma change 32
+      j["pdl_mode"] = ds41_pdl_mode();
+      j["pdl_graphs"] = pdl_graphs;
+      j["pdl_edges"] = pdl_edges;
+      j["pdl_refused"] = pdl_off;
+    }
     if (async_engram) {
       auto stats = async_engram->stats();
       for (const char *key : {"submitted_rows", "cache_hits", "unique_misses",
@@ -1352,7 +1372,28 @@ private:
       throw;
     }
     CK(cudaStreamEndCapture(stream, &recorded->graph));
-    CK(cudaGraphInstantiate(&recorded->exec, recorded->graph, 0));
+    if (ds41_pdl_mode() < 0) throw std::invalid_argument("DS41_PDL takes 0, 1 or 2");
+    if (const int mode = ds41_pdl_mode(); mode > 0 && !pdl_off) {
+      // s0ma change 32: rewrite a clone; if the driver refuses it, keep the graph as captured (and stop trying)
+      cudaGraph_t clone = nullptr;
+      size_t edges = 0;
+      bool done = cudaGraphClone(&clone, recorded->graph) == cudaSuccess &&
+                  ds41_pdl_rewrite(clone, mode, &edges) == cudaSuccess &&
+                  cudaGraphInstantiate(&recorded->exec, clone, 0) == cudaSuccess;
+      if (done) {
+        cudaGraphDestroy(recorded->graph);
+        recorded->graph = clone;
+        pdl_edges += edges;
+        ++pdl_graphs;
+      } else {
+        if (clone) cudaGraphDestroy(clone);
+        recorded->exec = nullptr;
+        cudaGetLastError();
+        pdl_off = true;
+        std::cerr << "DS41_PDL: graph " << key << " refused programmatic edges; graphs stay as captured\n";
+      }
+    }
+    if (!recorded->exec) CK(cudaGraphInstantiate(&recorded->exec, recorded->graph, 0));
     CK(cudaGraphLaunch(recorded->exec, stream));
     ++graph_replays;
     graphs.emplace(key, std::move(recorded));

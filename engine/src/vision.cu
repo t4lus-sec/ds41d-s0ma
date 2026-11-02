@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 // Vision tower + aligner for image prompts (official inference/vision.py and image_processor.py).
 // Arithmetic follows the reference's BF16 module graph: every linear multiplies BF16 operands with FP32
 // accumulation and rounds once (bias added in FP32 first), RMSNorm/RoPE/SiLU/GELU/softmax run in FP32 and
@@ -52,7 +61,7 @@ struct Max {
 };
 
 // load_image: float32 pixels / 255, then (x - 0.5) / 0.5, then BF16; patch features ordered (c, py, px).
-__global__ void patchify(const uint8_t *__restrict__ px, Bf16 *__restrict__ out, int nw) {
+__global__ void patchify(const uint8_t *__restrict__ px, Bf16 *__restrict__ out, int nw) {DS41_PDL_WAIT();
   const int n = blockIdx.x, i = n / nw, j = n % nw, width = nw * PATCH;
   for (int f = threadIdx.x; f < PDIM; f += blockDim.x) {
     const int c = f / (PATCH * PATCH), r = f % (PATCH * PATCH), py = r / PATCH, pxl = r % PATCH;
@@ -63,20 +72,20 @@ __global__ void patchify(const uint8_t *__restrict__ px, Bf16 *__restrict__ out,
 }
 // out = BF16(acc + bias)
 __global__ void bias_cast(const float *__restrict__ acc, const Bf16 *__restrict__ bias, Bf16 *__restrict__ out,
-                          size_t total, int n) {
+                          size_t total, int n) {DS41_PDL_WAIT();
   for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += size_t(gridDim.x) * blockDim.x)
     out[i] = rn(bias ? __fadd_rn(acc[i], bf(bias[i % n])) : acc[i]);
 }
 // x = BF16(x + BF16(acc + bias)): the reference rounds the linear's output before the residual add.
 __global__ void bias_residual(const float *__restrict__ acc, const Bf16 *__restrict__ bias, Bf16 *__restrict__ x,
-                              size_t total, int n) {
+                              size_t total, int n) {DS41_PDL_WAIT();
   for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += size_t(gridDim.x) * blockDim.x) {
     const float t = bf(rn(bias ? __fadd_rn(acc[i], bf(bias[i % n])) : acc[i]));
     x[i] = rn(__fadd_rn(bf(x[i]), t));
   }
 }
 // RMSNorm(dim 1024, eps 1e-6): BF16(w * (x * rsqrt(mean(x^2) + eps))), all FP32.
-__global__ void rms_norm(const Bf16 *__restrict__ x, const Bf16 *__restrict__ w, Bf16 *__restrict__ y) {
+__global__ void rms_norm(const Bf16 *__restrict__ x, const Bf16 *__restrict__ w, Bf16 *__restrict__ y) {DS41_PDL_WAIT();
   const Bf16 *row = x + size_t(blockIdx.x) * D;
   float v[D / 256], ss = 0;
 #pragma unroll
@@ -95,7 +104,7 @@ __global__ void rms_norm(const Bf16 *__restrict__ x, const Bf16 *__restrict__ w,
 // qkv [N, 3072] -> q, k rotated (2D RoPE: x1*cos - x2*sin, x2*cos + x1*sin over the two 32-wide halves) and
 // v, each [16, N, 64].
 __global__ void rope_split(const Bf16 *__restrict__ qkv, const float *__restrict__ cosv, const float *__restrict__ sinv,
-                           Bf16 *__restrict__ q, Bf16 *__restrict__ k, Bf16 *__restrict__ v, int N) {
+                           Bf16 *__restrict__ q, Bf16 *__restrict__ k, Bf16 *__restrict__ v, int N) {DS41_PDL_WAIT();
   const int n = blockIdx.x, h = threadIdx.x / 32, d = threadIdx.x % 32;
   const float c = cosv[n * 32 + d], s = sinv[n * 32 + d];
   const Bf16 *row = qkv + size_t(n) * 3 * D + h * HD;
@@ -111,7 +120,7 @@ __global__ void rope_split(const Bf16 *__restrict__ qkv, const float *__restrict
   v[o + 32 + d] = row[2 * D + 32 + d];
 }
 // One row of already scaled scores -> BF16 probabilities.
-__global__ void softmax_rows(const float *__restrict__ S, Bf16 *__restrict__ P, int cols) {
+__global__ void softmax_rows(const float *__restrict__ S, Bf16 *__restrict__ P, int cols) {DS41_PDL_WAIT();
   const float *s = S + size_t(blockIdx.x) * cols;
   Bf16 *p = P + size_t(blockIdx.x) * cols;
   float m = -INFINITY;
@@ -123,7 +132,7 @@ __global__ void softmax_rows(const float *__restrict__ S, Bf16 *__restrict__ P, 
   for (int i = threadIdx.x; i < cols; i += blockDim.x) p[i] = rn(__fdiv_rn(expf(__fsub_rn(s[i], m)), sum));
 }
 // MLP: h = BF16(x @ w1^T) split into gate | up; BF16(BF16(silu(gate)) * up).
-__global__ void swiglu(const float *__restrict__ acc, Bf16 *__restrict__ out, size_t rows) {
+__global__ void swiglu(const float *__restrict__ acc, Bf16 *__restrict__ out, size_t rows) {DS41_PDL_WAIT();
   const size_t total = rows * INTER;
   for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += size_t(gridDim.x) * blockDim.x) {
     const size_t r = i / INTER, c = i % INTER;
@@ -134,7 +143,7 @@ __global__ void swiglu(const float *__restrict__ acc, Bf16 *__restrict__ out, si
 }
 // Aligner input: zero-pad the [nh, nw] patch grid to multiples of 3 and unfold 3x3 blocks; features are
 // ordered (channel, ki, kj) like F.unfold, blocks in reading order.
-__global__ void unfold3(const Bf16 *__restrict__ x, Bf16 *__restrict__ u, int nh, int nw, int lw) {
+__global__ void unfold3(const Bf16 *__restrict__ x, Bf16 *__restrict__ u, int nh, int nw, int lw) {DS41_PDL_WAIT();
   const int b = blockIdx.x, bi = b / lw, bj = b % lw;
   for (int f = threadIdx.x; f < ALIGN_IN; f += blockDim.x) {
     const int c = f / 9, kk = f % 9, r = bi * 3 + kk / 3, col = bj * 3 + kk % 3;
@@ -143,7 +152,7 @@ __global__ void unfold3(const Bf16 *__restrict__ x, Bf16 *__restrict__ u, int nh
 }
 // BF16(gelu(BF16(acc + bias))), exact (erf) GELU.
 __global__ void bias_gelu(const float *__restrict__ acc, const Bf16 *__restrict__ bias, Bf16 *__restrict__ out,
-                          size_t total, int n) {
+                          size_t total, int n) {DS41_PDL_WAIT();
   for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += size_t(gridDim.x) * blockDim.x) {
     const float x = bf(rn(__fadd_rn(acc[i], bf(bias[i % n]))));
     out[i] = rn(__fmul_rn(__fmul_rn(x, .5f), __fadd_rn(1.f, erff(__fmul_rn(x, 0.70710678118654752440f)))));

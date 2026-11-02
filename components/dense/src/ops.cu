@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include "ds41/dense.h"
 #include <cuda_bf16.h>
 #include <math.h>
@@ -14,7 +23,7 @@ __device__ __forceinline__ float blocksum(float sum,float* sh,int width){int tid
  return sh[0];
 }
 int geometry(int M,int K,int& width){int height=1;while(height*2<=M&&height*2<=16)height*=2;int n=1;while(n*2<=K/4&&n*2<=512)n*=2;width=n<512/height?n:512/height;return K/width>=height*16?width*height:width;}
-__global__ void rms(const bf16*x,const bf16*w,bf16*y,int M,int K,float eps,int width){
+__global__ void rms(const bf16*x,const bf16*w,bf16*y,int M,int K,float eps,int width){DS41_PDL_WAIT();
  __shared__ float sums[512];int tid=threadIdx.x,row=blockIdx.x;if(row>=M)return;
  float v[4]={0,0,0,0};
  for(int i=tid*4;i<K;i+=blockDim.x*4){
@@ -27,7 +36,7 @@ __global__ void rms(const bf16*x,const bf16*w,bf16*y,int M,int K,float eps,int w
 }
 // Fused RMS -> explicit BF16 rounding -> optional FP8 quant or RoPE. The reduction
 // geometry and every arithmetic boundary remain identical to the standalone ops.
-__global__ void rmsrope(const bf16*x,const bf16*w,bf16*y,const float*f,int M,int K,int RD,float eps,int width,int inverse){
+__global__ void rmsrope(const bf16*x,const bf16*w,bf16*y,const float*f,int M,int K,int RD,float eps,int width,int inverse){DS41_PDL_WAIT();
  __shared__ float sums[512];int tid=threadIdx.x,row=blockIdx.x;float v[4]={0,0,0,0};
  for(int i=tid*4;i<K;i+=blockDim.x*4){
   #pragma unroll
@@ -42,17 +51,17 @@ __global__ void rmsrope(const bf16*x,const bf16*w,bf16*y,const float*f,int M,int
   y[row*K+k]=aa;y[row*K+k+1]=bb;
  }
 }
-__global__ void hcpre(const bf16*h,const float*p,bf16*y,int M,int K){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=M*K)return;int row=i/K,k=i%K;float v[4];
+__global__ void hcpre(const bf16*h,const float*p,bf16*y,int M,int K){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=M*K)return;int row=i/K,k=i%K;float v[4];
  for(int j=0;j<4;++j)v[j]=__fmul_rn(p[row*4+j],__bfloat162float(h[(row*4+j)*K+k]));
  y[i]=__float2bfloat16_rn(__fadd_rn(__fadd_rn(__fadd_rn(__fadd_rn(0.f,v[0]),v[1]),v[2]),v[3]));
 }
-__global__ void hcpost(const bf16*y,const bf16*h,const float*p,const float*c,bf16*out,int M,int K){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=M*4*K)return;int row=i/(4*K),j=(i/K)%4,k=i%K;float v[4];
+__global__ void hcpost(const bf16*y,const bf16*h,const float*p,const float*c,bf16*out,int M,int K){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=M*4*K)return;int row=i/(4*K),j=(i/K)%4,k=i%K;float v[4];
  for(int a=0;a<4;++a)v[a]=__fmul_rn(c[row*16+a*4+j],__bfloat162float(h[(row*4+a)*K+k]));
  float sum=__fadd_rn(__fadd_rn(__fadd_rn(__fadd_rn(0.f,v[0]),v[1]),v[2]),v[3]);out[i]=__float2bfloat16_rn(__fadd_rn(__fmul_rn(p[row*4+j],__bfloat162float(y[row*K+k])),sum));
 }
 __device__ float sum4(float v){v=__fadd_rn(v,__shfl_xor_sync(0xffffffff,v,2));return __fadd_rn(v,__shfl_xor_sync(0xffffffff,v,1));}
 __device__ float colsum4(float v){v=__fadd_rn(v,__shfl_xor_sync(0xffffffff,v,8));return __fadd_rn(v,__shfl_xor_sync(0xffffffff,v,4));}
-__global__ void sinkhorn(const float*m,const float*s,const float*b,float*pre,float*post,float*comb,int M,float eps,const float* rstd=nullptr){
+__global__ void sinkhorn(const float*m,const float*s,const float*b,float*pre,float*post,float*comb,int M,float eps,const float* rstd=nullptr){DS41_PDL_WAIT();
  int row=blockIdx.x,lane=threadIdx.x;if(row>=M)return;
  float z=lane<24?m[row*24+lane]:0.f;if(rstd)z=__fmul_rn(z,rstd[row]);
  if(lane<4){pre[row*4+lane]=__fadd_rn(1.f/(1.f+expf(-__fmaf_rn(z,s[0],b[lane]))),eps);float p=m[row*24+4+lane];if(rstd)p=__fmul_rn(p,rstd[row]);post[row*4+lane]=__fmul_rn(2.f,1.f/(1.f+expf(-__fmaf_rn(p,s[1],b[4+lane]))));}
@@ -63,20 +72,20 @@ __global__ void sinkhorn(const float*m,const float*s,const float*b,float*pre,flo
  if(lane<16)comb[row*16+lane]=v;
 }
 template<bool BF>
-__global__ void f32linear(const float*x,const void*w,float*y,int M,int N,int K){
+__global__ void f32linear(const float*x,const void*w,float*y,int M,int N,int K){DS41_PDL_WAIT();
  int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*4+warp;float acc[8]={0,0,0,0,0,0,0,0};
  if(row>=N)return;
  for(int k=lane;k<K;k+=32){float weight;if constexpr(BF)weight=__bfloat162float(((const bf16*)w)[(size_t)row*K+k]);else weight=((const float*)w)[(size_t)row*K+k];
   for(int m=0;m<M;++m)acc[m]=__fmaf_rn(weight,x[m*K+k],acc[m]);}
  for(int m=0;m<M;++m){for(int d=16;d;d>>=1)acc[m]=__fadd_rn(acc[m],__shfl_down_sync(0xffffffff,acc[m],d));if(!lane)y[m*N+row]=acc[m];}
 }
-__global__ void router(const float*logits,const float*bias,float*u,float*b,int count,int N){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=count)return;float z=logits[i],v=sqrtf(z>20.f?z:log1pf(expf(z)));u[i]=v;b[i]=__fadd_rn(v,bias[i%N]);}
-__global__ void rope(bf16*x,const float*freq,int rows,int heads,int dim,int rd,int inverse){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*heads*rd/2)return;int pair=i%(rd/2),head=(i/(rd/2))%heads,row=i/(heads*(rd/2));int off=(row*heads+head)*dim+dim-rd+pair*2;
+__global__ void router(const float*logits,const float*bias,float*u,float*b,int count,int N){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=count)return;float z=logits[i],v=sqrtf(z>20.f?z:log1pf(expf(z)));u[i]=v;b[i]=__fadd_rn(v,bias[i%N]);}
+__global__ void rope(bf16*x,const float*freq,int rows,int heads,int dim,int rd,int inverse){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*heads*rd/2)return;int pair=i%(rd/2),head=(i/(rd/2))%heads,row=i/(heads*(rd/2));int off=(row*heads+head)*dim+dim-rd+pair*2;
  float a=__bfloat162float(x[off]),b=__bfloat162float(x[off+1]),c=freq[row*rd+pair*2],s=freq[row*rd+pair*2+1];if(inverse)s=-s;
  // PyTorch complex64 contracts the first product for real and second for imag.
  x[off]=__float2bfloat16_rn(__fmaf_rn(a,c,-__fmul_rn(b,s)));x[off+1]=__float2bfloat16_rn(__fmaf_rn(b,c,__fmul_rn(a,s)));
 }
-__global__ void engram(const bf16*h,const bf16*key,const bf16*value,const bf16*qw,const bf16*kw,const uint8_t*mask,bf16*out,int M,int K,float eps){
+__global__ void engram(const bf16*h,const bf16*key,const bf16*value,const bf16*qw,const bf16*kw,const uint8_t*mask,bf16*out,int M,int K,float eps){DS41_PDL_WAIT();
  __shared__ float sh[3][512];int row=blockIdx.x,tid=threadIdx.x;float v[3][4]={{0,0,0,0},{0,0,0,0},{0,0,0,0}};
  for(int i=tid*4;i<K;i+=blockDim.x*4)for(int j=0;j<4;++j)if(i+j<K){int k=i+j;float a=__bfloat162float(h[row*K+k]),b=__bfloat162float(key[row*K+k]);float w=__fmul_rn(__bfloat162float(qw[(row%4)*K+k]),__bfloat162float(kw[(row%4)*K+k]));
   v[0][j]=__fadd_rn(v[0][j],__fmul_rn(a,a));v[1][j]=__fadd_rn(v[1][j],__fmul_rn(b,b));v[2][j]=__fadd_rn(v[2][j],__fmul_rn(__fmul_rn(a,w),b));}
@@ -87,7 +96,7 @@ __global__ void engram(const bf16*h,const bf16*key,const bf16*value,const bf16*q
  __syncthreads();for(int k=tid;k<K;k+=blockDim.x)out[row*K+k]=__float2bfloat16_rn(__fadd_rn(__bfloat162float(h[row*K+k]),__fmul_rn(sh[0][0],__bfloat162float(value[(row/4)*K+k]))));
 }
 __device__ __forceinline__ float mixvalue(const bf16*x,const float*pre,int row,int k,int K){if(!pre)return __bfloat162float(x[row*K+k]);float v[4];for(int j=0;j<4;++j)v[j]=__fmul_rn(pre[row*4+j],__bfloat162float(x[(row*4+j)*K+k]));return __bfloat162float(__float2bfloat16_rn(__fadd_rn(__fadd_rn(__fadd_rn(__fadd_rn(0.f,v[0]),v[1]),v[2]),v[3])));}
-__global__ void normquant(const bf16*x,const float*pre,const bf16*w,bf16*out,uint8_t*a,uint8_t*s,int M,int K,float eps,int width){
+__global__ void normquant(const bf16*x,const float*pre,const bf16*w,bf16*out,uint8_t*a,uint8_t*s,int M,int K,float eps,int width){DS41_PDL_WAIT();
  extern __shared__ bf16 normalized[];__shared__ float sh[512];int row=blockIdx.x,tid=threadIdx.x;float v[4]={0,0,0,0};
  for(int i=tid*4;i<K;i+=blockDim.x*4)for(int j=0;j<4;++j)if(i+j<K){float z=mixvalue(x,pre,row,i+j,K);v[j]=__fadd_rn(v[j],__fmul_rn(z,z));}
  float sum=blocksum(__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[1]),v[2]),v[3]),sh,width);
@@ -95,17 +104,17 @@ __global__ void normquant(const bf16*x,const float*pre,const bf16*w,bf16*out,uin
  for(int i=tid;i<K;i+=blockDim.x){bf16 z=__float2bfloat16_rn(__fmul_rn(__fmul_rn(mixvalue(x,pre,row,i,K),sh[0]),__bfloat162float(w[i])));normalized[i]=z;if(out)out[row*K+i]=z;}__syncthreads();
  int lane=tid&31,warp=tid>>5;for(int g=warp;g<K/32;g+=blockDim.x/32){float z=__bfloat162float(normalized[g*32+lane]),mx=fabsf(z);for(int d=16;d;d>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,d));uint32_t bits=__float_as_uint(__fmul_rn(fmaxf(mx,1e-4f),1.f/448.f));unsigned exponent=(bits>>23)+((bits&0x7fffff)!=0);float inv=__uint_as_float((254-exponent)<<23);a[row*K+g*32+lane]=__nv_cvt_float_to_fp8(fminf(448.f,fmaxf(-448.f,__fmul_rn(z,inv))),__NV_SATFINITE,__NV_E4M3);if(!lane)s[row*(K/32)+g]=exponent;}
 }
-__global__ void promote_stats(const bf16*x,float*y,float*rstd,int M,int K,float eps,int width){__shared__ float sh[512];int row=blockIdx.x,tid=threadIdx.x;float v[4]={0,0,0,0};
+__global__ void promote_stats(const bf16*x,float*y,float*rstd,int M,int K,float eps,int width){DS41_PDL_WAIT();__shared__ float sh[512];int row=blockIdx.x,tid=threadIdx.x;float v[4]={0,0,0,0};
  for(int i=tid*4;i<K;i+=blockDim.x*4)for(int j=0;j<4;++j)if(i+j<K){float a=__bfloat162float(x[row*K+i+j]);y[row*K+i+j]=a;v[j]=__fadd_rn(v[j],__fmul_rn(a,a));}
  float sum=blocksum(__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[1]),v[2]),v[3]),sh,width);if(!tid)rstd[row]=rsqrtf(__fadd_rn(__fmul_rn(sum,1.f/K),eps));
 }
-__global__ void promote(const bf16*x,float*y,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=__bfloat162float(x[i]);}
-__global__ void shared_act(const bf16*g,const bf16*u,bf16*z,uint8_t*a,uint8_t*s,int groups){int group=(blockIdx.x*blockDim.x+threadIdx.x)/32,lane=threadIdx.x&31;if(group>=groups)return;int i=group*32+lane;
+__global__ void promote(const bf16*x,float*y,int n){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=__bfloat162float(x[i]);}
+__global__ void shared_act(const bf16*g,const bf16*u,bf16*z,uint8_t*a,uint8_t*s,int groups){DS41_PDL_WAIT();int group=(blockIdx.x*blockDim.x+threadIdx.x)/32,lane=threadIdx.x&31;if(group>=groups)return;int i=group*32+lane;
  float gate=fminf(__bfloat162float(g[i]),10.f),up=fminf(10.f,fmaxf(-10.f,__bfloat162float(u[i])));float value=__fmul_rn(gate/(1.f+expf(-gate)),up);bf16 zz=__float2bfloat16_rn(value);if(z)z[i]=zz;
  value=__bfloat162float(zz);float mx=fabsf(value);for(int d=16;d;d>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,d));uint32_t bits=__float_as_uint(__fmul_rn(fmaxf(mx,1e-4f),1.f/448.f));unsigned exponent=(bits>>23)+((bits&0x7fffff)!=0);float inv=__uint_as_float((254-exponent)<<23);a[i]=__nv_cvt_float_to_fp8(fminf(448.f,fmaxf(-448.f,__fmul_rn(value,inv))),__NV_SATFINITE,__NV_E4M3);if(!lane)s[group]=exponent;
 }
-__global__ void routerweights(const float*s,const int32_t*ids,float*w,int M,int N,int topk,float scale){int row=blockIdx.x,lane=threadIdx.x;float v[6]={0,0,0,0,0,0};if(lane>=topk)return;for(int i=0;i<topk;++i)v[i]=s[row*N+ids[row*topk+i]];float sum=topk==6?__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[4]),v[2]),__fadd_rn(__fadd_rn(v[1],v[5]),v[3])):__fadd_rn(__fadd_rn(v[0],v[2]),v[1]);w[row*topk+lane]=__fmul_rn(v[lane]/__fadd_rn(sum,1e-20f),scale);}
-__global__ void hcmean(const bf16*h,bf16*y,int M,int K){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=M*K)return;int row=i/K,k=i%K;float sum=0.f;for(int j=0;j<4;++j)sum=__fadd_rn(sum,__bfloat162float(h[(row*4+j)*K+k]));y[i]=__float2bfloat16_rn(__fmul_rn(sum,.25f));}
+__global__ void routerweights(const float*s,const int32_t*ids,float*w,int M,int N,int topk,float scale){DS41_PDL_WAIT();int row=blockIdx.x,lane=threadIdx.x;float v[6]={0,0,0,0,0,0};if(lane>=topk)return;for(int i=0;i<topk;++i)v[i]=s[row*N+ids[row*topk+i]];float sum=topk==6?__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[4]),v[2]),__fadd_rn(__fadd_rn(v[1],v[5]),v[3])):__fadd_rn(__fadd_rn(v[0],v[2]),v[1]);w[row*topk+lane]=__fmul_rn(v[lane]/__fadd_rn(sum,1e-20f),scale);}
+__global__ void hcmean(const bf16*h,bf16*y,int M,int K){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=M*K)return;int row=i/K,k=i%K;float sum=0.f;for(int j=0;j<4;++j)sum=__fadd_rn(sum,__bfloat162float(h[(row*4+j)*K+k]));y[i]=__float2bfloat16_rn(__fmul_rn(sum,.25f));}
 }
 extern "C" int ds41_dense_rms(const void*x,const void*w,void*y,int M,int K,float eps,cudaStream_t st){if(!x||!w||!y||M<1||M>8||K<128||K%4)return cudaErrorInvalidValue;
  int width,threads=geometry(M,K,width);rms<<<M,threads,0,st>>>((const bf16*)x,(const bf16*)w,(bf16*)y,M,K,eps,width);return cudaGetLastError();}

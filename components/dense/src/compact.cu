@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include "ds41/dense.h"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -7,7 +16,7 @@ __device__ __forceinline__ float e8(uint8_t x){return x==0?__uint_as_float(0x004
 // Vectorized SIMT GEMV: each BF16 weight is fetched once and shared across M rows.
 // All inputs remain FP32. Independent FP32 FMA chains followed by a fixed warp tree.
 template<int M,int V=8,int W=4>
-__global__ void head(const float* __restrict__ x,const bf16* __restrict__ w,float* __restrict__ y,int N,int K){
+__global__ void head(const float* __restrict__ x,const bf16* __restrict__ w,float* __restrict__ y,int N,int K){DS41_PDL_WAIT();
  int lane=threadIdx.x&31,row=blockIdx.x*W+(threadIdx.x>>5);if(row>=N)return;
  float acc[M][4]={};
  for(int k=lane*V;k<K;k+=32*V){
@@ -23,7 +32,7 @@ __global__ void head(const float* __restrict__ x,const bf16* __restrict__ w,floa
  for(int m=0;m<M;++m){float sum=__fadd_rn(__fadd_rn(acc[m][0],acc[m][1]),__fadd_rn(acc[m][2],acc[m][3]));for(int d=16;d;d>>=1)sum=__fadd_rn(sum,__shfl_down_sync(0xffffffff,sum,d));if(!lane)y[m*N+row]=sum;}
 }
 template<int M,int W=4>
-__global__ void woa(const bf16* __restrict__ x,const uint8_t* __restrict__ w,const uint8_t* __restrict__ s,bf16* __restrict__ y,int N,int K,int G){
+__global__ void woa(const bf16* __restrict__ x,const uint8_t* __restrict__ w,const uint8_t* __restrict__ s,bf16* __restrict__ y,int N,int K,int G){DS41_PDL_WAIT();
  int lane=threadIdx.x&31,row=blockIdx.x*W+(threadIdx.x>>5),group=blockIdx.y;if(row>=N)return;
  float acc[M][4]={};
  for(int k=lane*8;k<K;k+=256){

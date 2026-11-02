@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 // s0ma: speculative acceptance on the GPU (DS41_SPARK_GPU_VERIFY=1, with DS41_SPARK_GPU_DRAW=1).
 //
 // The host path (speculation.cpp) builds p for every verify row in fp64 (probabilities_rows: first-maximum
@@ -71,7 +80,7 @@ __device__ double total_of(const double *part) {
 }
 
 // grid (G, rows): each block's first maximum of its slice of row y
-__global__ void k_argmax(const float *x, int n, Scratch *s) {
+__global__ void k_argmax(const float *x, int n, Scratch *s) {DS41_PDL_WAIT();
   __shared__ float fv[T];
   __shared__ int fi[T];
   const int r = blockIdx.y;
@@ -99,7 +108,7 @@ __global__ void k_argmax(const float *x, int n, Scratch *s) {
 }
 
 // p[r][i] = exp((double(x[r][i]) - x[r][b]) / t); each block's sum to zpart[r]
-__global__ void k_exp(const float *x, int n, double t, double *p, Scratch *s) {
+__global__ void k_exp(const float *x, int n, double t, double *p, Scratch *s) {DS41_PDL_WAIT();
   __shared__ double sh[T];
   __shared__ int top_i;
   const int r = blockIdx.y;
@@ -126,7 +135,7 @@ __global__ void k_exp(const float *x, int n, double t, double *p, Scratch *s) {
 }
 
 // p[r][i] /= z[r]
-__global__ void k_normalize(double *p, int n, Scratch *s) {
+__global__ void k_normalize(double *p, int n, Scratch *s) {DS41_PDL_WAIT();
   __shared__ double z;
   const int r = blockIdx.y;
   double *pr = p + size_t(r) * n;
@@ -138,7 +147,7 @@ __global__ void k_normalize(double *p, int n, Scratch *s) {
 }
 
 // one thread: the accept tests in order; then which row is drawn from, with which uniform
-__global__ void k_decide(const double *p, int n, int count, Drafts dr, uint64_t seed, uint64_t step, Scratch *s) {
+__global__ void k_decide(const double *p, int n, int count, Drafts dr, uint64_t seed, uint64_t step, Scratch *s) {DS41_PDL_WAIT();
   Out &o = s->out;
   o.emitted = o.accepted = o.rejected = o.error = 0;
   s->row = -1;
@@ -167,7 +176,7 @@ __device__ const double *draw_q(const Drafts &dr, const Scratch *s) {
 }
 
 // grid G: each block's sum of the drawn row's weights (p, or max(0, p - q) after a rejection)
-__global__ void k_draw_part(const double *p, int n, Drafts dr, Scratch *s) {
+__global__ void k_draw_part(const double *p, int n, Drafts dr, Scratch *s) {DS41_PDL_WAIT();
   __shared__ double sh[T];
   if (s->row < 0) return;   // an error: nothing to draw
   const double *pr = p + size_t(s->row) * n, *qr = draw_q(dr, s);
@@ -180,7 +189,7 @@ __global__ void k_draw_part(const double *p, int n, Drafts dr, Scratch *s) {
 }
 
 // one block: the inverse-CDF draw over the drawn row (the same two-level search as draft_draw.cu)
-__global__ void k_draw(const double *p, int n, Drafts dr, Scratch *s) {
+__global__ void k_draw(const double *p, int n, Drafts dr, Scratch *s) {DS41_PDL_WAIT();
   __shared__ double sub[T + 1];
   __shared__ int block, found, last, stop;
   __shared__ double base, target;

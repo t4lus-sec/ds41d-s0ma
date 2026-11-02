@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include <ds41/exl3.cuh>
 #include "device.cuh"
 #include <cooperative_groups.h>
@@ -74,13 +83,13 @@ __device__ __forceinline__ void decode_body(const DeviceExpert* table,const Gemm
     if(warp<job.tokens)rotate_output(out+warp*128,sv+blockIdx.x*128,job.output+warp*N+blockIdx.x*128,lane);
 }
 template<int K,int BITS>
-__global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const GemmJob* jobs,int projection,int N) {
+__global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const GemmJob* jobs,int projection,int N) {DS41_PDL_WAIT();
     decode_body<K,BITS>(table,jobs,projection,N);
 }
 // s0ma change 15: one launch for jobs of several widths. Each CTA reads its job's expert's width from `bits` and
 // runs that width's decode, so the work per CTA is exactly decode<K,BITS>'s (block-uniform branch, same shared memory).
 template<int K>
-__global__ __launch_bounds__(512,1) void decode_var(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,const uint8_t* bits) {
+__global__ __launch_bounds__(512,1) void decode_var(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,const uint8_t* bits) {DS41_PDL_WAIT();
     switch(bits[jobs[blockIdx.y].expert]){
         case 2: decode_body<K,2>(table,jobs,projection,N); break;
         case 3: decode_body<K,3>(table,jobs,projection,N); break;
@@ -100,7 +109,7 @@ struct SplitGeom {
     static constexpr int W=((CHUNK*16+127)/128+1)*128;   // the widest run of 128-blocks a partition touches
 };
 template<int K,int BITS>
-__global__ void __cluster_dims__(1,1,4) __launch_bounds__(128) decode_split(const DeviceExpert* table,const GemmJob* jobs,int projection,int N) {
+__global__ void __cluster_dims__(1,1,4) __launch_bounds__(128) decode_split(const DeviceExpert* table,const GemmJob* jobs,int projection,int N) {DS41_PDL_WAIT();
     namespace cg=cooperative_groups;
     cg::cluster_group cluster=cg::this_cluster();
     using G=SplitGeom<K>;
@@ -180,7 +189,7 @@ __global__ void __cluster_dims__(1,1,4) __launch_bounds__(128) decode_split(cons
 // fragments across four m16 tiles. K128 staging avoids an M*K scratch buffer.
 // The 136-half stride distributes eight MMA rows over all shared banks.
 template<int BITS>
-__global__ __launch_bounds__(256,1) void prefill(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,int K,int max_tokens) {
+__global__ __launch_bounds__(256,1) void prefill(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,int K,int max_tokens) {DS41_PDL_WAIT();
     GemmJob job=jobs[blockIdx.y];
     if(job.tokens<1||job.tokens>max_tokens){asm volatile("trap;");return;}
     int m0=blockIdx.z*64;if(m0>=job.tokens)return;

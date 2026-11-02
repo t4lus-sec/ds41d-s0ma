@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 // EXL3 K2/K3 grouped kernels against a plain reference, on random trellis words, scales and inputs.
 //
 //   nvcc -O2 -std=c++17 -arch=sm_120a -Icomponents/exl3/include -Icomponents/moe/include -Icomponents/exl3/src \
@@ -37,7 +46,7 @@ __device__ float decode_weight(const uint32_t* tile, int t, int bits) {
 }
 
 // W[k][n] from the trellis [k/16][n/16][8*bits words]
-__global__ void reference_weights(const uint32_t* trellis, float* W, int K, int N, int bits) {
+__global__ void reference_weights(const uint32_t* trellis, float* W, int K, int N, int bits) {DS41_PDL_WAIT();
     int k = blockIdx.y, n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= N) return;
     int kt = k / 16, nt = n / 16, kk = k % 16, nn = n % 16;

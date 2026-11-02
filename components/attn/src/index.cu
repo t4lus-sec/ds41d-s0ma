@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include "ds41/attention.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -14,7 +23,7 @@ __device__ uint16_t ixbit(unsigned c,unsigned scale){
  if(mag>=0x80&&mag<0x7f80)return sign|mag;
  float v=__half2float(__nv_cvt_fp4_to_halfraw(c,__NV_E2M1));return __bfloat16_as_ushort(__float2bfloat16_rn(__fmul_rn(v,ixscale(scale))));
 }
-__global__ void indexscore(const bf*q,const uint8_t*key,const bf*w,const int*ids,const int*visible,bf*out,int n){
+__global__ void indexscore(const bf*q,const uint8_t*key,const bf*w,const int*ids,const int*visible,bf*out,int n){DS41_PDL_WAIT();
  __shared__ __align__(32) bf qs[32*128];
  __shared__ __align__(32) bf ks[64*128];
  __shared__ __align__(32) float dot[32*64];
@@ -63,7 +72,7 @@ extern "C" int ds41_attn_index_scores(const void*q,const void*k,const void*w,con
  if(!q||!k||!w||!visible||!out||rows<1||n<1)return cudaErrorInvalidValue;
  indexscore<<<dim3((n+63)/64,rows),128,0,(cudaStream_t)st>>>((const bf*)q,(const uint8_t*)k,(const bf*)w,ids,visible,(bf*)out,n);return cudaGetLastError();
 }
-__global__ void blocks(const bf*s,const int*vis,bf*out,int n){
+__global__ void blocks(const bf*s,const int*vis,bf*out,int n){DS41_PDL_WAIT();
  int b=blockIdx.x*256+threadIdx.x,row=blockIdx.y,nb=(n+7)/8;if(b>=nb)return;float v=-CUDART_INF_F;
  for(int i=0;i<8;++i)if(b*8+i<n)v=fmaxf(v,__bfloat162float(s[row*n+b*8+i]));
  if(b==(vis[row]-1)/8&&vis[row]>0)v=CUDART_INF_F;out[row*nb+b]=__float2bfloat16_rn(v);
@@ -71,7 +80,7 @@ __global__ void blocks(const bf*s,const int*vis,bf*out,int n){
 extern "C" int ds41_attn_block_scores(const void*s,const int*vis,void*out,int rows,int n,void*st){
  if(!s||!vis||!out||rows<1||n<1)return cudaErrorInvalidValue;blocks<<<dim3(((n+7)/8+255)/256,rows),256,0,(cudaStream_t)st>>>((const bf*)s,vis,(bf*)out,n);return cudaGetLastError();
 }
-__global__ void expand(const int*block,int*out,int nb,int n){int i=blockIdx.x*256+threadIdx.x,row=blockIdx.y;if(i>=nb*8)return;int b=block[row*nb+i/8];int id=b<0?-1:b*8+i%8;out[row*nb*8+i]=id<n?id:-1;}
+__global__ void expand(const int*block,int*out,int nb,int n){DS41_PDL_WAIT();int i=blockIdx.x*256+threadIdx.x,row=blockIdx.y;if(i>=nb*8)return;int b=block[row*nb+i/8];int id=b<0?-1:b*8+i%8;out[row*nb*8+i]=id<n?id:-1;}
 extern "C" int ds41_attn_expand_blocks(const int*blocks,int*out,int rows,int nb,int n,void*st){if(!blocks||!out||rows<1||nb<1||n<1)return cudaErrorInvalidValue;expand<<<dim3((nb*8+255)/256,rows),256,0,(cudaStream_t)st>>>(blocks,out,nb,n);return cudaGetLastError();}
-__global__ void remap(const int*local,const int*ids,int*out,int k,int n){int i=blockIdx.x*256+threadIdx.x,row=blockIdx.y;if(i>=k)return;int j=local[row*k+i];out[row*k+i]=j>=0&&j<n?ids[row*n+j]:-1;}
+__global__ void remap(const int*local,const int*ids,int*out,int k,int n){DS41_PDL_WAIT();int i=blockIdx.x*256+threadIdx.x,row=blockIdx.y;if(i>=k)return;int j=local[row*k+i];out[row*k+i]=j>=0&&j<n?ids[row*n+j]:-1;}
 extern "C" int ds41_attn_remap_topk(const int*local,const int*ids,int*out,int rows,int k,int n,void*st){if(!local||!ids||!out||rows<1||k<1||n<1)return cudaErrorInvalidValue;remap<<<dim3((k+255)/256,rows),256,0,(cudaStream_t)st>>>(local,ids,out,k,n);return cudaGetLastError();}

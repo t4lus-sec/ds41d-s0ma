@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 // Included in mxfp4.cu after the exact FP8 MMA/FP4 expansion helpers.
 // Native scale metadata follows NVIDIA PTX ISA Block Scaling for mma.sync:
 // https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma-block-scaling
@@ -6,7 +15,7 @@
 // ALWAYS added serially, with a fresh zero MMA accumulator for every k32.
 template<bool Direct=false,bool Native=true>
 __global__ void __launch_bounds__(128) gemm_prefill(const DeviceExpert* table,const GemmJob* jobs,
-        int projection,int N,int K,DeviceExpert raw_e={},GemmJob raw_job={},int max_tokens=256) {
+        int projection,int N,int K,DeviceExpert raw_e={},GemmJob raw_job={},int max_tokens=256) {DS41_PDL_WAIT();
     constexpr int MT=32,NT=64,Groups=8,WS=144,XS=272;
     constexpr int WBytes=NT*WS,XBytes=MT*XS,ScaleOffset=WBytes+XBytes;
     constexpr int Stage=ScaleOffset+(NT+MT)*Groups;

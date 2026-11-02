@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include "ds41/spark.h"
 #include "append_tail.hpp"
 #include "ds41/dense.h"
@@ -23,9 +32,9 @@ struct Buf{
  ~Buf(){if(p)cudaFree(p);}Buf(const Buf&)=delete;Buf&operator=(const Buf&)=delete;
  template<class T=void>T*at(size_t off=0)const{return reinterpret_cast<T*>((char*)p+off);}
 };
-__global__ void embed(const bf16*w,bf16*h,float*pre,int anchor){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<B*4*H){int row=i/(4*H),col=i%H;h[i]=w[size_t(row?128799:anchor)*H+col];}if(i<B*4)pre[i]=(i%4==0)?1.f:0.f;}
+__global__ void embed(const bf16*w,bf16*h,float*pre,int anchor){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<B*4*H){int row=i/(4*H),col=i%H;h[i]=w[size_t(row?128799:anchor)*H+col];}if(i<B*4)pre[i]=(i%4==0)?1.f:0.f;}
 __device__ void top3_swap(float*v,int*ids,bool*valid,int a,int b,bool dir){bool swap=(v[a]>v[b]&&valid[a])||!valid[b];if(swap==dir){float f=v[a];v[a]=v[b];v[b]=f;int id=ids[a];ids[a]=ids[b];ids[b]=id;bool q=valid[a];valid[a]=valid[b];valid[b]=q;}}
-__global__ void select3(const float*s,int32_t*ids,int M){int row=blockIdx.x;if(threadIdx.x||row>=M)return;
+__global__ void select3(const float*s,int32_t*ids,int M){DS41_PDL_WAIT();int row=blockIdx.x;if(threadIdx.x||row>=M)return;
  int chosen[3]={-1,-1,-1};for(int k=0;k<3;++k){int best=-1;for(int i=0;i<128;++i){bool used=false;for(int j=0;j<k;++j)used|=chosen[j]==i;if(!used&&(best<0||s[row*128+i]>s[row*128+best]))best=i;}chosen[k]=best;}
  // CUDA torch.topk first gathers strict winners in index order, then the
  // threshold ties in index order. The pinned Torch CUDA sorted path uses
@@ -39,17 +48,17 @@ __global__ void select3(const float*s,int32_t*ids,int M){int row=blockIdx.x;if(t
  for(int stride=size_limit/2;stride;stride/=2)for(int t=0;t<size_limit/2;++t){int a=2*t-(t&(stride-1));top3_swap(v,order,valid,a,a+stride,false);}
  for(int k=0;k<3;++k)ids[row*3+k]=order[k];}
 /* Ring physical slots remain in official slot order even after wrap. */
-__global__ void gather_block(const bf16*ring,const bf16*block,bf16*out,int32_t*idx,int count){int i=blockIdx.x*blockDim.x+threadIdx.x;int width=count+B;
+__global__ void gather_block(const bf16*ring,const bf16*block,bf16*out,int32_t*idx,int count){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;int width=count+B;
  if(i<B*width*512){int col=(i/512)%width,k=i%512;out[i]=col<count?ring[col*512+k]:block[(col-count)*512+k];}
  if(i<B*width){int col=i%width;idx[i]=col;}}
-__global__ void markov_input(const bf16*hd,const bf16*emb,float*out){int i=threadIdx.x+blockIdx.x*blockDim.x;if(i<B*(H+256)){int row=i/(H+256),col=i%(H+256);out[i]=__bfloat162float(col<H?hd[row*H+col]:emb[col-H]);}}
-__global__ void add_bias(const float*u,const float*b,float*out){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<V)out[i]=__fadd_rn(u[i],b[i]);}
-__global__ void gather_expert(const bf16*x,const int32_t*ids,const float*w,bf16*out,float*rw,int expert,int count){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=count*H)return;int selected=i/H,k=i%H,seen=0;for(int s=0;s<B*3;++s)if(ids[s]==expert){if(seen++==selected){out[i]=x[(s/3)*H+k];if(!k)rw[selected]=w[s];break;}}}
-__global__ void scatter_expert(const bf16*input,const int32_t*ids,bf16*out,int expert,int count){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=count*H)return;int selected=i/H,k=i%H,seen=0;for(int s=0;s<B*3;++s)if(ids[s]==expert){if(seen++==selected){out[s*H+k]=input[i];break;}}}
+__global__ void markov_input(const bf16*hd,const bf16*emb,float*out){DS41_PDL_WAIT();int i=threadIdx.x+blockIdx.x*blockDim.x;if(i<B*(H+256)){int row=i/(H+256),col=i%(H+256);out[i]=__bfloat162float(col<H?hd[row*H+col]:emb[col-H]);}}
+__global__ void add_bias(const float*u,const float*b,float*out){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<V)out[i]=__fadd_rn(u[i],b[i]);}
+__global__ void gather_expert(const bf16*x,const int32_t*ids,const float*w,bf16*out,float*rw,int expert,int count){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=count*H)return;int selected=i/H,k=i%H,seen=0;for(int s=0;s<B*3;++s)if(ids[s]==expert){if(seen++==selected){out[i]=x[(s/3)*H+k];if(!k)rw[selected]=w[s];break;}}}
+__global__ void scatter_expert(const bf16*input,const int32_t*ids,bf16*out,int expert,int count){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=count*H)return;int selected=i/H,k=i%H,seen=0;for(int s=0;s<B*3;++s)if(ids[s]==expert){if(seen++==selected){out[s*H+k]=input[i];break;}}}
 /* sol-dense Reduce.cuh geometry extended to cold seed rows. The launch shape
  * depends on the original full prompt, even when only its last128 rows remain. */
 __device__ float sum_seed(float v,float*sh,int width){int t=threadIdx.x;sh[t]=v;__syncthreads();for(int d=width/2;d>=32;d>>=1){if(t%width<d){v=__fadd_rn(v,sh[t+d]);sh[t]=v;}__syncthreads();}for(int d=16;d;d>>=1)v=__fadd_rn(v,__shfl_down_sync(0xffffffff,v,d));if(t%width==0)sh[t]=v;__syncthreads();for(int d=(blockDim.x/width)/2;d;d>>=1){if(t%width==0&&t/width<d){v=__fadd_rn(v,sh[t+d*width]);sh[t]=v;}__syncthreads();}return sh[0];}
-__global__ void rms_seed(const bf16*x,const bf16*w,bf16*y,int K,int width){__shared__ float sh[512];int t=threadIdx.x,row=blockIdx.x;float v[4]={0,0,0,0};for(int i=t*4;i<K;i+=blockDim.x*4)for(int j=0;j<4;++j)if(i+j<K){float a=__bfloat162float(x[row*K+i+j]);v[j]=__fadd_rn(v[j],__fmul_rn(a,a));}float z=sum_seed(__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[1]),v[2]),v[3]),sh,width);if(!t)sh[0]=rsqrtf(__fadd_rn(__fmul_rn(z,1.f/K),1e-20f));__syncthreads();for(int i=t;i<K;i+=blockDim.x)y[row*K+i]=__float2bfloat16_rn(__fmul_rn(__fmul_rn(__bfloat162float(x[row*K+i]),sh[0]),__bfloat162float(w[i])));}
+__global__ void rms_seed(const bf16*x,const bf16*w,bf16*y,int K,int width){DS41_PDL_WAIT();__shared__ float sh[512];int t=threadIdx.x,row=blockIdx.x;float v[4]={0,0,0,0};for(int i=t*4;i<K;i+=blockDim.x*4)for(int j=0;j<4;++j)if(i+j<K){float a=__bfloat162float(x[row*K+i+j]);v[j]=__fadd_rn(v[j],__fmul_rn(a,a));}float z=sum_seed(__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[1]),v[2]),v[3]),sh,width);if(!t)sh[0]=rsqrtf(__fadd_rn(__fmul_rn(z,1.f/K),1e-20f));__syncthreads();for(int i=t;i<K;i+=blockDim.x)y[row*K+i]=__float2bfloat16_rn(__fmul_rn(__fmul_rn(__bfloat162float(x[row*K+i]),sh[0]),__bfloat162float(w[i])));}
 }
 struct ds41_spark{
  ds41_spark_config c;cudaStream_t stream;cublasHandle_t blas;int64_t committed=0;bool drafted=false;bool poisoned=false;bool capture=false;

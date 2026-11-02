@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include "ds41/spark.h"
 #include "ds41/spark_rng.h"
 #include <cuda_runtime.h>
@@ -21,8 +30,8 @@ __device__ int draw(const float*p,const float*q,int n,double pz,double qz,double
  __syncthreads();int result=*answer==n?-1:*answer;__syncthreads();return result;
 }
 __device__ double random_at(uint64_t seed,uint64_t address,int slot,uint32_t purpose,int v2){return v2?spark_uniform_v2(seed,address,slot,purpose):spark_uniform(seed,address+slot,purpose);}
-__global__ void sample_kernel(const float*p,int n,uint64_t seed,uint64_t pos,uint32_t purpose,int*out,int slot=0,int v2=0){seed+=blockIdx.x;out+=blockIdx.x;__shared__ double sh[257];__shared__ int answer;double z=mass(p,n,sh);if(!(z>0)||!isfinite(z)){if(!threadIdx.x)*out=-1;return;}int v=draw(p,nullptr,n,z,1,random_at(seed,pos,slot,purpose,v2),sh,&answer);if(!threadIdx.x)*out=v;}
-__global__ void verify_kernel(const int*d,const float*q,const float*p,int count,int n,int greedy,uint64_t seed,uint64_t pos,ds41_spark_result*out,int many=0,const ds41_spark_result*first=nullptr,int v2=0){
+__global__ void sample_kernel(const float*p,int n,uint64_t seed,uint64_t pos,uint32_t purpose,int*out,int slot=0,int v2=0){DS41_PDL_WAIT();seed+=blockIdx.x;out+=blockIdx.x;__shared__ double sh[257];__shared__ int answer;double z=mass(p,n,sh);if(!(z>0)||!isfinite(z)){if(!threadIdx.x)*out=-1;return;}int v=draw(p,nullptr,n,z,1,random_at(seed,pos,slot,purpose,v2),sh,&answer);if(!threadIdx.x)*out=v;}
+__global__ void verify_kernel(const int*d,const float*q,const float*p,int count,int n,int greedy,uint64_t seed,uint64_t pos,ds41_spark_result*out,int many=0,const ds41_spark_result*first=nullptr,int v2=0){DS41_PDL_WAIT();
  if(many){seed+=blockIdx.x;d+=blockIdx.x;out+=blockIdx.x;if(first&&((min(first[blockIdx.x].tokens[0],8))%2))p+=size_t(2)*n;}
  __shared__ double sh[257];__shared__ int answer,ids[256];__shared__ float fs[256];__shared__ ds41_spark_result result;
  if(!threadIdx.x)result={};__syncthreads();
@@ -43,7 +52,7 @@ __global__ void verify_kernel(const int*d,const float*q,const float*p,int count,
  * Thus every finite uniform selects the same token, including boundaries.
  * Five tables: q,p,p-q,rotated-p,rotated-p-q. Each table stores n element
  * prefixes,257 chunk prefixes,256 last-positive IDs,and the original masses. */
-__global__ void fixed_cdf_build(const float*ps,const float*q,int n,double*tables){
+__global__ void fixed_cdf_build(const float*ps,const float*q,int n,double*tables){DS41_PDL_WAIT();
  __shared__ double sh[257];int which=blockIdx.x,t=threadIdx.x;const float*p=which>=3?ps+size_t(2)*n:ps;double pz=mass(p,n,sh),qz=mass(q,n,sh);
  bool residual=which==2||which==4,isq=which==0;int chunk=(n+255)/256,begin=t*chunk,end=min(n,begin+chunk),last=-1;double z=0;
  for(int i=begin;i<end;++i){double v=isq?double(q[i])/qz:residual?fmax(0.,double(p[i])/pz-double(q[i])/qz):double(p[i])/pz;z+=v;if(v>0)last=i;}
@@ -52,7 +61,7 @@ __global__ void fixed_cdf_build(const float*ps,const float*q,int n,double*tables
  double c=sh[t];for(int i=begin;i<end;++i){double v=isq?double(q[i])/qz:residual?fmax(0.,double(p[i])/pz-double(q[i])/qz):double(p[i])/pz;c+=v;out[i]=c;}
 }
 __device__ int fixed_draw(const double*cdf,int n,double u){const double*prefix=cdf+n;double target=u*prefix[256];int low=0,high=255;while(low<high){int middle=(low+high)/2;if(prefix[middle+1]<=target)low=middle+1;else high=middle;}int t=low,chunk=(n+255)/256;low=t*chunk;high=min(n,low+chunk);int end=high;while(low<high){int middle=(low+high)/2;if(cdf[middle]<=target)low=middle+1;else high=middle;}return low<end?low:int(prefix[257+t]);}
-__global__ void fixed_cdf_sweep(const float*p,const float*q,int n,int draws,uint64_t seed,const double*tables,int*out){int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=draws)return;seed+=row;int stride=n+515;const double*qc=tables,*pc=tables+stride,*rc=tables+2*stride;
+__global__ void fixed_cdf_sweep(const float*p,const float*q,int n,int draws,uint64_t seed,const double*tables,int*out){DS41_PDL_WAIT();int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=draws)return;seed+=row;int stride=n+515;const double*qc=tables,*pc=tables+stride,*rc=tables+2*stride;
  double qz=qc[n+514],pz=pc[n+513];int proposal=fixed_draw(qc,n,spark_uniform_v2(seed,100,0,1));bool accepted=spark_uniform_v2(seed,100,0,2)<fmin(1.,(double(p[proposal])/pz)/(double(q[proposal])/qz));int first=accepted?proposal:fixed_draw(rc,n,spark_uniform_v2(seed,100,0,3));out[row*2]=first;
  bool rotated=(min(first,8)%2)!=0;pc=tables+(rotated?3:1)*stride;rc=tables+(rotated?4:2)*stride;const float*p2=p+(rotated?size_t(2)*n:0);pz=pc[n+513];proposal=fixed_draw(qc,n,spark_uniform_v2(seed,101,0,1));accepted=spark_uniform_v2(seed,101,0,2)<fmin(1.,(double(p2[proposal])/pz)/(double(q[proposal])/qz));out[row*2+1]=accepted?proposal:fixed_draw(rc,n,spark_uniform_v2(seed,101,0,3));
 }

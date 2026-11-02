@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include "ds41/kernels.cuh"
 #include <cuda_fp8.h>
 
@@ -5,7 +14,7 @@ namespace ds41 {
 __device__ __forceinline__ float e8m0(uint8_t x) {
     return x == 0 ? __uint_as_float(0x00400000) : x == 255 ? __uint_as_float(0x7fffffff) : __uint_as_float(uint32_t(x) << 23);
 }
-__global__ void quant_kernel(const __nv_bfloat16* x, uint8_t* q, uint8_t* s, int groups) {
+__global__ void quant_kernel(const __nv_bfloat16* x, uint8_t* q, uint8_t* s, int groups) {DS41_PDL_WAIT();
     int g = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = threadIdx.x & 31;
     if (g >= groups) return;
@@ -44,7 +53,7 @@ __device__ __forceinline__ void wait_ready(const DeviceExpert& e) {
 // Four warps, each handles 16 output channels and all <=8 tokens. We transpose
 // the mathematical GEMM so weights are MMA A and tokens MMA B; no K permutation.
 template<bool Direct=false>
-__global__ void __launch_bounds__(128) gemm_kernel(const DeviceExpert* table, const GemmJob* jobs, int projection, int N, int K,DeviceExpert raw_e={},GemmJob raw_job={}) {
+__global__ void __launch_bounds__(128) gemm_kernel(const DeviceExpert* table, const GemmJob* jobs, int projection, int N, int K,DeviceExpert raw_e={},GemmJob raw_job={}) {DS41_PDL_WAIT();
     GemmJob job = Direct?raw_job:jobs[blockIdx.y];
     DeviceExpert e = Direct?raw_e:table[job.expert];
     wait_ready(e);
@@ -111,7 +120,7 @@ __device__ __forceinline__ void mma_native(float (&c)[4],const uint32_t (&a)[4],
 }
 #include "prefill.cuh"
 template<bool Direct=false>
-__global__ void __launch_bounds__(128) gemm_native(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,int K,DeviceExpert raw_e={},GemmJob raw_job={}){
+__global__ void __launch_bounds__(128) gemm_native(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,int K,DeviceExpert raw_e={},GemmJob raw_job={}){DS41_PDL_WAIT();
     GemmJob job=Direct?raw_job:jobs[blockIdx.y];DeviceExpert e=Direct?raw_e:table[job.expert];wait_ready(e);
     const uint8_t* w=projection==0?e.gate:projection==1?e.up:e.down;
     const uint8_t* ws=projection==0?e.gate_scale:projection==1?e.up_scale:e.down_scale;
@@ -135,7 +144,7 @@ __global__ void __launch_bounds__(128) gemm_native(const DeviceExpert* table,con
 // this preserves the serial reference addition order exactly. No FP32 scratch
 // traffic and no atomic operations. Four warps cooperate on 16 output channels.
 template<int K,bool Direct=false>
-__global__ void __launch_bounds__(128,1) gemm_parallel(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,DeviceExpert raw_e={},GemmJob raw_job={}){
+__global__ void __launch_bounds__(128,1) gemm_parallel(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,DeviceExpert raw_e={},GemmJob raw_job={}){DS41_PDL_WAIT();
     constexpr int ng=K/32,G=(ng+3)/4,Groups=8,Stride=144,WarpStage=16*Stride,Stage=4*WarpStage;
     __shared__ __align__(16) uint8_t smem[2*Stage];
     __shared__ float carry[4][128];
@@ -199,7 +208,7 @@ __global__ void __launch_bounds__(128,1) gemm_parallel(const DeviceExpert* table
     }
 }
 template<int K,int Warps=4,bool Direct=false>
-__global__ void __launch_bounds__(Warps*32,1) gemm_native_parallel(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,DeviceExpert raw_e={},GemmJob raw_job={}){
+__global__ void __launch_bounds__(Warps*32,1) gemm_native_parallel(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,DeviceExpert raw_e={},GemmJob raw_job={}){DS41_PDL_WAIT();
     constexpr int ng=K/32,G=(ng+Warps-1)/Warps;
     __shared__ float carry[Warps][64];
     GemmJob job=Direct?raw_job:jobs[blockIdx.y];DeviceExpert e=Direct?raw_e:table[job.expert];wait_ready(e);
@@ -231,7 +240,7 @@ __global__ void __launch_bounds__(Warps*32,1) gemm_native_parallel(const DeviceE
         __syncthreads();
     }
 }
-__global__ void __launch_bounds__(128) gemm_native_tiled(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,int K){
+__global__ void __launch_bounds__(128) gemm_native_tiled(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,int K){DS41_PDL_WAIT();
     constexpr int Groups=8,Bytes=128,Stride=144,Stage=32*Stride;
     __shared__ __align__(16) uint8_t smem[2*Stage];
     GemmJob job=jobs[blockIdx.y];DeviceExpert e=table[job.expert];wait_ready(e);
@@ -267,7 +276,7 @@ __global__ void __launch_bounds__(128) gemm_native_tiled(const DeviceExpert* tab
 // alignment of the unmodified safetensors weight plane. Double buffering hides
 // global memory latency without changing any arithmetic/reduction boundary.
 template<bool Direct=false>
-__global__ void __launch_bounds__(128) gemm_tiled(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,int K,DeviceExpert raw_e={},GemmJob raw_job={}) {
+__global__ void __launch_bounds__(128) gemm_tiled(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,int K,DeviceExpert raw_e={},GemmJob raw_job={}) {DS41_PDL_WAIT();
     constexpr int Groups=8, Bytes=Groups*16, Stride=Bytes+16, Stage=64*Stride;
     __shared__ __align__(16) uint8_t smem[2*Stage];
     GemmJob job=Direct?raw_job:jobs[blockIdx.y];DeviceExpert e=Direct?raw_e:table[job.expert];wait_ready(e);
@@ -321,7 +330,7 @@ __global__ void __launch_bounds__(128) gemm_tiled(const DeviceExpert* table,cons
         for(int cc=0;cc<2;++cc){int token=t*2+cc;if(row+hr*8<N && token<job.tokens)job.output[(size_t)token*N+row+hr*8]=__float2bfloat16_rn(acc[hr*2+cc]);}
 }
 __global__ void swiglu_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up, const float* weight,
-                              __nv_bfloat16* out, int rows, int cols, float limit) {
+                              __nv_bfloat16* out, int rows, int cols, float limit) {DS41_PDL_WAIT();
     int i = blockIdx.x*blockDim.x+threadIdx.x;
     if (i >= rows*cols) return;
     float g=__bfloat162float(gate[i]), u=__bfloat162float(up[i]);
@@ -330,7 +339,7 @@ __global__ void swiglu_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up
     if (weight) h=__fmul_rn(weight[i/cols],h);
     out[i]=__float2bfloat16_rn(h);
 }
-__global__ void reduce_kernel(const __nv_bfloat16* routed,const int32_t* ids,const __nv_bfloat16* shared,__nv_bfloat16* out,int rows,int topk,int hidden){
+__global__ void reduce_kernel(const __nv_bfloat16* routed,const int32_t* ids,const __nv_bfloat16* shared,__nv_bfloat16* out,int rows,int topk,int hidden){DS41_PDL_WAIT();
     int index=blockIdx.x*blockDim.x+threadIdx.x;if(index>=rows*hidden)return;
     int token=index/hidden,h=index%hidden,last=-1;float acc=0;
     for(int i=0;i<topk;++i){int chosen=-1,smallest=0x7fffffff;for(int j=0;j<topk;++j){int id=ids[token*topk+j];if(id>last && id<smallest){chosen=j;smallest=id;}}

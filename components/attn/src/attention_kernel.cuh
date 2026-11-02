@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #if defined(_MSC_VER) && !defined(__clang__) && _MSC_VER < 1940
 #define _tl_orig_alignas alignas
 #define alignas(N) _tl_orig_alignas((N) <= 64 ? (N) : 64)
@@ -17,7 +26,7 @@
 #endif
 
 extern "C" __global__ void ds41_sparse_kernel(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk);
-extern "C" __global__ void __launch_bounds__(256, 1) ds41_sparse_kernel(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk) {
+extern "C" __global__ void __launch_bounds__(256, 1) ds41_sparse_kernel(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk) {DS41_PDL_WAIT();
   q += int64_t(blockIdx.y)*b*512;
   o += int64_t(blockIdx.y)*b*512;
   kv += int64_t(blockIdx.x)*topk*512;

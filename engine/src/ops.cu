@@ -1,32 +1,41 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include "ds41/ops.cuh"
 #include <cuda_fp8.h>
 namespace ds41e {
 namespace {
-__global__ void cast_up(const Bf16 *x, float *y, int n) {
+__global__ void cast_up(const Bf16 *x, float *y, int n) {DS41_PDL_WAIT();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n)
     y[i] = __bfloat162float(x[i]);
 }
-__global__ void cast_down(const float *x, Bf16 *y, int n) {
+__global__ void cast_down(const float *x, Bf16 *y, int n) {DS41_PDL_WAIT();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n)
     y[i] = __float2bfloat16_rn(x[i]);
 }
-__global__ void embed(const Bf16 *x, Bf16 *h, float *pre, int k) {
+__global__ void embed(const Bf16 *x, Bf16 *h, float *pre, int k) {DS41_PDL_WAIT();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < k * 4)
     h[i] = x[i % k];
   if (i < 4)
     pre[i] = i == 0 ? 1.f : 0.f;
 }
-__global__ void scale(Bf16 *x, int n, float factor) {
+__global__ void scale(Bf16 *x, int n, float factor) {DS41_PDL_WAIT();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n)
     x[i] = __float2bfloat16_rn(__fmul_rn(__bfloat162float(x[i]), factor));
 }
 // TEMP: contiguous single-row PyTorch mean reduction geometry. Kept explicit
 // until the component ABI exports this exact hc_mixes stage and fixture gate.
-__global__ void mixnorm(const Bf16 *h, float *mix, int k) {
+__global__ void mixnorm(const Bf16 *h, float *mix, int k) {DS41_PDL_WAIT();
   __shared__ float sh[512];
   int t = threadIdx.x;
   float v[4] = {0, 0, 0, 0};
@@ -69,20 +78,20 @@ __device__ __forceinline__ void route_one(const float *s, const int *ids, float 
   for (int i = 0; i < k; ++i)
     w[i] = __fmul_rn(s[ids[i]] / sum, 1.5f);
 }
-__global__ void route(const float *s, const int *ids, float *w, int k) {
+__global__ void route(const float *s, const int *ids, float *w, int k) {DS41_PDL_WAIT();
   if (threadIdx.x)
     return;
   route_one(s, ids, w, k);
 }
 // s0ma leg 26: every row's route weights in one launch, block r doing for row r what route<<<1,32>>> does.
-__global__ void route_rows(const float *s, const int *ids, float *w, int k, int scores_stride) {
+__global__ void route_rows(const float *s, const int *ids, float *w, int k, int scores_stride) {DS41_PDL_WAIT();
   if (threadIdx.x)
     return;
   const int r = blockIdx.x;
   route_one(s + size_t(r) * scores_stride, ids + r * k, w + r * k, k);
 }
 __global__ void rows(const uint8_t *values, const uint8_t *scales, Bf16 *out,
-                     int n) {
+                     int n) {DS41_PDL_WAIT();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n * 256)
     return;
@@ -94,7 +103,7 @@ __global__ void rows(const uint8_t *values, const uint8_t *scales, Bf16 *out,
   float s = __uint_as_float(exponent ? uint32_t(exponent) << 23 : 0x00400000u);
   out[i] = __float2bfloat16_rn(__fmul_rn(x, s));
 }
-__global__ void capture(const Bf16 *h, Bf16 *out, int k) {
+__global__ void capture(const Bf16 *h, Bf16 *out, int k) {DS41_PDL_WAIT();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= k)
     return;

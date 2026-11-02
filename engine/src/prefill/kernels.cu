@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include "ds41/prefill/kernels.cuh"
 #include "ds41/dense.h"
 #include <cublas_v2.h>
@@ -5,7 +14,7 @@
 namespace ds41e::prefill {
 namespace {
 constexpr int H=5120;
-__global__ void select(const float* biased,const float* unbiased,int* ids,float* weights){
+__global__ void select(const float* biased,const float* unbiased,int* ids,float* weights){DS41_PDL_WAIT();
   if(threadIdx.x)return;
   for(int k=0;k<6;++k){int best=-1;
     for(int e=0;e<384;++e){bool seen=false;for(int j=0;j<k;++j)seen|=ids[j]==e;
@@ -19,18 +28,18 @@ __global__ void select(const float* biased,const float* unbiased,int* ids,float*
   for(int k=0;k<6;++k)weights[k]=__fmul_rn(unbiased[ids[k]]/sum,1.5f);
 }
 __global__ void gather(const unsigned char*x,const unsigned char*s,const float*w,
-    const int*slots,unsigned char*out,unsigned char*os,float*ow){
+    const int*slots,unsigned char*out,unsigned char*os,float*ow){DS41_PDL_WAIT();
   int r=blockIdx.y,i=blockIdx.x*blockDim.x+threadIdx.x,slot=slots[r],src=slot/6;
   if(i<H)out[size_t(r)*H+i]=x[size_t(src)*H+i];
   if(i<H/32)os[size_t(r)*(H/32)+i]=s[size_t(src)*(H/32)+i];
   if(!i)ow[r]=w[slot];
 }
-__global__ void gather_bf16(const __nv_bfloat16*x,const float*w,const int*slots,__nv_bfloat16*out,float*ow){
+__global__ void gather_bf16(const __nv_bfloat16*x,const float*w,const int*slots,__nv_bfloat16*out,float*ow){DS41_PDL_WAIT();
   int r=blockIdx.y,i=blockIdx.x*blockDim.x+threadIdx.x,slot=slots[r],src=slot/6;
   if(i<H)out[size_t(r)*H+i]=x[size_t(src)*H+i];
   if(!i)ow[r]=w[slot];
 }
-__global__ void scatter(const __nv_bfloat16*x,const int*slots,__nv_bfloat16*out){
+__global__ void scatter(const __nv_bfloat16*x,const int*slots,__nv_bfloat16*out){DS41_PDL_WAIT();
   int r=blockIdx.y,i=blockIdx.x*blockDim.x+threadIdx.x;
   if(i<H)out[size_t(slots[r])*H+i]=x[size_t(r)*H+i];
 }
@@ -60,7 +69,7 @@ __device__ __forceinline__ float blocksum(float sum,float* sh,int width){int tid
  return sh[0];
 }
 int geometry(int M,int K,int& width){int height=1;while(height*2<=M&&height*2<=16)height*=2;int n=1;while(n*2<=K/4&&n*2<=512)n*=2;width=n<512/height?n:512/height;return K/width>=height*16?width*height:width;}
-__global__ void rms(const bf16*x,const bf16*w,bf16*y,int M,int K,float eps,int width){
+__global__ void rms(const bf16*x,const bf16*w,bf16*y,int M,int K,float eps,int width){DS41_PDL_WAIT();
  __shared__ float sums[512];int tid=threadIdx.x,row=blockIdx.x;if(row>=M)return;
  const bf16*xr=x+size_t(row)*K;bf16*yr=y+size_t(row)*K;
  float v[4]={0,0,0,0};
@@ -74,7 +83,7 @@ __global__ void rms(const bf16*x,const bf16*w,bf16*y,int M,int K,float eps,int w
 }
 __device__ float sum4(float v){v=__fadd_rn(v,__shfl_xor_sync(0xffffffff,v,2));return __fadd_rn(v,__shfl_xor_sync(0xffffffff,v,1));}
 __device__ float colsum4(float v){v=__fadd_rn(v,__shfl_xor_sync(0xffffffff,v,8));return __fadd_rn(v,__shfl_xor_sync(0xffffffff,v,4));}
-__global__ void sinkhorn(const float*m,const float*s,const float*b,float*pre,float*post,float*comb,int M,float eps,const float* rstd){
+__global__ void sinkhorn(const float*m,const float*s,const float*b,float*pre,float*post,float*comb,int M,float eps,const float* rstd){DS41_PDL_WAIT();
  int row=blockIdx.x,lane=threadIdx.x;if(row>=M)return;
  float z=lane<24?m[row*24+lane]:0.f;if(rstd)z=__fmul_rn(z,rstd[row]);
  if(lane<4){pre[row*4+lane]=__fadd_rn(1.f/(1.f+expf(-__fmaf_rn(z,s[0],b[lane]))),eps);float p=m[row*24+4+lane];if(rstd)p=__fmul_rn(p,rstd[row]);post[row*4+lane]=__fmul_rn(2.f,1.f/(1.f+expf(-__fmaf_rn(p,s[1],b[4+lane]))));}
@@ -84,12 +93,12 @@ __global__ void sinkhorn(const float*m,const float*s,const float*b,float*pre,flo
  for(int it=1;it<20;++it){v=v/__fadd_rn(sum4(v),eps);v=v/__fadd_rn(colsum4(v),eps);}
  if(lane<16)comb[row*16+lane]=v;
 }
-__global__ void promote_stats(const bf16*x,float*y,float*rstd,int M,int K,float eps,int width){__shared__ float sh[512];int row=blockIdx.x,tid=threadIdx.x;float v[4]={0,0,0,0};
+__global__ void promote_stats(const bf16*x,float*y,float*rstd,int M,int K,float eps,int width){DS41_PDL_WAIT();__shared__ float sh[512];int row=blockIdx.x,tid=threadIdx.x;float v[4]={0,0,0,0};
  const bf16*xr=x+size_t(row)*K;float*yr=y+size_t(row)*K;
  for(int i=tid*4;i<K;i+=blockDim.x*4)for(int j=0;j<4;++j)if(i+j<K){float a=__bfloat162float(xr[i+j]);yr[i+j]=a;v[j]=__fadd_rn(v[j],__fmul_rn(a,a));}
  float sum=blocksum(__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[1]),v[2]),v[3]),sh,width);if(!tid)rstd[row]=rsqrtf(__fadd_rn(__fmul_rn(sum,1.f/K),eps));
 }
-__global__ void select_rows(const float* biased,const float* unbiased,int* ids,float* weights,int rows){
+__global__ void select_rows(const float* biased,const float* unbiased,int* ids,float* weights,int rows){DS41_PDL_WAIT();
   int r=blockIdx.x;if(r>=rows||threadIdx.x)return;
   biased+=size_t(r)*384;unbiased+=size_t(r)*384;ids+=r*6;weights+=r*6;
   for(int k=0;k<6;++k){int best=-1;

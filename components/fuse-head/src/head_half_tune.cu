@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 // Research only. Inferred gemvx specialization6 lane/FMA/tree mechanism must
 // be reviewed and tested before any E0 claim or production selection.
 #include <cuda_runtime.h>
@@ -5,7 +14,7 @@
 #include <cstddef>
 namespace {
 template<int M,int ROWS,int UNROLL> __global__ void half_tree(const float *x,const __nv_bfloat16 *w,
-    float *y,int N,int K) {
+    float *y,int N,int K) {DS41_PDL_WAIT();
   int lane=threadIdx.x,row=blockIdx.x*ROWS+threadIdx.y;
   float acc[M]={};
   #pragma unroll UNROLL

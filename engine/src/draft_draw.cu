@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 // s0ma: a draft token drawn on the GPU (DS41_SPARK_GPU_DRAW=1).
 //
 // The host path (speculation.cpp) copies each drafted position's 129,280 logits to the host, builds q in fp64
@@ -48,7 +57,7 @@ __device__ void range_of(int n, int b, int &lo, int &hi) {
   hi = min(n, lo + chunk);
 }
 
-__global__ void k_argmax(const float *x, int n, Scratch *s) {
+__global__ void k_argmax(const float *x, int n, Scratch *s) {DS41_PDL_WAIT();
   __shared__ float fv[T];
   __shared__ int fi[T];
   int lo, hi;
@@ -81,7 +90,7 @@ __device__ int global_argmax(const Scratch *s) {   // every block reduces the pa
 }
 
 // e[i] = exp((double(x[i]) - x[b]) / t), written to q when sampling; each block's sum to zpart
-__global__ void k_exp(const float *x, int n, double t, double *q, Scratch *s) {
+__global__ void k_exp(const float *x, int n, double t, double *q, Scratch *s) {DS41_PDL_WAIT();
   __shared__ double sh[T];
   __shared__ int top_i;
   if (!threadIdx.x) top_i = global_argmax(s);
@@ -106,7 +115,7 @@ __device__ double total_of(const double *part) {
 }
 
 // q[i] /= z; each block's sum of q to qpart
-__global__ void k_normalize(double *q, int n, Scratch *s) {
+__global__ void k_normalize(double *q, int n, Scratch *s) {DS41_PDL_WAIT();
   __shared__ double sh[T];
   __shared__ double z;
   if (!threadIdx.x) z = total_of(s->zpart);
@@ -130,7 +139,7 @@ struct Result {
 
 // one block: the confidence, then the inverse-CDF draw (sampling) or the first maximum (greedy)
 __global__ void k_finish(const double *q, int n, int greedy, uint64_t seed, uint64_t step, uint32_t slot,
-                         uint32_t purpose, Scratch *s, Result *out) {
+                         uint32_t purpose, Scratch *s, Result *out) {DS41_PDL_WAIT();
   __shared__ double sub[T + 1];
   __shared__ int block, found, last;
   __shared__ double base, target;

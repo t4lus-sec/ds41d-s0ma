@@ -1,3 +1,12 @@
+// s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
+// predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
+#ifndef DS41_PDL_WAIT
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define DS41_PDL_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
+#else
+#define DS41_PDL_WAIT() do {} while (0)
+#endif
+#endif
 #include "ds41/attention.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -12,7 +21,7 @@ __device__ float powceil(float v) {
  unsigned u=__float_as_uint(v); unsigned ex=(u>>23)&255;
  return __uint_as_float((ex+((u&0x7fffff)!=0))<<23);
 }
-template<int F, bool RT> __global__ void packer(const bf* x, uint8_t* out, bf* rt, int rows,int cols) {
+template<int F, bool RT> __global__ void packer(const bf* x, uint8_t* out, bf* rt, int rows,int cols) {DS41_PDL_WAIT();
  constexpr int G=F==1?16:32;
  const int group=blockIdx.x*8+threadIdx.x/32, lane=threadIdx.x%32;
  const int groups=rows*(cols/G); if(group>=groups)return;
@@ -37,7 +46,7 @@ template<int F, bool RT> __global__ void packer(const bf* x, uint8_t* out, bf* r
   else{unsigned other=__shfl_xor_sync(G==16?0x0000ffff:0xffffffff,unsigned(v),1);if(!(lane&1))out[row*(cols/2+cols/G)+gg*G/2+lane/2]=v|(other<<4);if(lane==0)out[row*(cols/2+cols/G)+cols/2+gg]=sc;}
  }
 }
-template<int F> __global__ void unpacker(const uint8_t* p,bf* x,int count,int cols){
+template<int F> __global__ void unpacker(const uint8_t* p,bf* x,int count,int cols){DS41_PDL_WAIT();
  int i=blockIdx.x*256+threadIdx.x;if(i>=count)return;int row=i/cols,d=i%cols;
  if constexpr(F==0){p+=row*(cols+cols/32);x[i]=__float2bfloat16_rn(__fmul_rn(f8(p[d]),e8(p[cols+d/32])));}
  else {constexpr int G=F==1?16:32;p+=row*(cols/2+cols/G);uint8_t b=p[d/2];float sc=F==1?f8(p[cols/2+d/G]):e8(p[cols/2+d/G]);x[i]=__float2bfloat16_rn(__fmul_rn(f4((b>>(4*(d&1)))&15),sc));}

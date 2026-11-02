@@ -81,6 +81,10 @@ struct OffloadStore::Impl {
     std::vector<cudaEvent_t> slot_copy,slot_mapping,staging_copy;
     std::vector<bool> known_ready;
     cudaStream_t copy=nullptr, mapping=nullptr;
+    // s0ma change 41: DS41_MOE_PREFETCH_STREAM=1 gives prefetch uploads their own lowest-priority stream (pcopy) and
+    // demand uploads the highest, so a demand upload no longer queues behind every prefetch issued before it
+    cudaStream_t pcopy=nullptr;
+    cudaEvent_t pcopy_idle=nullptr;
     cudaEvent_t speculative_done=nullptr;
     bool speculative_pending=false;
     cudaEvent_t copy_idle=nullptr;
@@ -228,7 +232,12 @@ struct OffloadStore::Impl {
         }
         struct Guard { Impl* p;bool active=true;~Guard(){if(active)p->clear_device();} } guard{this};
         ck(cudaGetDevice(&device));
-        ck(cudaStreamCreateWithFlags(&copy,cudaStreamNonBlocking));
+        if(flag("DS41_MOE_PREFETCH_STREAM")) {   // s0ma change 41
+            int lo=0,hi=0;ck(cudaDeviceGetStreamPriorityRange(&lo,&hi));
+            ck(cudaStreamCreateWithPriority(&copy,cudaStreamNonBlocking,hi));
+            ck(cudaStreamCreateWithPriority(&pcopy,cudaStreamNonBlocking,lo));
+            ck(cudaEventCreateWithFlags(&pcopy_idle,cudaEventDisableTiming));
+        } else ck(cudaStreamCreateWithFlags(&copy,cudaStreamNonBlocking));
         ck(cudaStreamCreateWithFlags(&mapping,cudaStreamNonBlocking));
         if(demote)ck(cudaStreamCreateWithFlags(&demote_stream,cudaStreamNonBlocking));
         ck(cudaEventCreateWithFlags(&speculative_done,cudaEventDisableTiming));
@@ -301,6 +310,7 @@ struct OffloadStore::Impl {
     void clear_device() noexcept {
         gds.reset();
         if(copy)cudaStreamSynchronize(copy);
+        if(pcopy)cudaStreamSynchronize(pcopy);
         if(mapping)cudaStreamSynchronize(mapping);
         if(demote_stream){cudaStreamSynchronize(demote_stream);cudaStreamDestroy(demote_stream);demote_stream=nullptr;}
         if(speculative_done)cudaEventDestroy(speculative_done);
@@ -316,6 +326,9 @@ struct OffloadStore::Impl {
         if(table)cudaFree(table);
         if(ready)cudaFree(ready);
         if(copy)cudaStreamDestroy(copy);
+        if(pcopy)cudaStreamDestroy(pcopy);
+        if(pcopy_idle)cudaEventDestroy(pcopy_idle);
+        pcopy=nullptr;pcopy_idle=nullptr;
         if(mapping)cudaStreamDestroy(mapping);
         vram=nullptr;table=nullptr;ready=nullptr;copy=nullptr;mapping=nullptr;
     }
@@ -352,6 +365,7 @@ struct OffloadStore::Impl {
         }
     }
     Lease load(const std::vector<ExpertId>& ids,cudaStream_t consumer,bool is_prefetch,const ReadyCallback& callback={},const ReadyBatchCallback& batch_callback={},bool allow_host_admission=true,bool drift_demand=true) {
+        cudaStream_t cs=is_prefetch&&pcopy?pcopy:copy;   // s0ma change 41: this load's copy stream
         auto start=Clock::now();
         for(auto id:ids) if(!records.count(id))throw std::out_of_range("expert has no storage record");
         // pin_vram() uses load(false, allow_host_admission=false) to retain its
@@ -413,8 +427,8 @@ struct OffloadStore::Impl {
             else if(callback)for(auto a:allocations)if(a.hit)notify(a);
             for(auto a:allocations)if(!a.hit) {
                 auto h=host.find(a.id);if(h==host.end())continue;
-                if(auto d=demoting.find(a.id);d!=demoting.end())ck(cudaStreamWaitEvent(copy,d->second,0));
-                upload(a,static_cast<char*>(host_arena->data())+h->second,records.at(a.id).bytes,is_prefetch);
+                if(auto d=demoting.find(a.id);d!=demoting.end())ck(cudaStreamWaitEvent(cs,d->second,0));
+                upload(a,static_cast<char*>(host_arena->data())+h->second,records.at(a.id).bytes,is_prefetch,true,cs);
                 if(streaming)notify(a);
             }
             if(spec_n && !is_prefetch && !disk.empty()) {
@@ -433,8 +447,8 @@ struct OffloadStore::Impl {
                     }
                     if(s==SIZE_MAX){rest.push_back(a);continue;}
                     ++spec_hits;
-                    upload(a,static_cast<char*>(spec_buf->data())+s*slot_bytes,records.at(a.id).bytes,false);
-                    cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,copy));
+                    upload(a,static_cast<char*>(spec_buf->data())+s*slot_bytes,records.at(a.id).bytes,false,true,cs);
+                    cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,cs));
                     spec_release.push_back({s,done});
                     if(streaming)notify(a);
                 }
@@ -473,8 +487,8 @@ struct OffloadStore::Impl {
             auto io_start=Clock::now();
             struct DemandIo{std::atomic<int>& n;bool on;DemandIo(std::atomic<int>& c,bool o):n(c),on(o){if(on)++n;}~DemandIo(){if(on)--n;}} demand_io_guard(demand_io,!refs.empty() && !is_prefetch);
             auto record_ready=[&](size_t j,size_t b){
-                auto a=disk[j];upload(a,fixed[j]?fixed[j]:ring[b],refs[j]->bytes,is_prefetch,!chunk_upload);
-                if(!fixed[j])ck(cudaEventRecord(staging_copy[b],copy));
+                auto a=disk[j];upload(a,fixed[j]?fixed[j]:ring[b],refs[j]->bytes,is_prefetch,!chunk_upload,cs);
+                if(!fixed[j])ck(cudaEventRecord(staging_copy[b],cs));
                 if(streaming)notify(a);
             };
             auto ring_recycle=[&](size_t b){auto t=Clock::now();ck(cudaEventSynchronize(staging_copy[b]));counters.staging_wait_ns+=ns(Clock::now()-t);};
@@ -485,19 +499,19 @@ struct OffloadStore::Impl {
                     if(dst>=record_bytes)return;
                     const size_t n=std::min<size_t>(bytes,record_bytes-dst);
                     char* src=static_cast<char*>(fixed[j]?fixed[j]:ring[b]);
-                    ck(cudaMemcpyAsync(vram+voff(disk[j].slot)+dst,src+dst,n,cudaMemcpyHostToDevice,copy));
+                    ck(cudaMemcpyAsync(vram+voff(disk[j].slot)+dst,src+dst,n,cudaMemcpyHostToDevice,cs));
                 },ring_recycle,cfg.io_chunk_bytes);
             } else reader.stream_mixed(refs,ring,fixed,record_ready,ring_recycle,cfg.io_chunk_bytes);
             counters.io_ns+=ns(Clock::now()-io_start);
             // A later worker call may evict RAM while these async DMA reads
             // still execute. Retain all source slots through a copy event.
-            if(!host_holds.empty()){cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,copy));host_retired.push_back({std::move(host_holds),done});}
+            if(!host_holds.empty()){cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,cs));host_retired.push_back({std::move(host_holds),done});}
             if(!is_prefetch && !streaming)for(auto a:allocations)order(a,consumer);
             if(demote && batch_callback && !is_prefetch)top_up(ids);
             // Keep prefetch leases until DMA finishes; demand ownership is
             // transferred to the caller and released only after its consumer.
             uint64_t id=++serial;
-            if(is_prefetch){cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,copy));retired.push_back({allocations,done,false});ck(cudaEventRecord(speculative_done,copy));speculative_pending=true;}else live.emplace(id,allocations);
+            if(is_prefetch){cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,cs));retired.push_back({allocations,done,false});ck(cudaEventRecord(speculative_done,cs));speculative_pending=true;}else live.emplace(id,allocations);
             auto elapsed=ns(Clock::now()-start);counters.need_host_ns+=elapsed;
             if(!is_prefetch){std::set<unsigned> layers;for(auto a:allocations)layers.insert(expert_layer(a.id));for(auto l:layers)counters.layers[l].stall_ns+=elapsed;}
             if(policy_audit.is_open() && policy_demand) {
@@ -570,7 +584,7 @@ struct OffloadStore::Impl {
             // The slot's last upload must land before its bytes are copied back.
             auto rc=cudaEventQuery(slot_copy[v.slot]);
             if(rc==cudaErrorNotReady)ck(cudaStreamWaitEvent(demote_stream,slot_copy[v.slot],0));else ck(rc);
-            if(!waited){ck(cudaStreamWaitEvent(demote_stream,copy_idle,0));waited=true;}
+            if(!waited){ck(cudaStreamWaitEvent(demote_stream,copy_idle,0));if(pcopy_idle)ck(cudaStreamWaitEvent(demote_stream,pcopy_idle,0));waited=true;}
             ck(cudaMemcpyAsync(static_cast<char*>(host_arena->data())+hoff(size_t(hs)),vram+voff(v.slot),
                 records.at(x).bytes,cudaMemcpyDeviceToHost,demote_stream));
             cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,demote_stream));
@@ -599,14 +613,15 @@ struct OffloadStore::Impl {
         if(rc==cudaErrorNotReady)ck(cudaStreamWaitEvent(consumer,map,0));else ck(rc);
         if(!cfg.ready_flags){rc=cudaEventQuery(slot_copy[a.slot]);if(rc==cudaErrorNotReady)ck(cudaStreamWaitEvent(consumer,slot_copy[a.slot],0));else ck(rc);}
     }
-    void upload(const SlotPool::Allocation& a,void* src,size_t bytes,bool is_prefetch,bool copy_bytes=true) {
+    void upload(const SlotPool::Allocation& a,void* src,size_t bytes,bool is_prefetch,bool copy_bytes,cudaStream_t cs) {
+        if(!cs)cs=copy;
         size_t chunk=cfg.h2d_chunk_bytes?cfg.h2d_chunk_bytes:bytes;
-        if(copy_bytes)for(size_t off=0;off<bytes;off+=chunk)ck(cudaMemcpyAsync(vram+voff(a.slot)+off,static_cast<char*>(src)+off,std::min(chunk,bytes-off),cudaMemcpyHostToDevice,copy));
+        if(copy_bytes)for(size_t off=0;off<bytes;off+=chunk)ck(cudaMemcpyAsync(vram+voff(a.slot)+off,static_cast<char*>(src)+off,std::min(chunk,bytes-off),cudaMemcpyHostToDevice,cs));
         counters.h2d_bytes+=bytes;counters.layers[expert_layer(a.id)].h2d_bytes+=bytes;
         if(is_prefetch)counters.prefetch_h2d_bytes+=bytes;
-        if(cfg.ready_flags)ck(cudaMemcpyAsync(ready+a.slot,static_cast<uint32_t*>(generations->data())+a.slot,sizeof(uint32_t),cudaMemcpyHostToDevice,copy));
-        ck(cudaEventRecord(slot_copy[a.slot],copy));
-        ck(cudaEventRecord(copy_idle,copy));
+        if(cfg.ready_flags)ck(cudaMemcpyAsync(ready+a.slot,static_cast<uint32_t*>(generations->data())+a.slot,sizeof(uint32_t),cudaMemcpyHostToDevice,cs));
+        ck(cudaEventRecord(slot_copy[a.slot],cs));
+        ck(cudaEventRecord(cs==pcopy?pcopy_idle:copy_idle,cs));
     }
 };
 OffloadStore::OffloadStore(std::vector<Record> r,Config c):impl_(new Impl(std::move(r),c)){}

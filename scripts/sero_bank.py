@@ -14,6 +14,10 @@ where the quant has K4/K5 for them, so the bank is Sero's experts, not the whole
                                     ~186 GB; resumes (layers with a matching receipt are kept); then writes
                                     DIR/records-mixed.tsv, DIR/receipts.json, DIR/mixed-p80.placement, DIR/layers.json
   verify DIR                        recompute each bank file's SHA-256 and re-stamp its receipt
+  dense DIR [--source REPO[@REV]]   s0ma N1: every EXL3 tensor that is not a routed expert (attention, shared experts,
+                                    head; ~3 GB) into DIR/dense.bin, one record each (trellis, then suh, then svh, as
+                                    an expert projection's), and DIR/dense.json: each tensor's name, k, n, bits,
+                                    codebook and offset. Prints the inventory (names and shapes, no weights).
 
 The revision defaults to the repo's current commit, which is then pinned in every receipt."""
 import argparse
@@ -264,9 +268,94 @@ def inspect(source):
                     print(f'  {p}.{t}: {found[1]["dtype"]} {found[1]["shape"]} ({found[0]})')
 
 
+DENSE_ALIGN = 4096
+
+
+def dense_inventory(repo):
+    """every EXL3 linear outside the routed experts: (base name, k, n, bits, codebook, extra suffixes, metas)"""
+    bases = sorted({k[:-len('.trellis')] for k in repo.index if k.endswith('.trellis') and '.experts.' not in k})
+    suffixes = {}
+    for key in repo.index:
+        head, _, tail = key.rpartition('.')
+        if '.experts.' not in key:
+            suffixes.setdefault(head, set()).add(tail)
+    out = []
+    for b in bases:
+        t = repo.meta(f'{b}.trellis')
+        if t is None:
+            continue
+        shape = t[1]['shape']
+        if t[1]['dtype'] != 'I16' or len(shape) != 3 or shape[2] % 16:
+            raise ValueError(f'{repo.name} {b}.trellis: {t[1]["dtype"]} {shape}, want I16 [k/16, n/16, 16*bits]')
+        k, n, bits = shape[0] * 16, shape[1] * 16, shape[2] // 16
+        codebook = 'mcg' if repo.meta(f'{b}.mcg') else 'mul1' if repo.meta(f'{b}.mul1') else '3inst'
+        metas = {x: repo.meta(f'{b}.{x}') for x in ('trellis', 'suh', 'svh')}
+        for x, want in (('suh', [k]), ('svh', [n])):
+            if metas[x] is None or metas[x][1]['dtype'] != 'F16' or metas[x][1]['shape'] != want:
+                got = metas[x] and (metas[x][1]['dtype'], metas[x][1]['shape'])
+                raise ValueError(f'{repo.name} {b}.{x}: {got}, want F16 {want}')
+        extra = sorted(suffixes.get(b, set()) - {'trellis', 'suh', 'svh', 'mul1', 'mcg'})
+        out.append((b, k, n, bits, codebook, extra, metas))
+    return out
+
+
+def dense(out, source, threads):
+    """s0ma N1: Sero's non-expert EXL3 tensors as records in one file, with an inventory"""
+    import re
+    out.mkdir(parents=True, exist_ok=True)
+    repo, src, _ = open_repo(source)
+    inv = dense_inventory(repo)
+    if not inv:
+        raise SystemExit(f'{repo.name}: no EXL3 tensors outside the routed experts')
+    groups = {}
+    for b, k, n, bits, cb, extra, _ in inv:   # names with the layer number folded, for the inventory
+        key = (re.sub(r'\.\d+\.', '.{l}.', b), k, n, bits, cb, tuple(extra))
+        groups[key] = groups.get(key, 0) + 1
+    print(f'{src}: {len(inv)} EXL3 tensors outside the routed experts', flush=True)
+    for (name, k, n, bits, cb, extra), count in sorted(groups.items()):
+        more = f'; also {", ".join(extra)}' if extra else ''
+        print(f'  {name}: K{bits} {k}->{n} {cb} x{count}{more}', flush=True)
+    tensors, off = [], 0
+    for b, k, n, bits, cb, extra, metas in inv:
+        tb = k // 16 * (n // 16) * 16 * bits * 2
+        size = tb + 2 * k + 2 * n
+        tensors.append({'name': b, 'k': k, 'n': n, 'bits': bits, 'codebook': cb, 'offset': off,
+                        'trellis_bytes': tb, 'bytes': size})
+        off += (size + DENSE_ALIGN - 1) // DENSE_ALIGN * DENSE_ALIGN
+    path, tmp = out / 'dense.bin', out / 'dense.partial'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    t0, done = time.time(), [0]
+    try:
+        os.ftruncate(fd, off)
+
+        def one(item):
+            (b, k, n, bits, cb, extra, metas), t = item
+            dest = {'trellis': t['offset'], 'suh': t['offset'] + t['trellis_bytes'],
+                    'svh': t['offset'] + t['trellis_bytes'] + 2 * k}
+            for x in ('trellis', 'suh', 'svh'):
+                shard, entry = metas[x]
+                a, z = entry['data_offsets']
+                base = repo.header(shard)['__base__']
+                for c in range(a, z, 64 << 20):   # 64 MiB range reads
+                    e = min(z, c + (64 << 20))
+                    os.pwrite(fd, kb.get(repo.base + shard, base + c, base + e - 1), dest[x] + c - a)
+            done[0] += t['bytes']
+        with ThreadPoolExecutor(threads) as pool:
+            list(pool.map(one, zip(inv, tensors)))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    digest = kb.file_sha256(tmp)
+    os.replace(tmp, path)
+    (out / 'dense.json').write_text(json.dumps({'source': src, 'file': path.name, 'bytes': off, 'sha256': digest,
+                                                'tensors': tensors}, indent=1) + '\n')
+    print(f'dense complete: {path.resolve()}; {len(tensors)} tensors, {off / 1e9:.2f} GB, sha256 {digest[:16]}, '
+          f'{done[0] / 1e6 / max(1e-9, time.time() - t0):.0f} MB/s', flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('action', choices=['inspect', 'fetch', 'verify'])
+    p.add_argument('action', choices=['inspect', 'fetch', 'verify', 'dense'])
     p.add_argument('dir', type=Path, nargs='?')
     p.add_argument('--source', default=REPO, help='REPO or REPO@REVISION (default: the repo\'s current commit)')
     p.add_argument('--layers', default='0-39')
@@ -279,6 +368,9 @@ def main():
         raise SystemExit(f'{a.action} needs DIR')
     if a.action == 'verify':
         verify(a.dir)
+        return
+    if a.action == 'dense':
+        dense(a.dir, a.source, a.threads)
         return
     lo, _, hi = a.layers.partition('-')
     fetch(a.dir, range(int(lo), int(hi or lo) + 1), a.source, a.threads)

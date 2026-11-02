@@ -610,6 +610,10 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
       prefill_summary["warm_host"]={{"candidates",ids.size()},{"read",read},{"ms",clock_ms()-warm_start}};
       prefill_warm_counts.clear();
     }
+    // s0ma change 48: the first prompt's peak (its activations and chunk scratch are still held here), and the
+    // buffers it leaves allocated for decode (the stager ring, lanes, the dense FP16 cache) show as the next line
+    static bool ledger_first=true;
+    if(ledger_first){ledger_first=false;CK(cudaStreamSynchronize(stream));vram_checkpoint("first_prefill_peak");}
     return result;
   }catch(...){cudaStreamSynchronize(stream);prefill_chunk.reset();poisoned=true;in_step=false;throw;}
 }

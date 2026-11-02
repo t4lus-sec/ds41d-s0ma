@@ -94,7 +94,13 @@ extern "C" int ds41_dense_fp8(const void*x,const void*xs,const void*w,const void
  auto a=(const uint8_t*)x;auto as=(const uint8_t*)xs;auto b=(const uint8_t*)w;auto bs=(const uint8_t*)ws;auto c=(bf16*)y;
  if(variant==0){basic<<<(N+63)/64,128,0,stream>>>(a,as,b,bs,c,M,N,K);return cudaGetLastError();}
  #define LAUNCH(KV) case KV: if(variant==2)parallel<KV,8,true><<<(N+7)/8,256,0,stream>>>(a,as,b,bs,c,M,N);else if(variant==3)parallel<KV,4,true><<<(N+7)/8,128,0,stream>>>(a,as,b,bs,c,M,N);else if(variant==4)parallel<KV,4,true,4><<<(N+3)/4,128,0,stream>>>(a,as,b,bs,c,M,N);else if(variant==5)parallel<KV,8,true,4><<<(N+3)/4,256,0,stream>>>(a,as,b,bs,c,M,N);else if(variant==6)parallel<KV,4,true,2><<<(N+1)/2,128,0,stream>>>(a,as,b,bs,c,M,N);else parallel<KV,8,false><<<(N+15)/16,256,0,stream>>>(a,as,b,bs,c,M,N);break
- switch(K){LAUNCH(128);LAUNCH(256);LAUNCH(512);LAUNCH(1280);LAUNCH(2304);LAUNCH(4096);LAUNCH(5120);LAUNCH(6144);LAUNCH(8192);LAUNCH(15360);default:basic<<<(N+63)/64,128,0,stream>>>(a,as,b,bs,c,M,N,K);}
+ // s0ma change 48: at K=15360 the 4-warp variants keep 120 groups of dots a thread in local memory (a 1,184-byte
+ // stack), and the largest stack of any loaded kernel is reserved for every resident thread of the card (~326 MiB
+ // here). Only the 8-warp variants are built at that K; 3 -> 2 and 4/6 -> 5 add the same k32 dots in the same
+ // ascending order (the carry walks the groups in order whatever the warp count), so the bits are unchanged.
+ #define LAUNCH8(KV) case KV: if(variant==2||variant==3)parallel<KV,8,true><<<(N+7)/8,256,0,stream>>>(a,as,b,bs,c,M,N);else if(variant==4||variant==5||variant==6)parallel<KV,8,true,4><<<(N+3)/4,256,0,stream>>>(a,as,b,bs,c,M,N);else parallel<KV,8,false><<<(N+15)/16,256,0,stream>>>(a,as,b,bs,c,M,N);break
+ switch(K){LAUNCH(128);LAUNCH(256);LAUNCH(512);LAUNCH(1280);LAUNCH(2304);LAUNCH(4096);LAUNCH(5120);LAUNCH(6144);LAUNCH(8192);LAUNCH8(15360);default:basic<<<(N+63)/64,128,0,stream>>>(a,as,b,bs,c,M,N,K);}
+ #undef LAUNCH8
  #undef LAUNCH
  return cudaGetLastError();
 }

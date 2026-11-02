@@ -87,9 +87,22 @@ double clock_ms() {
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
+// s0ma change 48: without a test hook, each checkpoint prints the VRAM in use and its change since the last one
+// ("vram ledger: LABEL used MiB (+delta)"), so every load stage's share of the card is measured, not estimated.
+// DS41_VRAM_LEDGER=0 turns the lines off.
 void vram_checkpoint(const char *label) {
   auto f=reinterpret_cast<void(*)(const char*)>(dlsym(RTLD_DEFAULT,"ds41_vram_checkpoint"));
-  if (f) f(label);
+  if (f) { f(label); return; }
+  static const bool on = [] { const char *v = std::getenv("DS41_VRAM_LEDGER"); return !v || std::string(v) != "0"; }();
+  if (!on) return;
+  static size_t last_used = 0;
+  size_t free = 0, total = 0;
+  if (cudaMemGetInfo(&free, &total) != cudaSuccess) { cudaGetLastError(); return; }
+  const size_t used = total - free;
+  std::cerr << "vram ledger: " << label << " used " << (used >> 20) << " MiB ("
+            << (used >= last_used ? "+" : "-") << ((used >= last_used ? used - last_used : last_used - used) >> 20)
+            << ") of " << (total >> 20) << " MiB\n";
+  last_used = used;
 }
 struct Device {
   void *p = nullptr, *mapped_host = nullptr;
@@ -690,7 +703,9 @@ public:
     }
     reader = std::make_unique<ds41::DirectReader>(64);
     load_weights();
+    vram_checkpoint("native_after_native_weights");   // s0ma change 48
     load_sero_dense();
+    vram_checkpoint("native_after_sero_dense");
     splitk_scratch(0);   // s0ma change 40
     if (fused_head && !dense_of("head")) {   // s0ma change 43: unless Sero's head replaced it
       const auto &head = w("head.weight");
@@ -798,7 +813,15 @@ public:
       consumer_readiness=std::make_unique<hotpath::ConsumerReadiness>();
     }
     reset();
-    if (rows_dense) check_rows_batched();
+    if (rows_dense) {
+      check_rows_batched();
+      // s0ma change 48: the check captured cuBLAS into graphs and destroyed them; give their pool back
+      int device = 0;
+      CK(cudaGetDevice(&device));
+      CK(cudaDeviceGraphMemTrim(device));
+      vram_checkpoint("native_after_rows_check");
+    }
+    vram_checkpoint("native_loaded");
     std::cerr << "ds41d native M1 loaded; UNQUALIFIED; expert slots="
               << c.expert_slots << (exl3_mixed ? " (EXL3 mixed target experts: " + mixed_k3_layers + "; native MTP store)"
                                     : exl3 ? (exl3_bits_loaded == 2 ? " (EXL3 K2 target experts, native MTP store)"
@@ -1076,6 +1099,10 @@ public:
   verify(const std::vector<int> &input) override {
     if (poisoned)
       throw std::runtime_error("native forward/store poisoned; restart ds41d");
+    {   // s0ma change 48: what the first decode step starts from (the first prompt's scratch freed, its buffers kept)
+      static bool ledger_first = true;
+      if (ledger_first) { ledger_first = false; vram_checkpoint("first_decode_step"); }
+    }
     if (pending || input.empty() || input.size() > 6 ||
         committed + int64_t(input.size()) > config.max_context)
       throw std::invalid_argument("verify state/width/context");
@@ -1832,6 +1859,8 @@ private:
     dense_rows_c.resize(256 * widest_n * 4);
     used += dense_split_partial[0].bytes + dense_split_counts[0].bytes + dense_cache.bytes + dense_rows_a.bytes +
             dense_rows_c.bytes;
+    // s0ma change 48: with all 40 layers' wo_a as Sero's slices, the shared BF16 scratch for the native wo_a is dead
+    if (dense_woa.size() == 40 && woa_scratch.bytes) { freed += woa_scratch.bytes; woa_scratch.release(); }
     dense_extra_gib = freed > used ? double(freed - used) / double(size_t(1) << 30) : 0;
     std::cerr << "Sero dense EXL3 (" << meta.at("source").get<std::string>() << "): " << table.size() << " tensors, "
               << used / 1e9 << " GB in place of " << freed / 1e9 << " GB of FP8 (" << skipped << " left native):";

@@ -290,6 +290,12 @@ def environment(cfg, render=True):
         env.update(K2_ENV)
     if cfg.get('experts') == 'sero':
         env.update(SERO_ENV)
+        # s0ma change 48: Sero's own dense tensors (change 34: 38.2 -> 40.1 tok/s) and K4 head (change 43: 0.99 GB
+        # to expert slots, drafting 3.19 -> 2.64 ms a step) whenever the bank has them (ds41.sh sero dense); a lab
+        # --env DS41_SERO_DENSE=0 or DS41_SERO_HEAD=0 (in ENGINE_ENV, applied first) still wins
+        if (bank_dir(cfg) / 'dense' / 'dense.json').exists():
+            env.setdefault('DS41_SERO_DENSE', '1')
+            env.setdefault('DS41_SERO_HEAD', '1')
         # change 25: a lab --env DS41_EXPERT_EXTRA_GIB=... (in ENGINE_ENV) wins
         env.setdefault('DS41_EXPERT_EXTRA_GIB', SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
     # the pinned cuBLAS pair (dist/blas) before CUDA 13.4's own libraries (cudart, cuFile)

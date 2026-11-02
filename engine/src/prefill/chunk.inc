@@ -34,8 +34,11 @@ struct PrefillChunk {
 std::unique_ptr<PrefillChunk> prefill_chunk;
 size_t prefill_fp8_elements() const {
   size_t best=0;
+  // s0ma change 48: only the target's layers run through the prefill chunk's FP8 path (the drafter's FP8 tensors,
+  // left after Sero's dense set replaced the target's, sized this scratch for nothing)
   for(const auto &item:weights)
-    if((item.second.dtype=="F8_E4M3"||item.second.dtype=="F8_E4M3FN")&&item.second.shape.size()==2)
+    if(item.first.compare(0,7,"layers.")==0&&
+       (item.second.dtype=="F8_E4M3"||item.second.dtype=="F8_E4M3FN")&&item.second.shape.size()==2)
       best=std::max<size_t>(best,item.second.shape[0]*item.second.shape[1]);
   return best;
 }

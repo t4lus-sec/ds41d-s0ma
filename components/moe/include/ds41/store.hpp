@@ -117,8 +117,18 @@ public:
     void drained(size_t slot);
     // Host pool: experts resident in the VRAM peer score 0, so duplicates are evicted first.
     void exclusive(bool enabled);
+    // s0ma change 51 (V6): slots lent to prompt processing. A lent slot is empty, never allocated, never a victim and
+    // not idle for reserve(). lend() requires the slots unleased and unpinned; each one's expert moves into the
+    // lowest-ranked unlent, unleased slot of its class when that slot ranks below it (that expert is evicted instead),
+    // else it is dropped. Returns the moves (to = its new slot, evicted = the victim or -1) and the dropped ids.
+    struct Move { ExpertId id; size_t from, to; int64_t evicted; };
+    std::vector<Move> lend(const std::vector<size_t>& slots, std::vector<ExpertId>& dropped);
+    void set_lent(size_t slot, bool lent);
+    bool lent(size_t slot) const { return slot < slots_.size() && slots_[slot].lent; }
+    bool busy(size_t slot) const { return slot < slots_.size() && (slots_[slot].leases || slots_[slot].pinned || slots_[slot].draining ||
+                                                                    slots_[slot].retention.use_count() > 1); }
 private:
-    struct Slot { int64_t id = -1; uint32_t leases = 0; bool pinned = false; bool draining = false; uint64_t stamp = 0;
+    struct Slot { int64_t id = -1; uint32_t leases = 0; bool pinned = false; bool draining = false, lent = false; uint64_t stamp = 0;
         std::shared_ptr<const void> retention;
     };
     std::vector<Slot> slots_;

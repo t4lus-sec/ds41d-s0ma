@@ -253,6 +253,11 @@ class Native final : public Forward, public hotpath::GateEvidence {
   bool mtp_exl3 = false;
   int mtp_bits = 0;
   double mtp_extra_gib = 0;                           // VRAM they gave back, for target expert slots
+  // s0ma change 51 (V6): DS41_PREFILL_LEND_GIB=N adds N GiB of expert slots in chunks that each prompt borrows back for
+  // its scratch (begin_prompt) and decode takes again (the first verify after the prompt)
+  size_t lend_chunks_total = 0, lend_chunk_bytes = 0, lent_chunks = 0, lend_margin = size_t(256) << 20;
+  bool lend_prompt = false;
+  uint64_t lend_prompts = 0, lend_retry = 0;
   std::set<std::string> dense_woa;                    // "layers.L.attn" whose wo_a runs as Sero's eight slices
   // s0ma change 47 (H1): the step's tier snapshot, each row's private cost so far, the cut counters
   std::vector<uint8_t> h1_snap;
@@ -1118,6 +1123,7 @@ public:
   verify(const std::vector<int> &input) override {
     if (poisoned)
       throw std::runtime_error("native forward/store poisoned; restart ds41d");
+    if (lent_chunks && !lend_prompt && (lend_retry++ % 64) == 0) lend_reclaim();   // s0ma change 51
     {   // s0ma change 48: what the first decode step starts from (the first prompt's scratch freed, its buffers kept)
       static bool ledger_first = true;
       if (ledger_first) { ledger_first = false; vram_checkpoint("first_decode_step"); }
@@ -2523,6 +2529,40 @@ private:
       vram[k] += add; vram[donor] -= take;
       floor_note += " K" + std::to_string(widths[k]) + " +" + std::to_string(add) + " (from K" + std::to_string(widths[donor]) +
                     " -" + std::to_string(take) + ")";
+    }
+    // s0ma change 51 (V6): the prefill reserve lent to experts during decode. DS41_PREFILL_LEND_GIB=N adds N GiB of
+    // slots to the K3 class (else the class with the most dynamic bytes), in chunks of DS41_PREFILL_LEND_CHUNK_MIB
+    // (512). Each prompt frees as many chunks as its first segment's scratch needs; their valuable experts move into
+    // the class's least valued slots first. Decode is exact (placement only); the segments are the ones today's
+    // free VRAM gives, as the reserve is free again whenever a prompt runs.
+    if (const char *x = std::getenv("DS41_PREFILL_LEND_GIB"); x && *x && std::string(x) != "0") {
+      char *end = nullptr;
+      const double g = std::strtod(x, &end);
+      if (*end || !(g > 0) || g > 32) throw std::invalid_argument("DS41_PREFILL_LEND_GIB: 0..32 GiB");
+      double mib = 512;
+      if (const char *m = std::getenv("DS41_PREFILL_LEND_CHUNK_MIB"); m && *m) {
+        mib = std::strtod(m, &end);
+        if (*end || !(mib >= 64) || mib > 4096) throw std::invalid_argument("DS41_PREFILL_LEND_CHUNK_MIB: 64..4096");
+      }
+      if (const char *m = std::getenv("DS41_PREFILL_LEND_MARGIN_MIB"); m && *m) {
+        const double v = std::strtod(m, &end);
+        if (*end || !(v >= 64) || v > 8192) throw std::invalid_argument("DS41_PREFILL_LEND_MARGIN_MIB: 64..8192");
+        lend_margin = size_t(v * double(1 << 20));
+      }
+      size_t kl = cls[3] >= 0 ? size_t(cls[3]) : 0;
+      if (cls[3] < 0)
+        for (size_t k = 1; k < n; ++k)
+          if ((vram[k] - pins[k]) * bytes[k] > (vram[kl] - pins[kl]) * bytes[kl]) kl = k;
+      const size_t per = std::max<size_t>(1, size_t(mib * double(1 << 20)) / bytes[kl]);
+      lend_chunk_bytes = per * bytes[kl];
+      lend_chunks_total = std::max<size_t>(1, size_t(g * double(1ull << 30) / double(lend_chunk_bytes)));   // whole chunks, rounded down
+      ec.lend_class = int(kl);
+      ec.lend_chunk_slots = per;
+      ec.lend_slots = lend_chunks_total * per;
+      vram[kl] += ec.lend_slots;
+      std::cerr << "prefill lend: " << ec.lend_slots << " K" << widths[kl] << " slots in " << lend_chunks_total << " chunks of "
+                << lend_chunk_bytes / double(1 << 20) << " MiB, lent to each prompt's scratch, decode keeps "
+                << lend_margin / double(1 << 20) << " MiB free\n";
     }
     ec.slots = 0;
     for (auto v : vram) ec.slots += v;

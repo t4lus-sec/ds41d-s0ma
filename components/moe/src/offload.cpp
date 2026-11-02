@@ -74,6 +74,16 @@ struct OffloadStore::Impl {
     std::vector<size_t> vram_offsets, host_offsets;
     size_t vram_total=0, host_total=0, host_slot_count=0;
     size_t voff(size_t slot)const{return vram_offsets.empty()?slot*slot_bytes:vram_offsets[slot];}
+    // s0ma change 51 (V6): lendable slots [lend_first, lend_first+lend_n) live in lend_base chunks of lend_per slots
+    // (lend_cbytes each); a null chunk is lent to prompt processing.
+    size_t lend_first=0,lend_n=0,lend_per=0,lend_cbytes=0,lend_chunk_bytes=0;
+    std::vector<uint8_t*> lend_base;
+    LendInfo lend_counters;
+    bool lendable(size_t slot)const{return lend_n && slot>=lend_first && slot<lend_first+lend_n;}
+    uint8_t* sptr(size_t slot)const{
+        if(lendable(slot)){const size_t i=slot-lend_first;return lend_base[i/lend_per]+(i%lend_per)*lend_cbytes;}
+        return vram+voff(slot);
+    }
     size_t hoff(size_t slot)const{return host_offsets.empty()?slot*slot_bytes:host_offsets[slot];}
     uint8_t* vram=nullptr;
     DeviceExpert* table=nullptr;
@@ -200,8 +210,22 @@ struct OffloadStore::Impl {
                 if(c>=n || r.bytes>cfg.class_bytes[c])throw std::invalid_argument("record larger than its slot class");
             }
             std::vector<uint8_t> vc,hc;vram_total=0;host_total=0;
+            if(cfg.lend_slots){
+                if(cfg.lend_class<0 || size_t(cfg.lend_class)>=n || cfg.lend_slots>cfg.class_slots[size_t(cfg.lend_class)] ||
+                   !cfg.lend_chunk_slots || cfg.lend_slots%cfg.lend_chunk_slots)
+                    throw std::invalid_argument("lendable slots: a class, at most its slots, whole chunks");
+                lend_n=cfg.lend_slots;lend_per=cfg.lend_chunk_slots;lend_cbytes=cfg.class_bytes[size_t(cfg.lend_class)];
+                lend_chunk_bytes=lend_per*lend_cbytes;
+            }
             for(size_t c=0;c<n;++c){
-                for(size_t j=0;j<cfg.class_slots[c];++j){vram_offsets.push_back(vram_total);vram_total+=cfg.class_bytes[c];vc.push_back(uint8_t(c));}
+                for(size_t j=0;j<cfg.class_slots[c];++j){
+                    vc.push_back(uint8_t(c));
+                    if(lend_n && int(c)==cfg.lend_class && j>=cfg.class_slots[c]-lend_n){   // its own chunk allocation
+                        if(j==cfg.class_slots[c]-lend_n)lend_first=vram_offsets.size();
+                        vram_offsets.push_back(0);continue;
+                    }
+                    vram_offsets.push_back(vram_total);vram_total+=cfg.class_bytes[c];
+                }
                 for(size_t j=0;j<cfg.class_host_slots[c];++j){host_offsets.push_back(host_total);host_total+=cfg.class_bytes[c];hc.push_back(uint8_t(c));}
             }
             host_slot_count=hc.size();
@@ -209,6 +233,7 @@ struct OffloadStore::Impl {
             if(host_slot_count){host_pool=std::make_unique<SlotPool>(host_slot_count,cfg.host_recent_window,cfg.host_decay_interval,cfg.distinct_lfu);host_pool->classes(hc,ec);}
         }
         else if(host_slot_count)host_pool=std::make_unique<SlotPool>(host_slot_count,cfg.host_recent_window,cfg.host_decay_interval,cfg.distinct_lfu);
+        if(cfg.lend_slots && cfg.class_bytes.empty())throw std::invalid_argument("lendable slots need slot classes");
         policy_options={flag("DS41_MOE_DECAY256"),flag("DS41_MOE_DRIFT_0_50"),flag("DS41_MOE_FAST_MINIMA")};
         // Opt-in chunk-level NVMe->H2D pipelining: upload each O_DIRECT chunk as it lands; publish the slot
         // (readiness/events/notify) only after the record's last chunk. Same bytes, earlier copies.
@@ -243,6 +268,11 @@ struct OffloadStore::Impl {
         ck(cudaEventCreateWithFlags(&speculative_done,cudaEventDisableTiming));
         ck(cudaEventCreateWithFlags(&copy_idle,cudaEventDisableTiming));
         ck(cudaMalloc(&vram,vram_total));
+        // s0ma change 51: lendable chunks after the arena; lent until place() has run, so no pin lands in them
+        lend_base.assign(lend_n?lend_n/lend_per:0,nullptr);
+        for(auto& b:lend_base)ck(cudaMalloc(&b,lend_chunk_bytes));
+        for(size_t j=0;j<lend_n;++j)pool.set_lent(lend_first+j,true);
+        lend_counters.chunks=lend_base.size();lend_counters.chunk_bytes=lend_chunk_bytes;
         if(flag("DS41_MOE_GDS")) {
             unsigned threads=8;if(const char* t=std::getenv("DS41_MOE_GDS_THREADS"))threads=unsigned(std::stoul(t));
             gds=std::make_unique<GdsReader>(vram,vram_total,cfg.io_chunk_bytes?cfg.io_chunk_bytes:size_t(2)<<20,threads);
@@ -323,6 +353,7 @@ struct OffloadStore::Impl {
         for(auto e:slot_mapping)if(e)cudaEventDestroy(e);
         slot_copy.clear();slot_mapping.clear();
         if(vram)cudaFree(vram);
+        for(auto& b:lend_base){if(b)cudaFree(b);b=nullptr;}
         if(table)cudaFree(table);
         if(ready)cudaFree(ready);
         if(copy)cudaStreamDestroy(copy);
@@ -406,7 +437,7 @@ struct OffloadStore::Impl {
                 auto& r=records.at(a.id);
                 known_ready[a.slot]=false;
                 uint32_t generation=++gens[a.slot];if(!generation)generation=++gens[a.slot];
-                auto* base=vram+voff(a.slot);
+                auto* base=sptr(a.slot);
                 auto& v=views[a.id];
                 v={base+r.gate.offset,base+r.gate_scale.offset,base+r.up.offset,base+r.up_scale.offset,base+r.down.offset,base+r.down_scale.offset,
                    cfg.ready_flags?ready+a.slot:nullptr,generation,int32_t(a.slot)};
@@ -455,6 +486,10 @@ struct OffloadStore::Impl {
                 disk.swap(rest);
             }
             if(gds && batch_callback && !is_prefetch && !disk.empty()) {
+                // s0ma change 51: a lendable slot is outside the registered arena; it takes the reader below
+                std::vector<SlotPool::Allocation> rest,via;
+                for(auto a:disk)(lendable(a.slot)?rest:via).push_back(a);
+                disk.swap(via);
                 std::vector<const Record*> direct;std::vector<size_t> offsets;
                 for(auto a:disk) {
                     auto& r=records.at(a.id);direct.push_back(&r);offsets.push_back(voff(a.slot));
@@ -470,7 +505,7 @@ struct OffloadStore::Impl {
                     if(streaming)notify(a);
                 });
                 counters.io_ns+=ns(Clock::now()-io_start);
-                disk.clear();
+                disk.swap(rest);
             }
             std::vector<const Record*> refs;std::vector<void*> ring,fixed;
             for(auto a:disk) {
@@ -499,7 +534,7 @@ struct OffloadStore::Impl {
                     if(dst>=record_bytes)return;
                     const size_t n=std::min<size_t>(bytes,record_bytes-dst);
                     char* src=static_cast<char*>(fixed[j]?fixed[j]:ring[b]);
-                    ck(cudaMemcpyAsync(vram+voff(disk[j].slot)+dst,src+dst,n,cudaMemcpyHostToDevice,cs));
+                    ck(cudaMemcpyAsync(sptr(disk[j].slot)+dst,src+dst,n,cudaMemcpyHostToDevice,cs));
                 },ring_recycle,cfg.io_chunk_bytes);
             } else reader.stream_mixed(refs,ring,fixed,record_ready,ring_recycle,cfg.io_chunk_bytes);
             counters.io_ns+=ns(Clock::now()-io_start);
@@ -585,12 +620,68 @@ struct OffloadStore::Impl {
             auto rc=cudaEventQuery(slot_copy[v.slot]);
             if(rc==cudaErrorNotReady)ck(cudaStreamWaitEvent(demote_stream,slot_copy[v.slot],0));else ck(rc);
             if(!waited){ck(cudaStreamWaitEvent(demote_stream,copy_idle,0));if(pcopy_idle)ck(cudaStreamWaitEvent(demote_stream,pcopy_idle,0));waited=true;}
-            ck(cudaMemcpyAsync(static_cast<char*>(host_arena->data())+hoff(size_t(hs)),vram+voff(v.slot),
+            ck(cudaMemcpyAsync(static_cast<char*>(host_arena->data())+hoff(size_t(hs)),sptr(v.slot),
                 records.at(x).bytes,cudaMemcpyDeviceToHost,demote_stream));
             cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,demote_stream));
             demoting[x]=done;draining.push_back({v.slot,x,done,std::move(held)});
             ++counters.demotions;
         }
+    }
+    // s0ma change 51 (V6). Worker only. Chunks are lent from the last one down and reclaimed from the first up.
+    size_t lend(size_t want){
+        size_t done=0;
+        for(size_t k=lend_base.size();k-- >0 && done<want;){
+            if(!lend_base[k])continue;
+            std::vector<size_t> slots;
+            for(size_t i=0;i<lend_per;++i)slots.push_back(lend_first+k*lend_per+i);
+            auto settled=[&]{for(auto j:slots)if(pool.busy(j))return false;return true;};
+            collect(false);
+            while(!settled() && (!retired.empty() || !draining.empty())){
+                if(!retired.empty())collect(true);
+                else{ck(cudaEventSynchronize(draining.front().event));collect(false);}
+            }
+            if(!settled()){++lend_counters.busy;continue;}   // a live lease holds one of its experts
+            // Uploads into these slots (prefetches, demotion copies) must land before their bytes move or are freed.
+            ck(cudaStreamSynchronize(copy));if(pcopy)ck(cudaStreamSynchronize(pcopy));
+            ck(cudaStreamSynchronize(mapping));if(demote_stream)ck(cudaStreamSynchronize(demote_stream));
+            std::vector<ExpertId> dropped;
+            const auto moves=pool.lend(slots,dropped);
+            auto* views=static_cast<DeviceExpert*>(entries->data());
+            auto* gens=static_cast<uint32_t*>(generations->data());
+            for(const auto& m:moves){
+                const auto& r=records.at(m.id);
+                ck(cudaMemcpyAsync(sptr(m.to),sptr(m.from),r.bytes,cudaMemcpyDeviceToDevice,copy));
+                uint32_t generation=++gens[m.to];if(!generation)generation=++gens[m.to];
+                auto* base=sptr(m.to);
+                views[m.id]={base+r.gate.offset,base+r.gate_scale.offset,base+r.up.offset,base+r.up_scale.offset,base+r.down.offset,base+r.down_scale.offset,
+                             cfg.ready_flags?ready+m.to:nullptr,generation,int32_t(m.to)};
+                ck(cudaMemcpyAsync(table+m.id,views+m.id,sizeof(DeviceExpert),cudaMemcpyHostToDevice,mapping));
+                if(cfg.ready_flags)ck(cudaMemcpyAsync(ready+m.to,gens+m.to,sizeof(uint32_t),cudaMemcpyHostToDevice,copy));
+                ++counters.evictions;++counters.vram.evictions;
+                if(prefetched.erase(ExpertId(m.evicted))){++counters.prefetch_wasted;counters.vram.wasted_bytes+=records.at(ExpertId(m.evicted)).bytes;}
+            }
+            for(auto id:dropped){++counters.evictions;++counters.vram.evictions;prefetched.erase(id);}
+            ck(cudaStreamSynchronize(copy));ck(cudaStreamSynchronize(mapping));
+            for(const auto& m:moves){ck(cudaEventRecord(slot_copy[m.to],copy));ck(cudaEventRecord(slot_mapping[m.to],mapping));known_ready[m.to]=true;}
+            for(auto j:slots)known_ready[j]=false;
+            ck(cudaFree(lend_base[k]));lend_base[k]=nullptr;
+            ++done;++lend_counters.lends;lend_counters.moved+=moves.size();lend_counters.dropped+=dropped.size();
+        }
+        return done;
+    }
+    size_t reclaim(size_t margin){
+        size_t done=0;
+        for(size_t k=0;k<lend_base.size();++k){
+            if(lend_base[k])continue;
+            size_t free=0,total=0;ck(cudaMemGetInfo(&free,&total));
+            if(free<lend_chunk_bytes+margin)break;
+            void* p=nullptr;
+            if(cudaMalloc(&p,lend_chunk_bytes)!=cudaSuccess){cudaGetLastError();++lend_counters.failed;break;}
+            lend_base[k]=static_cast<uint8_t*>(p);
+            for(size_t i=0;i<lend_per;++i){const size_t j=lend_first+k*lend_per+i;known_ready[j]=false;pool.set_lent(j,false);}
+            ++done;++lend_counters.reclaims;
+        }
+        return done;
     }
     int admit_host(ExpertId id,bool speculative,std::vector<SlotPool::Allocation>* hold=nullptr){
         if(!host_pool)return -1;
@@ -616,7 +707,7 @@ struct OffloadStore::Impl {
     void upload(const SlotPool::Allocation& a,void* src,size_t bytes,bool is_prefetch,bool copy_bytes,cudaStream_t cs) {
         if(!cs)cs=copy;
         size_t chunk=cfg.h2d_chunk_bytes?cfg.h2d_chunk_bytes:bytes;
-        if(copy_bytes)for(size_t off=0;off<bytes;off+=chunk)ck(cudaMemcpyAsync(vram+voff(a.slot)+off,static_cast<char*>(src)+off,std::min(chunk,bytes-off),cudaMemcpyHostToDevice,cs));
+        if(copy_bytes)for(size_t off=0;off<bytes;off+=chunk)ck(cudaMemcpyAsync(sptr(a.slot)+off,static_cast<char*>(src)+off,std::min(chunk,bytes-off),cudaMemcpyHostToDevice,cs));
         counters.h2d_bytes+=bytes;counters.layers[expert_layer(a.id)].h2d_bytes+=bytes;
         if(is_prefetch)counters.prefetch_h2d_bytes+=bytes;
         if(cfg.ready_flags)ck(cudaMemcpyAsync(ready+a.slot,static_cast<uint32_t*>(generations->data())+a.slot,sizeof(uint32_t),cudaMemcpyHostToDevice,cs));
@@ -824,7 +915,13 @@ void OffloadStore::place(const Placement& input) {
     pin_host(p.host_residents);
     if(impl_->cfg.dynamic_host)impl_->submit([this,p]{for(auto id:p.host_residents)impl_->host_pool->unpin(id);}).get();
     pin_vram(p.vram_pins);
+    // s0ma change 51: the lendable slots join the pool once the pins are placed
+    impl_->submit([this]{for(size_t j=0;j<impl_->lend_n;++j)impl_->pool.set_lent(impl_->lend_first+j,false);}).get();
 }
+size_t OffloadStore::lend(size_t chunks){check_error();return impl_->submit([this,chunks]{return impl_->lend(chunks);}).get();}
+size_t OffloadStore::reclaim(size_t margin){check_error();return impl_->submit([this,margin]{return impl_->reclaim(margin);}).get();}
+OffloadStore::LendInfo OffloadStore::lend_info(){return impl_->submit([this]{auto x=impl_->lend_counters;x.lent=0;
+    for(auto b:impl_->lend_base)if(!b)++x.lent;return x;}).get();}
 OffloadStore::Lease OffloadStore::borrow_vram(std::vector<ExpertId> ids,cudaStream_t consumer){
     return impl_->submit([this,ids=std::move(ids),consumer]{
         std::vector<ExpertId> hits;for(auto id:ids){impl_->records.at(id);if(impl_->pool.residency(id)>=0)hits.push_back(id);}

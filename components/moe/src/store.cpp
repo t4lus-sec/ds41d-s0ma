@@ -115,20 +115,20 @@ std::vector<SlotPool::Allocation> SlotPool::acquire(const std::vector<ExpertId>&
     // Transactional capacity check: reject before changing state.
     size_t available = 0;
     for (const auto& s : slots_) {
-        if (s.draining) continue;
+        if (s.draining || s.lent) continue;
         if (s.id < 0 || wanted.count(s.id) || (!s.pinned && !s.leases && s.retention.use_count()<=1)) ++available;
     }
     if(hard_){
         std::array<size_t,43> need{},avail{};
         for(auto e:ids)++need[expert_layer(e)];
-        for(size_t j=0;j<slots_.size();++j){const auto& s=slots_[j];if(s.draining)continue;if(s.id<0 || wanted.count(s.id) || (!s.pinned && !s.leases && s.retention.use_count()<=1))++avail[slot_layers_[j]];}
+        for(size_t j=0;j<slots_.size();++j){const auto& s=slots_[j];if(s.draining || s.lent)continue;if(s.id<0 || wanted.count(s.id) || (!s.pinned && !s.leases && s.retention.use_count()<=1))++avail[slot_layers_[j]];}
         for(unsigned l=0;l<43;++l)if(need[l]>avail[l])throw std::runtime_error("need set exceeds hard layer capacity");
     }
     if (ids.size() > available) throw std::runtime_error("need set exceeds unleased slot capacity; split the batch");
     if(classed_){
         std::array<size_t,256> need{},avail{};
         for(auto e:ids)++need[expert_class_[e]];
-        for(size_t j=0;j<slots_.size();++j){const auto& s=slots_[j];if(s.draining)continue;if(s.id<0 || wanted.count(s.id) || (!s.pinned && !s.leases && s.retention.use_count()<=1))++avail[slot_class_[j]];}
+        for(size_t j=0;j<slots_.size();++j){const auto& s=slots_[j];if(s.draining || s.lent)continue;if(s.id<0 || wanted.count(s.id) || (!s.pinned && !s.leases && s.retention.use_count()<=1))++avail[slot_class_[j]];}
         for(size_t c=0;c<need.size();++c)if(need[c]>avail[c])throw std::runtime_error("need set exceeds unleased slot capacity of its size class; split the batch");
     }
     for(auto e:ids)dirty_[layer_of(e)]=true;
@@ -141,7 +141,7 @@ std::vector<SlotPool::Allocation> SlotPool::acquire(const std::vector<ExpertId>&
         bool hit = slot >= 0;
         int64_t evicted=-1;
         if (!hit) {
-            for (size_t s = 0; s < slots_.size(); ++s) if (slots_[s].id < 0 && !slots_[s].draining && (!hard_ || slot_layers_[s]==layer_of(e)) && fits(s,e)) { slot = s; break; }
+            for (size_t s = 0; s < slots_.size(); ++s) if (slots_[s].id < 0 && !slots_[s].draining && !slots_[s].lent && (!hard_ || slot_layers_[s]==layer_of(e)) && fits(s,e)) { slot = s; break; }
             if (slot < 0) {
                 if(fast_ && distinct_ && !hard_ && uniform_)slot=fast_victim(wanted,layer_counts,class_of(e));
                 else slot=scan_victim(wanted,layer_counts,hard_?int(layer_of(e)):-1,class_of(e));
@@ -162,7 +162,7 @@ int SlotPool::scan_victim(const std::unordered_set<ExpertId>& wanted,const std::
     for (unsigned pass = 0; pass != 2 && slot < 0; ++pass) {
         for (size_t s = 0; s < slots_.size(); ++s) {
             const auto& c = slots_[s];
-            if (c.id < 0) continue;
+            if (c.id < 0 || c.lent) continue;
             if (cls >= 0 && classed_ && slot_class_[s] != unsigned(cls)) continue;
             if (c.pinned || c.leases || c.retention.use_count()>1 || wanted.count(c.id) || (layer>=0 && slot_layers_[s]!=unsigned(layer))) continue;
             if (!pass && recent_ && last_use_[c.id] && last_use_[c.id] + recent_ >= layer_clocks_[layer_of(c.id)] &&
@@ -180,7 +180,7 @@ std::vector<SlotPool::Allocation> SlotPool::reserve(size_t target,const std::uno
     if(hard_)throw std::logic_error("reserve requires soft layer budgets");
     if(!classed_)cls=-1;
     size_t idle=0;
-    for(size_t j=0;j<slots_.size();++j)if(slots_[j].id<0 && (cls<0 || slot_class_[j]==unsigned(cls)))++idle; // empty or draining
+    for(size_t j=0;j<slots_.size();++j)if(slots_[j].id<0 && !slots_[j].lent && (cls<0 || slot_class_[j]==unsigned(cls)))++idle; // empty or draining
     if(idle>=target)return out;
     std::array<size_t,43> layer_counts{};
     for(const auto& s:slots_)if(s.id>=0 && !s.pinned)++layer_counts[layer_of(s.id)];
@@ -200,6 +200,42 @@ void SlotPool::drained(size_t slot) {
     slots_[slot].draining=false;
 }
 void SlotPool::exclusive(bool enabled) { exclusive_=enabled;dirty_.fill(true); }
+void SlotPool::set_lent(size_t slot,bool lent) {
+    if(slot>=slots_.size())throw std::out_of_range("slot");
+    auto& s=slots_[slot];
+    if(lent && (s.id>=0 || s.leases || s.draining))throw std::logic_error("set_lent requires an empty, unleased slot (lend() moves experts)");
+    s.lent=lent;dirty_.fill(true);
+}
+std::vector<SlotPool::Move> SlotPool::lend(const std::vector<size_t>& targets,std::vector<ExpertId>& dropped) {
+    if(hard_)throw std::logic_error("lending slots requires soft layer budgets");
+    for(auto j:targets){
+        if(j>=slots_.size())throw std::out_of_range("slot");
+        if(busy(j))throw std::logic_error("lend requires unleased, unpinned, settled slots");
+    }
+    // All targets leave the victim search first, so an expert never moves into a slot that is also being lent.
+    for(auto j:targets)slots_[j].lent=true;
+    std::array<size_t,43> layer_counts{};
+    for(const auto& s:slots_)if(s.id>=0 && !s.pinned && !s.lent)++layer_counts[layer_of(s.id)];
+    std::vector<Move> moves;
+    const std::unordered_set<ExpertId> none;
+    for(auto j:targets){
+        auto& from=slots_[j];
+        if(from.id<0)continue;
+        const auto e=ExpertId(from.id);
+        int v=scan_victim(none,layer_counts,-1,class_of(e));
+        dirty_[layer_of(e)]=true;++epochs_[layer_of(e)];
+        if(v>=0 && std::make_tuple(score(ExpertId(slots_[v].id)),slots_[v].stamp)<std::make_tuple(score(e),from.stamp)){
+            auto& to=slots_[v];
+            const auto x=ExpertId(to.id);
+            dirty_[layer_of(x)]=true;++epochs_[layer_of(x)];--layer_counts[layer_of(x)];residency_[x]=-1;
+            to.id=e;to.stamp=from.stamp;to.retention=std::make_shared<const ExpertId>(e);
+            residency_[e]=v;++layer_counts[layer_of(e)];
+            moves.push_back({e,j,size_t(v),int64_t(x)});
+        } else { residency_[e]=-1;dropped.push_back(e); }
+        from.id=-1;from.retention.reset();
+    }
+    return moves;
+}
 std::vector<SlotPool::Allocation> SlotPool::borrow(const std::vector<ExpertId>& ids){
     for(auto id:ids)if(id>=expert_count)throw std::out_of_range("expert id");
     std::unordered_set<ExpertId> seen;std::vector<Allocation> result;
@@ -248,6 +284,7 @@ int SlotPool::fast_victim(const std::unordered_set<ExpertId>& wanted,const std::
         unsigned first=expert_id(l,0),end=first+(l<40?384:128);
         for(unsigned e=first;e<end;++e) {
             int j=residency_[e];if(j<0)continue;const auto& c=slots_[j];
+            if(c.lent)continue;
             if(c.pinned || c.leases || c.retention.use_count()>1 || wanted.count(e))continue;
             if(best_any_[l]<0 || less_slot(j,best_any_[l]))best_any_[l]=j;
             if(recent_ && last_use_[e] && last_use_[e]+recent_>=layer_clocks_[l] && !dup_first(e))continue;

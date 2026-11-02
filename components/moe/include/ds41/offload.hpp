@@ -29,6 +29,15 @@ public:
         std::vector<size_t> class_bytes, class_slots, class_host_slots;
         std::array<uint8_t,43> layer_class{};
         std::vector<uint8_t> expert_class;
+        // s0ma change 51 (V6): the last lend_slots VRAM slots of class lend_class live in their own allocations,
+        // lend_chunk_slots slots each, which lend() frees for prompt processing and reclaim() allocates again (empty).
+        // They are lent while place() runs, so no pin lands in them. GDS reads skip them (they are not registered).
+        int lend_class = -1;
+        size_t lend_slots = 0, lend_chunk_slots = 0;
+    };
+    struct LendInfo {
+        size_t chunks = 0, lent = 0, chunk_bytes = 0;
+        uint64_t lends = 0, reclaims = 0, moved = 0, dropped = 0, busy = 0, failed = 0;
     };
     struct CachePolicy {
         bool decay256=false, drift_0_50=false, fast_minima=false;
@@ -102,6 +111,12 @@ public:
     HostLease borrow_host(std::vector<ExpertId> ids);
     Lease borrow_vram(std::vector<ExpertId> ids,cudaStream_t consumer);
     void reset_history(); // preserve cache contents, clear conversation LFU history
+    // s0ma change 51: free up to `chunks` lendable chunks (their valuable experts move into the class's lowest-ranked
+    // slots first); returns how many were freed. A chunk with a live lease is left (counted as busy).
+    size_t lend(size_t chunks);
+    // Allocate lent chunks again, empty, while cudaMemGetInfo leaves at least margin_bytes free; returns how many.
+    size_t reclaim(size_t margin_bytes);
+    LendInfo lend_info();
     void report_error(std::exception_ptr error) noexcept;
     void check_error();
     // bit 0: VRAM, bit 1: RAM. Advisory only; admission rechecks on the worker.

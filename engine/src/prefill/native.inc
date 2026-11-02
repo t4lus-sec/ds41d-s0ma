@@ -399,6 +399,43 @@ bool supports_prefill(PrefillMode mode,size_t rows) const override {
   size_t free,total;CK(cudaMemGetInfo(&free,&total));
   return need<=free&&free-need>=(prefill_chunk_fit?(size_t(128)<<20):(size_t(64)<<20));
 }
+// s0ma change 51 (V6): the prompt borrows back the lendable expert chunks its first segment's scratch needs (as
+// supports_prefill counts it, with the chunk scratch and 256 MiB for the buffers a first prompt keeps), or all of
+// them when that cannot fit; the first verify after the prompt takes them back for experts, keeping lend_margin free.
+size_t prefill_lend_need(size_t rows) const {
+  size_t need=PrefillData::required_bytes(rows,committed,1);
+  if(config.prefill_chunk_rows) {
+    const int64_t end=committed+int64_t(rows);
+    const int width=int(std::min<int64_t>(2048,(end+7)/8)*8);
+    for(auto b:PrefillChunk::sizes(int(config.prefill_chunk_rows),end,width,prefill_fp8_elements()))need+=b;
+  }
+  return need+(size_t(256)<<20)+(size_t(256)<<20)+(size_t(128)<<20);
+}
+void prefill_lend(size_t need) {
+  if(!lend_chunks_total||lent_chunks>=lend_chunks_total)return;
+  size_t free,total;CK(cudaMemGetInfo(&free,&total));
+  if(free>=need)return;
+  const size_t want=(need-free+lend_chunk_bytes-1)/lend_chunk_bytes;
+  lent_chunks+=experts->lend(std::min(want,lend_chunks_total-lent_chunks));
+}
+void begin_prompt(int64_t rows,bool append) override {
+  (void)append;
+  if(!lend_chunks_total||poisoned)return;
+  lend_prompt=true;++lend_prompts;lend_retry=0;
+  const int64_t fresh=std::max<int64_t>(1,std::min<int64_t>(rows-committed,config.max_context-committed));
+  prefill_lend(prefill_lend_need(size_t(fresh)));
+}
+void end_prompt(bool) override { lend_prompt=false;lend_retry=0; }
+void lend_reclaim() {
+  const size_t got=experts->reclaim(lend_margin);
+  lent_chunks-=std::min(got,lent_chunks);
+  if(!lent_chunks) {
+    const auto x=experts->lend_info();
+    std::cerr<<"prefill lend: "<<lend_prompts<<" prompts, chunks lent "<<x.lends<<", reclaimed "<<x.reclaims<<" of "<<x.chunks
+             <<" x "<<x.chunk_bytes/double(1<<20)<<" MiB; experts moved "<<x.moved<<", dropped "<<x.dropped
+             <<"; busy "<<x.busy<<", failed "<<x.failed<<"\n";
+  }
+}
 PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& options) override {
   if(!config.prefill)throw std::logic_error("native prefill requires Config::prefill opt-in");
   if(poisoned)throw std::runtime_error("native forward/store poisoned; restart ds41d");
@@ -414,6 +451,8 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
   std::vector<uint8_t> residency_before;
   try{residency_before=p_residency(*experts);}catch(...){poisoned=true;throw;}
   auto plan=ds41e::prefill::plan(committed,int64_t(input.size()),int64_t(options.logits_tail));
+  // s0ma change 51: an image's encoder and rows need VRAM begin_prompt did not count: every lendable chunk
+  if(options.images&&!options.images->empty())prefill_lend(~size_t(0)>>1);
   // Image rows of this segment. Each image the segment touches is encoded first, before the prefill arena
   // takes free VRAM; only its aligner rows (10 MB at most) stay allocated until the prefill returns.
   struct Rows {void* p=nullptr;~Rows(){if(p)cudaFree(p);}};

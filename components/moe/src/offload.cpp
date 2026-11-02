@@ -80,7 +80,7 @@ struct OffloadStore::Impl {
     std::vector<uint8_t*> lend_base;
     LendInfo lend_counters;
     std::mutex miss_m;                           // s0ma change 56
-    std::vector<ExpertId> miss_log;
+    std::vector<ExpertId> miss_log, ram_log;
     std::atomic<bool> miss_on{false};
     std::map<uint64_t,std::vector<SlotPool::Allocation>> admitting;   // s0ma change 57: held RAM slots
     uint64_t admit_serial=0;
@@ -453,7 +453,8 @@ struct OffloadStore::Impl {
                 auto h=host.find(a.id);
                 if(h==host.end()){disk.push_back(a);if(!is_prefetch){++counters.nvme_misses;++layer.nvme_misses;++counters.ram.misses;++counters.class_nvme_misses[kc];
                     if(miss_on.load(std::memory_order_relaxed)){std::lock_guard<std::mutex> l(miss_m);miss_log.push_back(a.id);}}}
-                else if(!is_prefetch){++counters.host_hits;++layer.host_hits;++counters.ram.hits;host_prefetched.erase(a.id);++counters.class_host_hits[kc];}
+                else if(!is_prefetch){++counters.host_hits;++layer.host_hits;++counters.ram.hits;host_prefetched.erase(a.id);++counters.class_host_hits[kc];
+                    if(miss_on.load(std::memory_order_relaxed)){std::lock_guard<std::mutex> l(miss_m);ram_log.push_back(a.id);}}
                 if(is_prefetch)prefetched.insert(a.id);
             }
             // Submit resident work first so a cold expert cannot head-of-line
@@ -964,6 +965,7 @@ void OffloadStore::admit_end(Admission a){
     }).get();
 }
 void OffloadStore::log_nvme_misses(bool on){impl_->miss_on.store(on);}
+std::vector<ExpertId> OffloadStore::take_ram_hits(){std::vector<ExpertId> out;std::lock_guard<std::mutex> l(impl_->miss_m);out.swap(impl_->ram_log);return out;}
 std::vector<ExpertId> OffloadStore::take_nvme_misses(){std::vector<ExpertId> out;std::lock_guard<std::mutex> l(impl_->miss_m);out.swap(impl_->miss_log);return out;}
 size_t OffloadStore::lend(size_t chunks){check_error();return impl_->submit([this,chunks]{return impl_->lend(chunks);}).get();}
 size_t OffloadStore::reclaim(size_t margin){check_error();return impl_->submit([this,margin]{return impl_->reclaim(margin);}).get();}

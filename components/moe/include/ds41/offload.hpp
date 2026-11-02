@@ -130,6 +130,8 @@ public:
     Admission admit_begin(const std::vector<ExpertId>& ids, const std::vector<uint32_t>& credit, size_t byte_budget);
     void admit_end(Admission admission);
     std::vector<ExpertId> take_nvme_misses();
+    // s0ma change 59: and of decode's VRAM misses served from the RAM tier (same switch)
+    std::vector<ExpertId> take_ram_hits();
     void report_error(std::exception_ptr error) noexcept;
     void check_error();
     // bit 0: VRAM, bit 1: RAM. Advisory only; admission rechecks on the worker.

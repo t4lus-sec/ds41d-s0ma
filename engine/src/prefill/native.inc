@@ -268,6 +268,8 @@ Json pmoe(int l,ds41e::prefill::Span span) {
   CK(cudaMemcpyAsync(ids,pf.ids.as<char>(base*6*4),count*6*4,cudaMemcpyDeviceToHost,stream));
   CK(cudaStreamSynchronize(stream));
   double boundary=clock_ms()-host_start;
+  if(!prompt_bits.empty())   // s0ma change 59: every expert the prompt routed
+    for(size_t r=0;r<count;++r)for(int j=0;j<6;++j)prompt_bits[ds41::expert_id(l,ids[r*6+j])]|=4;
   if(!prompt_bits.empty()&&pf.warm)   // s0ma change 56: the prompt's last 256 rows (change 57: and how often)
     for(size_t r=0;r<count;++r)if(base+r+256>=pf.rows)for(int j=0;j<6;++j){
       const auto e=ds41::expert_id(l,ids[r*6+j]);prompt_bits[e]|=2;
@@ -485,6 +487,12 @@ void overlap_drain(bool step) {
     for(auto *o:{&req_all,&after_all}){++o->n;o->disk+=b&1;o->tail+=(b>>1)&1;o->both+=(b&3)==3;}
     if(first)for(auto *o:{&req_first,&after_first}){++o->n;o->disk+=b&1;o->tail+=(b>>1)&1;o->both+=(b&3)==3;}
   }
+  for(auto id:experts->take_ram_hits()) {   // s0ma change 59
+    if(id>=15360)continue;
+    const uint8_t b=prompt_bits[id];
+    for(auto *o:{&ram_req_all,&ram_all}){++o->n;o->disk+=(b>>2)&1;o->tail+=(b>>1)&1;}
+    if(first)for(auto *o:{&ram_req_first,&ram_first}){++o->n;o->disk+=(b>>2)&1;o->tail+=(b>>1)&1;}
+  }
   if(step)++steps_after_prompt;
 }
 void overlap_report() {
@@ -507,6 +515,16 @@ void overlap_report() {
            <<tail<<" routed, "<<both<<" of them from the SSD ("<<both_b/double(1ull<<30)<<" GiB)\n"<<std::defaultfloat<<std::setprecision(6);
   line("after prompts, all",after_all,after_first);
   std::cerr<<" ("<<overlap_requests<<" requests)\n";
+  auto ram_line=[](const char* name,const Overlap& a,const Overlap& f){
+    std::cerr<<name<<": decode VRAM misses served from RAM "<<a.n<<" (first 32 steps "<<f.n<<"); the prompt routed "<<a.disk
+             <<" ("<<f.disk<<"); its last 256 rows routed "<<a.tail<<" ("<<f.tail<<")";
+  };
+  ram_line("after prompt, RAM",ram_req_all,ram_req_first);
+  std::cerr<<std::fixed<<std::setprecision(1)<<". When the prompt ended, "<<tail_not_vram<<" experts its last 256 rows routed were not in VRAM ("
+           <<tail_not_vram_b/double(1ull<<30)<<" GiB)\n"<<std::defaultfloat<<std::setprecision(6);
+  ram_line("after prompts, all, RAM",ram_all,ram_first);
+  std::cerr<<"\n";
+  ram_req_all=ram_req_first=Overlap{};
   if(admit_budget)std::cerr<<std::fixed<<std::setprecision(1)<<"prompt admission: "<<admit_experts<<" experts ("
                            <<admit_bytes/double(1ull<<30)<<" GiB) copied into RAM from the prompts' drive reads, "
                            <<admit_copy_ms<<" ms on the reader thread to queue their copies ("<<admit_budget/double(1ull<<30)
@@ -532,7 +550,15 @@ void begin_prompt(int64_t rows,bool append) override {
   prefill_lend(lend_all?~size_t(0)>>1:prefill_lend_need(size_t(fresh)));
   const double t=clock_ms()-t0;lend_begin_ms+=t;lend_begin_max_ms=std::max(lend_begin_max_ms,t);
 }
-void end_prompt(bool) override { lend_prompt=false;lend_retry=0; }
+void end_prompt(bool) override {
+  lend_prompt=false;lend_retry=0;
+  if(overlap_on&&experts&&!prompt_bits.empty()) {   // s0ma change 59: what a VRAM admission of the tail would bring in
+    const auto bits=experts->residency_snapshot();
+    tail_not_vram=0;tail_not_vram_b=0;
+    for(size_t id=0;id<15360&&id<bits.size();++id)if((prompt_bits[id]&2)&&!(bits[id]&1)){
+      ++tail_not_vram;tail_not_vram_b+=width_of.empty()?double(expert_slot_bytes):double(exl3_rec_of(width_of[id]));}
+  }
+}
 void lend_reclaim() {
   const double t0=clock_ms();
   const size_t got=experts->reclaim(lend_margin);

@@ -267,6 +267,10 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::vector<uint8_t> prompt_bits;
   struct Overlap { uint64_t n = 0, disk = 0, tail = 0, both = 0; } after_all, after_first, req_all, req_first;
   uint64_t steps_after_prompt = 0, overlap_requests = 0;
+  // s0ma change 59: the same for decode's VRAM misses served from RAM (disk = routed anywhere in the prompt), and the
+  // experts the prompt's last 256 rows routed that were not in VRAM when it ended
+  Overlap ram_req_all, ram_req_first, ram_all, ram_first;
+  size_t tail_not_vram = 0; double tail_not_vram_b = 0;
   bool overlap_on = [] { const char *v = std::getenv("DS41_PROMPT_OVERLAP"); return !(v && std::string(v) == "0"); }();
   // s0ma change 57: DS41_PROMPT_ADMIT_GIB=N copies up to N GiB a prompt of the experts its last 256 rows routed and its
   // sweep read from the drive into the RAM tier, as they pass through the stager's pinned ring (no extra reads)

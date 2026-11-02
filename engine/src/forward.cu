@@ -249,6 +249,10 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::vector<Device> dense_records;
   Device dense_table;
   double dense_extra_gib = 0;                         // VRAM the swap gave back, for expert slots
+  // s0ma change 49: the drafter's 384 routed experts as EXL3 records (DS41_MTP_EXL3=DIR), one width for all
+  bool mtp_exl3 = false;
+  int mtp_bits = 0;
+  double mtp_extra_gib = 0;                           // VRAM they gave back, for target expert slots
   std::set<std::string> dense_woa;                    // "layers.L.attn" whose wo_a runs as Sero's eight slices
   // s0ma change 47 (H1): the step's tier snapshot, each row's private cost so far, the cut counters
   std::vector<uint8_t> h1_snap;
@@ -738,6 +742,21 @@ public:
     if (exl3) {
       std::vector<ds41::Record> mtp;
       for (auto &r : records) if (r.id >= 15360) mtp.push_back(r);
+      // s0ma change 49: DS41_MTP_EXL3=DIR (ds41.sh mtp quantize): the drafter's experts from an EXL3 bank in place of
+      // the native MXFP4 ones. Drafts only change acceptance, never the output distribution.
+      if (const char *d = std::getenv("DS41_MTP_EXL3"); d && *d && std::string(d) != "0") {
+        const std::filesystem::path dir(d);
+        auto q = ds41::load_records((dir / "records-mtp.tsv").string());
+        validate_mtp_records(q, (dir / "receipts.json").string());
+        size_t native = 0, packed = 0;
+        for (auto &r : mtp) native += (size_t(r.bytes) + 4095) / 4096 * 4096;
+        for (auto &r : q) packed += r.bytes;
+        mtp_extra_gib = native > packed ? double(native - packed) / double(size_t(1) << 30) : 0;
+        std::cerr << "DSpark experts EXL3 K" << mtp_bits << " (" << dir.string() << "): " << packed / 1e9
+                  << " GB in place of " << native / 1e9 << " GB of MXFP4; " << mtp_extra_gib << " GiB more expert slots\n";
+        mtp = std::move(q);
+        mtp_exl3 = true;
+      }
       records = ds41::load_records(c.exl3_experts);
       validate_k3_records(records, c.exl3_receipts);
       expert_slot_bytes = 0;
@@ -1420,9 +1439,11 @@ private:
       int count = rows * 3;
       std::vector<ds41::GemmJob> job(count);
       for (int j = 0; j < count; ++j)
-        job[j] = {logical[j], 1, spark_aq.as<uint8_t>((j / 3) * H),
-                  spark_as.as<uint8_t>((j / 3) * H / 32),
-                  spark_gate.as<Bf16>(j * I * 2)};
+        job[j] = mtp_exl3   // s0ma change 49: EXL3 reads the BF16 rows themselves (each expert rotates its input)
+            ? ds41::GemmJob{logical[j], 1, static_cast<const uint8_t *>(input) + size_t(j / 3) * H * 2, nullptr,
+                            spark_gate.as<Bf16>(j * I * 2)}
+            : ds41::GemmJob{logical[j], 1, spark_aq.as<uint8_t>((j / 3) * H),
+                            spark_as.as<uint8_t>((j / 3) * H / 32), spark_gate.as<Bf16>(j * I * 2)};
       // Job descriptors go through a pinned mapped buffer and a zero-copy kernel: a pageable H2D would
       // synchronize the stream before each copy. The buffer is rewritten only after the next route
       // readback, i.e. after these descriptors were consumed in stream order.
@@ -1434,13 +1455,26 @@ private:
       for (int j = 0; j < count; ++j) {
         hj[max_jobs + j] = job[j];
         hj[max_jobs + j].output = spark_up.as<Bf16>(j * I * 2);
-        hj[2 * max_jobs + j] = {logical[j], 1, spark_eq.as<uint8_t>(j * I),
-                                spark_es.as<uint8_t>(j * I / 32),
-                                static_cast<Bf16 *>(output) + j * H};
+        hj[2 * max_jobs + j] = mtp_exl3
+            ? ds41::GemmJob{logical[j], 1, spark_act.as<uint8_t>(j * I * 2), nullptr, static_cast<Bf16 *>(output) + j * H}
+            : ds41::GemmJob{logical[j], 1, spark_eq.as<uint8_t>(j * I), spark_es.as<uint8_t>(j * I / 32),
+                            static_cast<Bf16 *>(output) + j * H};
       }
       zc(spark_jobs.p, dj, count * sizeof(ds41::GemmJob));
       zc(spark_up_jobs.p, dj + slab, count * sizeof(ds41::GemmJob));
       zc(spark_down_jobs.p, dj + 2 * slab, count * sizeof(ds41::GemmJob));
+      if (mtp_exl3) {   // s0ma change 49
+        CK(ds41::grouped_exl3_bits(spark_store().table(), spark_jobs.as<ds41::GemmJob>(), count,
+                                   ds41::Projection::Gate, I, H, mtp_bits, stream));
+        CK(ds41::grouped_exl3_bits(spark_store().table(), spark_up_jobs.as<ds41::GemmJob>(), count,
+                                   ds41::Projection::Up, I, H, mtp_bits, stream));
+        CK(ds41::swiglu(spark_gate.as<Bf16>(), spark_up.as<Bf16>(), route_weights,
+                        spark_act.as<Bf16>(), count, I, 10, stream));
+        CK(ds41::grouped_exl3_bits(spark_store().table(), spark_down_jobs.as<ds41::GemmJob>(), count,
+                                   ds41::Projection::Down, H, I, mtp_bits, stream));
+        spark_store().retire(std::move(lease), stream);
+        return;
+      }
       CK(ds41::quantize_mxfp8(static_cast<const Bf16 *>(input),
                               spark_aq.as<uint8_t>(), spark_as.as<uint8_t>(),
                               rows, H, stream));
@@ -2446,6 +2480,7 @@ private:
       if (*end || !(extra_gib >= 0) || extra_gib > 64) throw std::invalid_argument("DS41_EXPERT_EXTRA_GIB: 0..64 GiB");
     }
     extra_gib += dense_extra_gib;   // s0ma change 34: the VRAM Sero's dense tensors gave back
+    extra_gib += mtp_extra_gib;     // s0ma change 49: and the drafter's EXL3 experts
     const char *cw_env = std::getenv("DS41_CLASS_WEIGHTS");
     if ((cw_env && *cw_env) || extra_gib > 0) {
       const char *cw = cw_env && *cw_env ? cw_env : "";
@@ -2609,6 +2644,50 @@ private:
               receipt[key].at("mtime_ns").get<uint64_t>())
         throw std::runtime_error("EXL3 bank changed since its receipt was verified: " + path);
     }
+  }
+  // s0ma change 49: the drafter's EXL3 bank (scripts/mtp_bank.py): 384 records of one width K2..K5 in the target banks'
+  // record layout, MTP layer L (40..42) in bank-L.bin at expert e * REC, each file matching its verified receipt
+  void validate_mtp_records(const std::vector<ds41::Record> &records, const std::string &receipts) {
+    if (records.size() != 384) throw std::runtime_error("DS41_MTP_EXL3: the bank must hold the drafter's 384 experts");
+    constexpr uint64_t SB = 2 * (5120 + 2304);
+    int bits = 0;
+    for (int k = 2; k <= 5; ++k) if (records.front().bytes == exl3_rec_of(k)) bits = k;
+    if (!bits) throw std::runtime_error("DS41_MTP_EXL3: record size is not K2..K5");
+    const uint64_t REC = exl3_rec_of(bits), TB = 320 * 144 * 16 * uint64_t(bits) * 2;
+    const std::array<ds41::TensorView, 6> v{ds41::TensorView{0, TB}, ds41::TensorView{TB, SB}, ds41::TensorView{TB + SB, TB},
+        ds41::TensorView{2 * TB + SB, SB}, ds41::TensorView{2 * TB + 2 * SB, TB}, ds41::TensorView{3 * TB + 2 * SB, SB}};
+    auto same = [](ds41::TensorView a, ds41::TensorView b) { return a.offset == b.offset && a.bytes == b.bytes; };
+    auto receipt = read_json(receipts);
+    std::vector<bool> seen(384);
+    std::map<unsigned, std::string> bank;
+    for (auto &r : records) {
+      if (r.id < 15360 || r.id >= 15744 || seen[r.id - 15360]) throw std::runtime_error("DS41_MTP_EXL3: duplicate/id");
+      seen[r.id - 15360] = true;
+      const unsigned layer = 40 + (r.id - 15360) / 128, e = (r.id - 15360) % 128;
+      if (r.bytes != REC || !same(r.gate, v[0]) || !same(r.gate_scale, v[1]) || !same(r.up, v[2]) ||
+          !same(r.up_scale, v[3]) || !same(r.down, v[4]) || !same(r.down_scale, v[5]))
+        throw std::runtime_error("DS41_MTP_EXL3: record layout/width mismatch: expert " + std::to_string(r.id));
+      if (r.extents.size() != 1) throw std::runtime_error("DS41_MTP_EXL3: a record must be one bank extent");
+      const auto &x = r.extents[0];
+      if (x.dst_offset != 0 || x.bytes != REC || (x.required_bytes && x.required_bytes != REC) ||
+          x.file_offset != e * REC || x.expected_file_bytes != 128 * REC)
+        throw std::runtime_error("DS41_MTP_EXL3: bank extent mismatch: expert " + std::to_string(r.id));
+      auto &path = bank[layer];
+      if (path.empty()) path = x.path;
+      else if (path != x.path) throw std::runtime_error("DS41_MTP_EXL3: an MTP layer spans several bank files");
+    }
+    for (auto &[layer, path] : bank) {
+      const std::string name = "bank-" + std::to_string(layer) + ".bin", key = std::to_string(layer);
+      if (std::filesystem::path(path).filename() != name || !receipt.contains(key) ||
+          receipt[key].at("file").get<std::string>() != name || receipt[key].at("bytes").get<uint64_t>() != 128 * REC ||
+          receipt[key].at("bits").get<int>() != bits || receipt[key].at("sha256").get<std::string>().size() != 64)
+        throw std::runtime_error("DS41_MTP_EXL3: no matching receipt for " + path);
+      struct stat st {};
+      if (::stat(path.c_str(), &st) || uint64_t(st.st_size) != 128 * REC ||
+          uint64_t(st.st_mtim.tv_sec) * 1000000000ull + uint64_t(st.st_mtim.tv_nsec) != receipt[key].at("mtime_ns").get<uint64_t>())
+        throw std::runtime_error("DS41_MTP_EXL3: bank changed since its receipt was written: " + path);
+    }
+    mtp_bits = bits;
   }
   // The DSpark drafter's 384 native MXFP4 experts, permanently resident in VRAM. The DS41_MOE_* policy
   // and GDS switches configure the target store, so this fixed store is built without them.

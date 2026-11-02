@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""s0ma change 49: the DSpark drafter's 384 routed experts as an EXL3 bank, read by ds41d with DS41_MTP_EXL3=DIR.
+"""s0ma changes 49-50: the DSpark drafter's 384 routed experts as an EXL3 bank, read by ds41d with DS41_MTP_EXL3=DIR.
 
-  quantize DIR --weights CKPT --k 3 [--device 0] [--limit N]
+  quantize DIR --weights CKPT --k 2 [--device 0] [--limit N]
       decode each MTP expert's native MXFP4 weights to F32 (exact), encode w1/w3/w2 with exllamav3's quantize_exl3
       at K bits (mul1 codebook, uncalibrated: what exllamav3's own converter does for MTP layers), and write
       DIR/bank-40.bin .. bank-42.bin (128 records each, in the target banks' layout), receipts.json and
@@ -96,7 +96,9 @@ def encoder(device):
                   'inf_nan': torch.zeros(2, dtype=torch.long, device=device), 'device': device}
         args = {'seed': seed, 'K': bits, 'devices': [device], 'device_ratios': None, 'apply_out_scales': None,
                 'debug_dir': str(workdir / 'debug'), 'mul1': True}
-        weight_q, _, out = quantize_exl3(weight, h_data, args, True)
+        # quantize_exl3 regularizes (rotates and scales) the tensor it is given in place, so it gets a copy: the error
+        # below is against the original weight (change 49 compared with the rotated tensor: ~1.0 whatever the encoding)
+        weight_q, _, out = quantize_exl3(weight.clone(), h_data, args, True)
         trellis, suh, svh = out['trellis'], out['suh'], out['svh']
         if out.get('mcg') is not None or out.get('mul1') is None:
             raise SystemExit('exllamav3 did not encode with the mul1 codebook (ds41d decodes mul1 only)')
@@ -227,7 +229,7 @@ def main():
     q = sub.add_parser('quantize')
     q.add_argument('dir', type=Path)
     q.add_argument('--weights', required=True)
-    q.add_argument('--k', type=int, choices=(2, 3, 4), default=3)
+    q.add_argument('--k', type=int, choices=(2, 3, 4), default=2)
     q.add_argument('--device', default='cuda:0')
     q.add_argument('--limit', type=int, default=0)
     v = sub.add_parser('verify')

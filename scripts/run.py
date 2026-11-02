@@ -296,6 +296,16 @@ def environment(cfg, render=True):
         if (bank_dir(cfg) / 'dense' / 'dense.json').exists():
             env.setdefault('DS41_SERO_DENSE', '1')
             env.setdefault('DS41_SERO_HEAD', '1')
+        # s0ma change 50: the drafter's routed experts from its EXL3 bank (change 49, ds41.sh mtp quantize) whenever one
+        # is complete, K2 before K3. Drafts are verified, so only acceptance can move; the freed VRAM goes to target
+        # slots. Seed 21 at a 46 GiB tier: 37.29 -> 38.65 tok/s with K3 (drafter 6,892 -> 4,882 MiB, NVMe misses -6.1%,
+        # acceptance 0.727 -> 0.735), 40.59 with K2 (3,262 MiB, misses -10.6%, acceptance 0.757). A lab
+        # --env DS41_MTP_EXL3=0 (native MXFP4 drafter) or =DIR still wins
+        for k in (2, 3):
+            mtp = ROOT / 'models' / f'mtp-k{k}'
+            if (mtp / 'records-mtp.tsv').exists() and (mtp / 'receipts.json').exists():
+                env.setdefault('DS41_MTP_EXL3', str(mtp))
+                break
         # change 25: a lab --env DS41_EXPERT_EXTRA_GIB=... (in ENGINE_ENV) wins
         env.setdefault('DS41_EXPERT_EXTRA_GIB', SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
     # the pinned cuBLAS pair (dist/blas) before CUDA 13.4's own libraries (cudart, cuFile)

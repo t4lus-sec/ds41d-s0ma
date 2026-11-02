@@ -108,6 +108,9 @@ ENGINE_ENV = {
     # s0ma change 28: a prompt's resident experts run on 3 side streams beside the staged sweep (EXL3 banks only;
     # exact). Sero: first token 7.90 -> 6.60 s mean, 8K prompts 15.0-15.8 -> 12.5-13.1 s, decode unchanged (37.54)
     'DS41_PREFILL_LANES': '4',
+    # s0ma change 30: speculative acceptance on the GPU (change 29; same uniforms, fp64, only the sums' order
+    # differs). Sero: 37.44 -> 38.42 tok/s, acceptance unchanged (0.715). =check reruns each step on the host; =0 off
+    'DS41_SPARK_GPU_VERIFY': '1',
     # DSpark adaptive draft length. Before drafting token k the engine estimates its acceptance from the
     # drafter's top probability and confidence head (a logistic model), and stops when the expected gain no
     # longer pays for another verify row. The decision uses only what is known before token k is drawn, so

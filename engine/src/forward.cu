@@ -321,7 +321,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
   const bool rows_verify = [] { const char *v = std::getenv("DS41_ROWS_VERIFY"); return v && std::string(v) == "1"; }();
   // s0ma change 29: the verify's logits also kept on the device, [6, V] f32, for acceptance there
   // (DS41_SPARK_GPU_VERIFY=1; layer-major verify only); vlogits_rows is 0 when the last verify left none
-  const bool keep_device_logits = [] { const char *v = std::getenv("DS41_SPARK_GPU_VERIFY"); return v && std::string(v) == "1"; }();
+  const bool keep_device_logits = [] { const char *v = std::getenv("DS41_SPARK_GPU_VERIFY"); return v && (std::string(v) == "1" || std::string(v) == "check"); }();
   Device vlogits;
   int vlogits_rows = 0;
   Device rows_verify_buf;

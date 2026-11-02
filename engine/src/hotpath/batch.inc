@@ -637,6 +637,7 @@ void ensure_lanes() {
   CK(cudaStreamCreateWithFlags(&lane_stream,cudaStreamNonBlocking));
   if(cublasCreate(&lane_blas)!=CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate (lane B)");
   pdl_workspace(lane_blas,lane_stream,pdl_lane_workspace);   // s0ma change 36
+  splitk_scratch(1);   // s0ma change 40: lane B's own expert split-K scratch
   if(dense_split_partial[0].bytes) {   // s0ma change 37: lane B's own split-K scratch
     dense_split_partial[1].resize(dense_split_partial[0].bytes);
     dense_split_counts[1].resize(dense_split_counts[0].bytes);

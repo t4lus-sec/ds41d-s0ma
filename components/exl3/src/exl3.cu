@@ -270,20 +270,19 @@ __global__ __launch_bounds__(256,1) void prefill_one(const DeviceExpert* table,c
 // multiplies its slice of the input as decode_body does, writes its 128 columns' FP32 partial sums to scratch, and
 // the last CTA of a tile to arrive (an atomic count) adds the partials in z order 0..S-1, so the result does not
 // depend on arrival order, rotates the sum and writes BF16. It then resets the count for the next launch.
+// The split-K work of one CTA: e's K range [z*KC, z*KC + KC) of 128 columns (blockIdx.x) for job's rows, x and out
+// already at the job's own columns, its partials at partial (S x 8 x N floats), its tiles' counts at counts. Shared
+// buffers come from the kernel (one set whatever BITS a launch decodes).
 template<int KC,int BITS>
-__global__ __launch_bounds__(512,1) void decode_splitk(const DeviceExpert* table,const GemmJob job,int N,int K,int xs,int os,
-                                                      int gx,int go,float* partial,unsigned* counts) {DS41_PDL_WAIT();
+__device__ __forceinline__ void splitk_body(const DeviceExpert& e,const GemmJob& job,int projection,int N,int K,int xs,
+                                            int os,const __nv_bfloat16* x,__nv_bfloat16* out_rows,float* partial,
+                                            unsigned* counts,half* A,float* red,int* last) {
     constexpr int ROWS=8;
-    const int S=K/KC, z=blockIdx.z, g=blockIdx.y, tiles=N/128;
-    if(job.tokens<1||job.tokens>ROWS){asm volatile("trap;");return;}
-    DeviceExpert e=table[job.expert+g];
-    const uint32_t* B=weights(e,0);
-    const half* su=scales(e,0); const half* sv=su+K;
-    __shared__ __align__(16) half A[ROWS*KC<2048?2048:ROWS*KC];
-    __shared__ __align__(16) float red[4*8*128];
-    __shared__ int last;
+    const int S=K/KC, z=blockIdx.z;
+    const uint32_t* B=weights(e,projection);
+    const half* su=scales(e,projection); const half* sv=su+K;
     const int warp=threadIdx.x/32,lane=threadIdx.x%32,wn=warp%4,wk=warp/4;
-    const auto* x=reinterpret_cast<const __nv_bfloat16*>(job.x)+size_t(g)*gx+size_t(z)*KC;
+    x+=size_t(z)*KC;
     for(int idx=warp;idx<job.tokens*(KC/128);idx+=16) {
         int r=idx/(KC/128),c=(idx%(KC/128))*128;
         rotate_input(x+size_t(r)*xs+c,su+size_t(z)*KC+c,A+r*KC+c,lane);
@@ -328,8 +327,7 @@ __global__ __launch_bounds__(512,1) void decode_splitk(const DeviceExpert* table
         }
     }
     __syncthreads();
-    // this CTA's partial: [g][z][row][N], its 128 columns
-    float* mine=partial+(size_t(g)*S+z)*size_t(ROWS)*N;
+    float* mine=partial+size_t(z)*ROWS*N;   // this CTA's partial: [z][row][N], its 128 columns
     for(int i=threadIdx.x;i<job.tokens*128;i+=512){
         float sum=0;
         #pragma unroll
@@ -338,21 +336,62 @@ __global__ __launch_bounds__(512,1) void decode_splitk(const DeviceExpert* table
     }
     __threadfence();
     __syncthreads();
-    if(!threadIdx.x) last=atomicAdd(counts+size_t(g)*tiles+blockIdx.x,1u)==unsigned(S-1);
+    if(!threadIdx.x) *last=atomicAdd(counts+blockIdx.x,1u)==unsigned(S-1);
     __syncthreads();
-    if(!last)return;
+    if(!*last)return;
     __threadfence();
-    float* out=red;   // the sum, then the rotation, as decode_body's epilogue
+    float* sum_out=red;   // the sum in z order, then the rotation, as decode_body's epilogue
     for(int i=threadIdx.x;i<job.tokens*128;i+=512){
         const size_t at=size_t(i/128)*N+blockIdx.x*128+i%128;
         float sum=0;
-        for(int s=0;s<S;++s)sum+=__ldcg(partial+(size_t(g)*S+s)*size_t(ROWS)*N+at);
-        out[i]=sum;
+        for(int s=0;s<S;++s)sum+=__ldcg(partial+size_t(s)*ROWS*N+at);
+        sum_out[i]=sum;
     }
     __syncthreads();
-    if(warp<job.tokens)
-        rotate_output(out+warp*128,sv+blockIdx.x*128,job.output+size_t(g)*go+size_t(warp)*os+blockIdx.x*128,lane);
-    if(!threadIdx.x) counts[size_t(g)*tiles+blockIdx.x]=0u;
+    if(warp<job.tokens)rotate_output(sum_out+warp*128,sv+blockIdx.x*128,out_rows+size_t(warp)*os+blockIdx.x*128,lane);
+    if(!threadIdx.x) counts[blockIdx.x]=0u;
+}
+// s0ma change 37: dense decode split over K across CTAs. 0xSero's dense tensors are narrow (wkv: 4 column tiles of
+// 128, wq_a 10, shared w1/w3 18, wo_b 40) so one CTA a tile left most of the 188 SMs idle. blockIdx.z takes K range
+// [z*KC, z*KC + KC); the last CTA of a tile to arrive (an atomic count) adds the partials in z order 0..S-1, so the
+// result does not depend on arrival order, rotates the sum and writes BF16, then resets the count.
+template<int KC,int BITS>
+__global__ __launch_bounds__(512,1) void decode_splitk(const DeviceExpert* table,const GemmJob job,int N,int K,int xs,int os,
+                                                      int gx,int go,float* partial,unsigned* counts) {DS41_PDL_WAIT();
+    constexpr int ROWS=8;
+    __shared__ __align__(16) half A[ROWS*KC<2048?2048:ROWS*KC];
+    __shared__ __align__(16) float red[4*8*128];
+    __shared__ int last;
+    const int g=blockIdx.y, S=K/KC;
+    if(job.tokens<1||job.tokens>ROWS){asm volatile("trap;");return;}
+    const DeviceExpert e=table[job.expert+g];
+    splitk_body<KC,BITS>(e,job,0,N,K,xs,os,reinterpret_cast<const __nv_bfloat16*>(job.x)+size_t(g)*gx,
+                         job.output+size_t(g)*go,partial+size_t(g)*S*ROWS*N,counts+size_t(g)*(N/128),A,red,&last);
+}
+// s0ma change 40: the routed experts' grouped launch split over K the same way (DS41_EXL3_SPLITK=1): job y's expert
+// at its own width (bits[expert], or `uniform`), its own partials and counts. A layer's handful of experts gives
+// gate/up 18 column tiles each: 6 experts filled 108 of 188 SMs.
+template<int KC>
+__global__ __launch_bounds__(512,1) void decode_var_splitk(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,
+                                                          int K,const uint8_t* bits,int uniform,float* partial,unsigned* counts) {DS41_PDL_WAIT();
+    constexpr int ROWS=8;
+    __shared__ __align__(16) half A[ROWS*KC<2048?2048:ROWS*KC];
+    __shared__ __align__(16) float red[4*8*128];
+    __shared__ int last;
+    const GemmJob job=jobs[blockIdx.y];
+    if(job.tokens<1||job.tokens>ROWS){asm volatile("trap;");return;}
+    const DeviceExpert e=table[job.expert];wait_ready(e);
+    const int S=K/KC, b=bits?bits[job.expert]:uniform;
+    const auto* x=reinterpret_cast<const __nv_bfloat16*>(job.x);
+    float* part=partial+size_t(blockIdx.y)*S*ROWS*N;
+    unsigned* cnt=counts+size_t(blockIdx.y)*(N/128);
+    switch(b){
+        case 2: splitk_body<KC,2>(e,job,projection,N,K,K,N,x,job.output,part,cnt,A,red,&last); break;
+        case 3: splitk_body<KC,3>(e,job,projection,N,K,K,N,x,job.output,part,cnt,A,red,&last); break;
+        case 4: splitk_body<KC,4>(e,job,projection,N,K,K,N,x,job.output,part,cnt,A,red,&last); break;
+        case 5: splitk_body<KC,5>(e,job,projection,N,K,K,N,x,job.output,part,cnt,A,red,&last); break;
+        default: asm volatile("trap;");
+    }
 }
 // s0ma change 37: prefill of a dense tensor as exllamav3 does for many rows: the weights decoded once into FP16
 // [K, N] (row k = input feature), the rows rotated into FP16, one FP16 GEMM with FP32 sums (the caller's cuBLAS), and
@@ -575,6 +614,39 @@ cudaError_t exl3_dense_rotate_out(const DeviceExpert* t,int index,const float* c
                                   __nv_bfloat16* out,int out_stride,cudaStream_t s){
     if(!t||!c||!out||rows<1||n<=0||n%128)return cudaErrorInvalidValue;
     exl3_detail::rotate_rows_out<<<(rows*(n/128)+7)/8,256,0,s>>>(t,index,c,rows,n,k,out,out_stride?out_stride:n);
+    return cudaGetLastError();
+}
+// s0ma change 40: the routed experts' grouped launch split over K (k 5120: chunks of 1280 or 2560; k 2304: 768 or
+// 1152): the fewest splits giving at least 564 CTAs (three per SM), the most if none does; none above 564 already
+int splitk_var_chunk(int n,int k,int count){
+    const long tiles=long(count)*(n/128);
+    if(tiles>=564)return 0;
+    const int* opts=nullptr;int m=0;
+    static const int k5120[]={2560,1280},k2304[]={1152,768};
+    if(k==5120){opts=k5120;m=2;}else if(k==2304){opts=k2304;m=2;}else return 0;
+    for(int i=0;i<m;++i)if(tiles*(k/opts[i])>=564)return opts[i];
+    return opts[m-1];
+}
+size_t exl3_var_splitk_floats(int n,int k,int count){
+    const int kc=splitk_var_chunk(n,k,count);
+    return kc?size_t(count)*(k/kc)*8*n:0;
+}
+cudaError_t grouped_exl3_splitk(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,
+                                const uint8_t* bits,int uniform,float* partial,size_t partial_floats,unsigned* counts,
+                                size_t count_slots,cudaStream_t s){
+    if(!valid(t,j,count,p,n,k)||(!bits&&(uniform<2||uniform>5)))return cudaErrorInvalidValue;
+    if(!count)return cudaSuccess;
+    const int kc=splitk_var_chunk(n,k,count);
+    if(!kc||!partial||!counts||partial_floats<exl3_var_splitk_floats(n,k,count)||count_slots<size_t(count)*(n/128))
+        return bits?grouped_exl3_var(t,j,count,p,n,k,bits,s):grouped_exl3_bits(t,j,count,p,n,k,uniform,s);
+    const dim3 grid(n/128,count,k/kc);
+    switch(kc){
+        case 2560: exl3_detail::decode_var_splitk<2560><<<grid,512,0,s>>>(t,j,int(p),n,k,bits,uniform,partial,counts); break;
+        case 1280: exl3_detail::decode_var_splitk<1280><<<grid,512,0,s>>>(t,j,int(p),n,k,bits,uniform,partial,counts); break;
+        case 1152: exl3_detail::decode_var_splitk<1152><<<grid,512,0,s>>>(t,j,int(p),n,k,bits,uniform,partial,counts); break;
+        case 768: exl3_detail::decode_var_splitk<768><<<grid,512,0,s>>>(t,j,int(p),n,k,bits,uniform,partial,counts); break;
+        default: return cudaErrorInvalidValue;
+    }
     return cudaGetLastError();
 }
 cudaError_t exl3_set_bits(int bits){

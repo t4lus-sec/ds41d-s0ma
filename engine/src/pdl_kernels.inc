@@ -17,6 +17,7 @@
   "decode_split",
   "decode_splitk",
   "decode_var",
+  "decode_var_splitk",
   "dequant",
   "ds41_pv_kernel",
   "ds41_qk_kernel",

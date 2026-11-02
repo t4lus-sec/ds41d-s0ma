@@ -267,8 +267,32 @@ class Native final : public Forward, public hotpath::GateEvidence {
   size_t expert_slot_bytes = 18808832;
   ds41::OffloadStore &spark_store() { return mtp_experts ? *mtp_experts : *experts; }
   // Target-layer expert GEMM. EXL3 jobs read BF16 rows; native jobs MXFP8 rows and scales.
+  // s0ma change 40: DS41_EXL3_SPLITK=1 splits each grouped launch over K when its experts give few CTAs (a scratch
+  // set a verify lane; up to 64 jobs a launch)
+  static bool exl3_splitk_on() {
+    static const bool on = [] { const char *v = std::getenv("DS41_EXL3_SPLITK"); return v && std::string(v) == "1"; }();
+    return on;
+  }
+  Device splitk_partial[2], splitk_counts[2];
+  static constexpr int splitk_jobs = 64;
+  void splitk_scratch(int lane) {
+    if (!exl3 || !exl3_splitk_on() || splitk_partial[lane].bytes) return;
+    const size_t floats = std::max(ds41::exl3_var_splitk_floats(2304, 5120, 1) * splitk_jobs,
+                                   ds41::exl3_var_splitk_floats(5120, 2304, 1) * splitk_jobs);
+    splitk_partial[lane].resize(floats * 4);
+    splitk_counts[lane].resize(size_t(splitk_jobs) * 40 * 4);
+    CK(cudaMemset(splitk_counts[lane].p, 0, splitk_counts[lane].bytes));
+  }
   cudaError_t expert_gemm(const ds41::GemmJob *jobs, int count, ds41::Projection p,
                           int n, int k, cudaStream_t s, int layer) {
+    if (exl3 && exl3_splitk_on() && count <= splitk_jobs) {
+      const int lane = lane_b_active ? 1 : 0;
+      if (splitk_partial[lane].bytes)
+        return ds41::grouped_exl3_splitk(experts->table(), jobs, count, p, n, k,
+                                         expert_bits(layer) ? nullptr : expert_width_dev.as<uint8_t>(), expert_bits(layer),
+                                         splitk_partial[lane].as<float>(), splitk_partial[lane].bytes / 4,
+                                         splitk_counts[lane].as<unsigned>(), splitk_counts[lane].bytes / 4, s);
+    }
     if (exl3 && !expert_bits(layer))   // s0ma change 15: a layer whose experts differ in width
       return ds41::grouped_exl3_var(experts->table(), jobs, count, p, n, k, expert_width_dev.as<uint8_t>(), s);
     return exl3 ? ds41::grouped_exl3_bits(experts->table(), jobs, count, p, n, k, expert_bits(layer), s)
@@ -662,6 +686,7 @@ public:
     reader = std::make_unique<ds41::DirectReader>(64);
     load_weights();
     load_sero_dense();
+    splitk_scratch(0);   // s0ma change 40
     if (fused_head) {
       const auto &head = w("head.weight");
       if (head.dtype != "BF16" || head.shape != std::vector<uint64_t>({uint64_t(V), uint64_t(H)}))

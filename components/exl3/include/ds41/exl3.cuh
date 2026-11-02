@@ -39,6 +39,13 @@ cudaError_t exl3_dense(const DeviceExpert* table, GemmJob job, int n, int k, int
                        float* partial = nullptr, size_t partial_floats = 0, unsigned* counts = nullptr,
                        size_t count_slots = 0);
 size_t exl3_dense_splitk_floats(int n, int k, int groups);
+// s0ma change 40: the routed experts' grouped launch with K split across CTAs (partials summed in a fixed order; the
+// same products in another order). bits: a device width per expert id, or nullptr and `uniform`. Scratch as above:
+// exl3_var_splitk_floats() floats and count*n/128 zeroed slots, left zeroed. Without enough, the unsplit launch.
+size_t exl3_var_splitk_floats(int n, int k, int count);
+cudaError_t grouped_exl3_splitk(const DeviceExpert* table, const GemmJob* jobs, int count, Projection projection, int n,
+                                int k, const uint8_t* bits, int uniform, float* partial, size_t partial_floats,
+                                unsigned* counts, size_t count_slots, cudaStream_t stream);
 // s0ma change 37: prefill as exllamav3 does it for many rows: W [k, n] FP16 decoded from table[index] (row = input
 // feature), the rows rotated into FP16 [rows, k], the caller's FP16 GEMM into FP32 [rows, n], then rotated and scaled
 // into BF16 (out_stride 0: n).

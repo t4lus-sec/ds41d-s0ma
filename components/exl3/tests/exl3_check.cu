@@ -88,7 +88,7 @@ static void dense_split(const ds41::DeviceExpert* t, ds41::GemmJob j, int N, int
         cudaFree(partial); cudaFree(counts);
     }
 }
-struct Case { int bits, K, N, tokens; bool prefill; ds41::Projection p; bool var = false; bool dense = false; int stride = 1; bool dq = false; };
+struct Case { int bits, K, N, tokens; bool prefill; ds41::Projection p; bool var = false; bool dense = false; int stride = 1; bool dq = false; bool vsplit = false; };
 
 static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
     const int K = c.K, N = c.N, M = c.tokens, bits = c.bits;
@@ -138,6 +138,21 @@ static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
         CK(cudaMemcpy2D(dout, size_t(N) * 2, wout + N, size_t(N) * S * 2, size_t(N) * 2, M, cudaMemcpyDeviceToDevice));
         cudaFree(wx); cudaFree(wout);
     }
+    else if (c.vsplit) {   // s0ma change 40: the experts' grouped launch split over K (twice: counts back to zero)
+        const size_t pf = ds41::exl3_var_splitk_floats(N, K, 1), slots = N / 128;
+        float* partial; unsigned* counts;
+        CK(cudaMalloc(&partial, (pf ? pf : 1) * 4)); CK(cudaMalloc(&counts, slots * 4)); CK(cudaMemset(counts, 0, slots * 4));
+        uint8_t* dbits; const uint8_t b8 = uint8_t(bits);
+        CK(cudaMalloc(&dbits, 1)); CK(cudaMemcpy(dbits, &b8, 1, cudaMemcpyHostToDevice));
+        for (int rep = 0; rep < 2; ++rep) {
+            CK(ds41::grouped_exl3_splitk(dt, dj, 1, c.p, N, K, rep ? nullptr : dbits, bits, partial, pf, counts, slots, 0));
+            CK(cudaDeviceSynchronize());
+        }
+        std::vector<unsigned> h(slots);
+        CK(cudaMemcpy(h.data(), counts, slots * 4, cudaMemcpyDeviceToHost));
+        for (unsigned v : h) if (v && invariant) *invariant = false;
+        cudaFree(partial); cudaFree(counts); cudaFree(dbits);
+    }
     else if (c.dq) {   // s0ma change 37: prefill as decoded weights, rotated rows, a GEMM, rotated output
         half *W, *A; float* C;
         CK(cudaMalloc(&W, size_t(K) * N * 2)); CK(cudaMalloc(&A, size_t(M) * K * 2)); CK(cudaMalloc(&C, size_t(M) * N * 4));
@@ -169,10 +184,20 @@ static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
     std::vector<__nv_bfloat16> out(size_t(M) * N);
     CK(cudaMemcpy(out.data(), dout, out.size() * 2, cudaMemcpyDeviceToHost));
 
-    if (invariant && !c.prefill && M > 1) {          // row 0 alone must give the same bits
+    // row 0 alone must give the same bits, on the same path (s0ma change 40: a split launch sums K in its own order,
+    // so it is compared with itself; a strided group launch may split differently from one tensor: not compared)
+    if (invariant && !c.prefill && M > 1 && !(c.dense && c.stride > 1)) {
         ds41::GemmJob one{0, 1, reinterpret_cast<const uint8_t*>(dx), nullptr, dout};
         CK(cudaMemcpy(dj, &one, sizeof one, cudaMemcpyHostToDevice));
-        CK(ds41::grouped_exl3(dt, dj, 1, c.p, N, K, 0));
+        if (c.dense) dense_split(dt, one, N, K, bits, 0, 0, 1, 0, 0, invariant);
+        else if (c.vsplit) {
+            const size_t pf = ds41::exl3_var_splitk_floats(N, K, 1), slots = N / 128;
+            float* partial; unsigned* counts;
+            CK(cudaMalloc(&partial, (pf ? pf : 1) * 4)); CK(cudaMalloc(&counts, slots * 4)); CK(cudaMemset(counts, 0, slots * 4));
+            CK(ds41::grouped_exl3_splitk(dt, dj, 1, c.p, N, K, nullptr, bits, partial, pf, counts, slots, 0));
+            CK(cudaDeviceSynchronize()); cudaFree(partial); cudaFree(counts);
+        }
+        else CK(ds41::grouped_exl3(dt, dj, 1, c.p, N, K, 0));
         CK(cudaDeviceSynchronize());
         std::vector<__nv_bfloat16> row(N);
         CK(cudaMemcpy(row.data(), dout, N * 2, cudaMemcpyDeviceToHost));
@@ -243,6 +268,11 @@ int main() {
         {3, 5120, 512, 2, false, ds41::Projection::Gate, false, true},
         {4, 5120, 1280, 256, true, ds41::Projection::Gate, false, false, 1, true}, {5, 4096, 1024, 100, true, ds41::Projection::Gate, false, false, 1, true},
         {4, 8192, 5120, 33, true, ds41::Projection::Gate, false, false, 1, true}, {2, 2304, 5120, 9, true, ds41::Projection::Gate, false, false, 1, true},
+        // s0ma change 40: the routed experts' grouped launch split over K, each width, gate/up and down
+        {2, 5120, 2304, 3, false, ds41::Projection::Gate, false, false, 1, false, true},
+        {3, 5120, 2304, 6, false, ds41::Projection::Up, false, false, 1, false, true},
+        {4, 2304, 5120, 2, false, ds41::Projection::Down, false, false, 1, false, true},
+        {5, 2304, 5120, 8, false, ds41::Projection::Down, false, false, 1, false, true},
     };
     int fail = 0;
     for (const auto& c : cases) {
@@ -251,7 +281,7 @@ int main() {
         bool ok = e < 1e-2 && inv;
         fail += !ok;
         std::printf("%s K%d %s k=%d n=%d rows=%d: relative error %.2e%s\n", ok ? "ok  " : "FAIL", c.bits,
-                    c.dq ? "dense dequant+gemm" : c.dense ? (c.prefill ? "dense prefill" : "dense decode ") : c.prefill ? "prefill" : c.var ? "mixed  " : "decode ", c.K, c.N, c.tokens, e, inv ? "" : "; row 0 differs by row count");
+                    c.vsplit ? "experts split-K" : c.dq ? "dense dequant+gemm" : c.dense ? (c.prefill ? "dense prefill" : "dense decode ") : c.prefill ? "prefill" : c.var ? "mixed  " : "decode ", c.K, c.N, c.tokens, e, inv ? "" : "; row 0 differs by row count");
     }
     std::printf(fail ? "%d FAILED\n" : "all passed\n", fail);
     return fail ? 1 : 0;

@@ -635,15 +635,20 @@ struct OffloadStore::Impl {
             std::vector<size_t> slots;
             for(size_t i=0;i<lend_per;++i)slots.push_back(lend_first+k*lend_per+i);
             auto settled=[&]{for(auto j:slots)if(pool.busy(j))return false;return true;};
+            auto ms=[](Clock::time_point t){return double(ns(Clock::now()-t))/1e6;};
+            auto t0=Clock::now();
             collect(false);
             while(!settled() && (!retired.empty() || !draining.empty())){
                 if(!retired.empty())collect(true);
                 else{ck(cudaEventSynchronize(draining.front().event));collect(false);}
             }
+            lend_counters.settle_ms+=ms(t0);
             if(!settled()){++lend_counters.busy;continue;}   // a live lease holds one of its experts
+            t0=Clock::now();
             // Uploads into these slots (prefetches, demotion copies) must land before their bytes move or are freed.
             ck(cudaStreamSynchronize(copy));if(pcopy)ck(cudaStreamSynchronize(pcopy));
             ck(cudaStreamSynchronize(mapping));if(demote_stream)ck(cudaStreamSynchronize(demote_stream));
+            lend_counters.sync_ms+=ms(t0);t0=Clock::now();
             std::vector<ExpertId> dropped;
             const auto moves=pool.lend(slots,dropped);
             auto* views=static_cast<DeviceExpert*>(entries->data());
@@ -664,7 +669,9 @@ struct OffloadStore::Impl {
             ck(cudaStreamSynchronize(copy));ck(cudaStreamSynchronize(mapping));
             for(const auto& m:moves){ck(cudaEventRecord(slot_copy[m.to],copy));ck(cudaEventRecord(slot_mapping[m.to],mapping));known_ready[m.to]=true;}
             for(auto j:slots)known_ready[j]=false;
+            lend_counters.move_ms+=ms(t0);t0=Clock::now();
             ck(cudaFree(lend_base[k]));lend_base[k]=nullptr;
+            lend_counters.free_ms+=ms(t0);
             ++done;++lend_counters.lends;lend_counters.moved+=moves.size();lend_counters.dropped+=dropped.size();
         }
         return done;
@@ -676,7 +683,10 @@ struct OffloadStore::Impl {
             size_t free=0,total=0;ck(cudaMemGetInfo(&free,&total));
             if(free<lend_chunk_bytes+margin)break;
             void* p=nullptr;
-            if(cudaMalloc(&p,lend_chunk_bytes)!=cudaSuccess){cudaGetLastError();++lend_counters.failed;break;}
+            const auto t0=Clock::now();
+            const auto rc=cudaMalloc(&p,lend_chunk_bytes);
+            lend_counters.malloc_ms+=double(ns(Clock::now()-t0))/1e6;
+            if(rc!=cudaSuccess){cudaGetLastError();++lend_counters.failed;break;}
             lend_base[k]=static_cast<uint8_t*>(p);
             for(size_t i=0;i<lend_per;++i){const size_t j=lend_first+k*lend_per+i;known_ready[j]=false;pool.set_lent(j,false);}
             ++done;++lend_counters.reclaims;

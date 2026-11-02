@@ -422,18 +422,25 @@ void begin_prompt(int64_t rows,bool append) override {
   (void)append;
   if(!lend_chunks_total||poisoned)return;
   lend_prompt=true;++lend_prompts;lend_retry=0;
+  const double t0=clock_ms();
   const int64_t fresh=std::max<int64_t>(1,std::min<int64_t>(rows-committed,config.max_context-committed));
   prefill_lend(prefill_lend_need(size_t(fresh)));
+  const double t=clock_ms()-t0;lend_begin_ms+=t;lend_begin_max_ms=std::max(lend_begin_max_ms,t);
 }
 void end_prompt(bool) override { lend_prompt=false;lend_retry=0; }
 void lend_reclaim() {
+  const double t0=clock_ms();
   const size_t got=experts->reclaim(lend_margin);
+  lend_reclaim_ms+=clock_ms()-t0;
   lent_chunks-=std::min(got,lent_chunks);
   if(!lent_chunks) {
     const auto x=experts->lend_info();
     std::cerr<<"prefill lend: "<<lend_prompts<<" prompts, chunks lent "<<x.lends<<", reclaimed "<<x.reclaims<<" of "<<x.chunks
              <<" x "<<x.chunk_bytes/double(1<<20)<<" MiB; experts moved "<<x.moved<<", dropped "<<x.dropped
-             <<"; busy "<<x.busy<<", failed "<<x.failed<<"\n";
+             <<"; busy "<<x.busy<<", failed "<<x.failed
+             <<"; begin_prompt "<<lend_begin_ms/double(lend_prompts)<<" ms a prompt (max "<<lend_begin_max_ms<<"; settle "
+             <<x.settle_ms<<", sync "<<x.sync_ms<<", moves "<<x.move_ms<<", cudaFree "<<x.free_ms<<" ms in all), reclaim "
+             <<lend_reclaim_ms<<" ms in all (cudaMalloc "<<x.malloc_ms<<")\n";
   }
 }
 PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& options) override {

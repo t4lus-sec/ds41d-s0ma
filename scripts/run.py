@@ -306,6 +306,11 @@ def environment(cfg, render=True):
             if (mtp / 'records-mtp.tsv').exists() and (mtp / 'receipts.json').exists():
                 env.setdefault('DS41_MTP_EXL3', str(mtp))
                 break
+        # s0ma change 52 (V6): 2 GiB more K3 slots in 4 chunks that each prompt borrows back for its scratch (change 51).
+        # Seed 22, 46 GiB tier: 40.43 -> 41.88 tok/s, tokens 7/7 identical, verify 57.4 -> 55.3 ms a step; first
+        # token 5.65 -> 6.13 s mean (all of it inside the engine's prefill; lending itself 3-10 ms). A lab
+        # --env DS41_PREFILL_LEND_GIB=0 turns it off
+        env.setdefault('DS41_PREFILL_LEND_GIB', '2')
         # change 25: a lab --env DS41_EXPERT_EXTRA_GIB=... (in ENGINE_ENV) wins
         env.setdefault('DS41_EXPERT_EXTRA_GIB', SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
     # the pinned cuBLAS pair (dist/blas) before CUDA 13.4's own libraries (cudart, cuFile)

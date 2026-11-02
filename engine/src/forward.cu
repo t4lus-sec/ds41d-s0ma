@@ -258,6 +258,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
   size_t lend_chunks_total = 0, lend_chunk_bytes = 0, lent_chunks = 0, lend_margin = size_t(256) << 20;
   bool lend_prompt = false;
   uint64_t lend_prompts = 0, lend_retry = 0;
+  double lend_begin_ms = 0, lend_begin_max_ms = 0, lend_reclaim_ms = 0;   // s0ma change 52
   std::set<std::string> dense_woa;                    // "layers.L.attn" whose wo_a runs as Sero's eight slices
   // s0ma change 47 (H1): the step's tier snapshot, each row's private cost so far, the cut counters
   std::vector<uint8_t> h1_snap;

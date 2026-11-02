@@ -38,6 +38,8 @@ public:
     struct LendInfo {
         size_t chunks = 0, lent = 0, chunk_bytes = 0;
         uint64_t lends = 0, reclaims = 0, moved = 0, dropped = 0, busy = 0, failed = 0;
+        // s0ma change 52: where lend() and reclaim() spend their time, summed (ms)
+        double settle_ms = 0, sync_ms = 0, move_ms = 0, free_ms = 0, malloc_ms = 0;
     };
     struct CachePolicy {
         bool decay256=false, drift_0_50=false, fast_minima=false;

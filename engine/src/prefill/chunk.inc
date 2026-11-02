@@ -40,6 +40,7 @@ size_t prefill_fp8_elements() const {
   return best;
 }
 void clinear(const std::string& name,const void* input,void* output,int n,int k,int rows) {
+  if(dense_linear(name,input,output,rows))return;   // s0ma change 34: Sero's EXL3 tensor
   auto &c=*prefill_chunk;auto &weight=w(name+".weight");
   if(weight.shape!=std::vector<uint64_t>({uint64_t(n),uint64_t(k)}))throw std::runtime_error("prefill chunk linear shape: "+name);
   if(weight.dtype=="F8_E4M3"||weight.dtype=="F8_E4M3FN") {
@@ -189,7 +190,8 @@ void cproject(const ds41e::prefill::Layer& work,int64_t first,int rows,const cha
   clinear(a+".wkv",c.x.p,c.kv.p,512,H,rows);cnorm(a+".kv_norm",c.kv.p,c.kv.p,512,rows);
   cattention(work,first,rows,qb,qn);
   if(!qn)return;
-  CK(ds41e::prefill::wo_a_rows(blas,c.o.p,woa_weight(a+".wo_a"),c.wo.p,qn,1024,4096,8,stream));
+  if(!dense_wo_a(a,c.o.p,c.wo.p,qn))   // s0ma change 34: Sero's wo_a slices when loaded
+    CK(ds41e::prefill::wo_a_rows(blas,c.o.p,woa_weight(a+".wo_a"),c.wo.p,qn,1024,4096,8,stream));
   clinear(a+".wo_b",c.wo.p,c.y.p,H,8192,qn);
   char* hq=c.h.as<char>(size_t(qoff)*HC*H*2);
   CK(ds41_dense_hc_post(c.y.p,hq,c.post.as<float>(size_t(qoff)*4*4),c.comb.as<float>(size_t(qoff)*16*4),c.next.p,qn,H,stream));

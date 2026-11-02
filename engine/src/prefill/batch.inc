@@ -11,6 +11,7 @@ struct PrefillBatch {
 };
 std::unique_ptr<PrefillBatch> prefill_batch;
 void plinear(const std::string& name,const void* input,void* output,int n,int k,int rows) {
+  if(dense_linear(name,input,output,rows))return;   // s0ma change 34: Sero's EXL3 tensor
   auto &b=*prefill_batch;auto &weight=w(name+".weight");
   if(weight.shape!=std::vector<uint64_t>({uint64_t(n),uint64_t(k)}))throw std::runtime_error("prefill batch linear shape");
   if(weight.dtype=="F8_E4M3"||weight.dtype=="F8_E4M3FN") {
@@ -69,9 +70,11 @@ void pproject_batch(const ds41e::prefill::Layer& work,int64_t first,int rows,con
     if(work.query.contains(first+r))pcopy(b.o.as<char>(r*32768*2),o.p,32768*2);
   }
   if(!queries)return;
-  const void *woa=woa_weight(a+".wo_a");
-  for(int r=0;r<rows;++r)CK(ds41_dense_cublas(blas,b.o.as<char>(r*32768*2),
-      woa,b.wo.as<char>(r*8192*2),1,1024,4096,0,8,stream));
+  if(!dense_wo_a(a,b.o.p,b.wo.p,rows)) {   // s0ma change 34: Sero's wo_a slices when loaded
+    const void *woa=woa_weight(a+".wo_a");
+    for(int r=0;r<rows;++r)CK(ds41_dense_cublas(blas,b.o.as<char>(r*32768*2),
+        woa,b.wo.as<char>(r*8192*2),1,1024,4096,0,8,stream));
+  }
   plinear(a+".wo_b",b.wo.p,b.y.p,H,8192,rows);
   CK(ds41_dense_hc_post(b.y.p,b.h.p,b.post.as<float>(),b.comb.as<float>(),b.next.p,rows,H,stream));
   pcopy(b.h.p,b.next.p,size_t(rows)*HC*H*2);

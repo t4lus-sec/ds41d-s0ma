@@ -22,11 +22,14 @@ void btrace(int64_t pos,int m,int layer,const char *tag,const Device &data,int s
 }
 void blinear(const std::string &prefix, const void *in, void *out,
              int n, int k, int m, bool quant_ready=false) {
+  if (dense_linear(prefix, in, out, m)) return;   // s0ma change 34: Sero's EXL3 tensor
   auto &weight = w(prefix + ".weight");
   if(weight.shape != std::vector<uint64_t>({uint64_t(n),uint64_t(k)}))
     throw std::runtime_error("linear shape: "+prefix);
   if (weight.dtype == "F8_E4M3" || weight.dtype == "F8_E4M3FN") {
-    if(!quant_ready) CK(ds41_dense_quant(in, aq.p, as.p, m, k, stream));
+    // s0ma change 34: an EXL3 projection in between did not quantize this input into aq/as: quantize it here
+    if(!quant_ready || dense_since_quant) CK(ds41_dense_quant(in, aq.p, as.p, m, k, stream));
+    dense_since_quant = false;
     // s0ma: ds41d's own per-shape table (-1), as the drafter uses, unless DS41_FP8_VARIANT2=1. Every variant keeps
     // each k32 dot and adds them in ascending K from zero, so only the tiling changes, never a sum.
     static const int variant = [] { const char *v = std::getenv("DS41_FP8_VARIANT2"); return v && v[0] == '1' ? 2 : -1; }();
@@ -199,7 +202,8 @@ void battention(int l, int64_t pos, int m) {
   brope(o,64,512,l,pos,m,true);
   CK(ds41_attn_roundtrip(o.p,m,32768,DS41_SWA_FP8,stream));
   bgraph(p+".output",m,[&]{
-    if(config.compact_woa)
+    if(dense_wo_a(p,o.p,wo.p,m)) {}   // s0ma change 34: Sero's wo_a slices when loaded
+    else if(config.compact_woa)
       CK(ds41_dense_wo_a_compact(o.p,w(p+".wo_a.weight").data.p,w(p+".wo_a.scale").data.p,wo.p,m,1024,4096,8,stream));
     else {
       const void *woa=woa_weight(p+".wo_a");

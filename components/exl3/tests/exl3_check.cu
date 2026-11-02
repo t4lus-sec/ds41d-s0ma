@@ -63,7 +63,7 @@ static void hadamard128(float* v) {           // Sylvester order, scaled by 1/sq
     for (int i = 0; i < 128; ++i) v[i] *= 0.088388347648f;
 }
 
-struct Case { int bits, K, N, tokens; bool prefill; ds41::Projection p; bool var = false; };
+struct Case { int bits, K, N, tokens; bool prefill; ds41::Projection p; bool var = false; bool dense = false; int stride = 1; };
 
 static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
     const int K = c.K, N = c.N, M = c.tokens, bits = c.bits;
@@ -94,7 +94,32 @@ static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
     ds41::GemmJob job{0, M, reinterpret_cast<const uint8_t*>(dx), nullptr, dout};
     CK(cudaMalloc(&dj, sizeof job)); CK(cudaMemcpy(dj, &job, sizeof job, cudaMemcpyHostToDevice));
     CK(ds41::exl3_set_bits(bits));
-    if (c.prefill) CK(ds41::grouped_exl3_prefill(dt, dj, 1, c.p, N, K, M, 0));
+    if (c.dense && c.stride > 1) {   // s0ma change 34: rows a slice of wider ones (wo_a's groups), in and out
+        const int S = c.stride;
+        __nv_bfloat16 *wx, *wout;
+        CK(cudaMalloc(&wx, size_t(M) * K * S * 2)); CK(cudaMalloc(&wout, size_t(M) * N * S * 2));
+        CK(cudaMemset(wx, 0x7f, size_t(M) * K * S * 2));
+        CK(cudaMemcpy2D(wx + K, size_t(K) * S * 2, dx, size_t(K) * 2, size_t(K) * 2, M, cudaMemcpyDeviceToDevice));
+        ds41::GemmJob sj{0, M, reinterpret_cast<const uint8_t*>(wx + K), nullptr, wout + N};
+        if (c.prefill) CK(ds41::exl3_dense_prefill(dt, sj, N, K, bits, 0, K * S, N * S));
+        else {   // two tensors at consecutive table entries in one launch; group 1 is the one checked
+            ds41::DeviceExpert two[2] = {e, e}, *dt2;
+            CK(cudaMalloc(&dt2, sizeof two)); CK(cudaMemcpy(dt2, two, sizeof two, cudaMemcpyHostToDevice));
+            ds41::GemmJob gj{0, M, reinterpret_cast<const uint8_t*>(wx), nullptr, wout};
+            CK(ds41::exl3_dense(dt2, gj, N, K, bits, 0, K * S, N * S, 2, K, N));
+            CK(cudaDeviceSynchronize()); cudaFree(dt2);
+        }
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy2D(dout, size_t(N) * 2, wout + N, size_t(N) * S * 2, size_t(N) * 2, M, cudaMemcpyDeviceToDevice));
+        cudaFree(wx); cudaFree(wout);
+    }
+    else if (c.dense) {   // s0ma change 34: the by-value dense launches (gate views), at an explicit width
+        CK(ds41::exl3_set_bits(bits == 2 ? 3 : 2));   // the global width must not matter
+        if (c.prefill) CK(ds41::exl3_dense_prefill(dt, job, N, K, bits, 0));
+        else CK(ds41::exl3_dense(dt, job, N, K, bits, 0));
+        CK(ds41::exl3_set_bits(bits));
+    }
+    else if (c.prefill) CK(ds41::grouped_exl3_prefill(dt, dj, 1, c.p, N, K, M, 0));
     else if (c.var) {   // s0ma change 15: the mixed-width launch, its expert's width from a device table
         uint8_t* dbits; const uint8_t b8 = uint8_t(bits);
         CK(cudaMalloc(&dbits, 1)); CK(cudaMemcpy(dbits, &b8, 1, cudaMemcpyHostToDevice));
@@ -166,6 +191,16 @@ int main() {
         {5, 2304, 5120, 65, true, ds41::Projection::Down},
         {2, 5120, 2304, 3, false, ds41::Projection::Gate, true}, {3, 2304, 5120, 2, false, ds41::Projection::Down, true},
         {4, 5120, 2304, 5, false, ds41::Projection::Up, true}, {5, 2304, 5120, 8, false, ds41::Projection::Down, true},
+        // s0ma change 34 (N1): 0xSero's dense shapes: wq_b's k=1280, wo_b's k=8192 (decode: at most 4 rows a job)
+        {4, 1280, 4096, 1, false, ds41::Projection::Gate}, {4, 1280, 4096, 6, false, ds41::Projection::Gate},
+        {4, 1280, 4096, 256, true, ds41::Projection::Gate},
+        {4, 8192, 5120, 1, false, ds41::Projection::Gate}, {5, 8192, 5120, 4, false, ds41::Projection::Gate},
+        {4, 8192, 5120, 130, true, ds41::Projection::Gate}, {4, 5120, 1280, 6, false, ds41::Projection::Gate},
+        {4, 5120, 1280, 6, false, ds41::Projection::Gate, false, true}, {5, 8192, 5120, 4, false, ds41::Projection::Gate, false, true},
+        {4, 1280, 4096, 3, false, ds41::Projection::Gate, false, true}, {4, 5120, 2304, 256, true, ds41::Projection::Gate, false, true},
+        {5, 8192, 5120, 97, true, ds41::Projection::Gate, false, true},
+        {5, 4096, 1024, 6, false, ds41::Projection::Gate, false, true, 8}, {5, 4096, 1024, 200, true, ds41::Projection::Gate, false, true, 8},
+        {5, 4096, 1024, 1, false, ds41::Projection::Gate, false, true},
     };
     int fail = 0;
     for (const auto& c : cases) {
@@ -174,7 +209,7 @@ int main() {
         bool ok = e < 1e-2 && inv;
         fail += !ok;
         std::printf("%s K%d %s k=%d n=%d rows=%d: relative error %.2e%s\n", ok ? "ok  " : "FAIL", c.bits,
-                    c.prefill ? "prefill" : c.var ? "mixed  " : "decode ", c.K, c.N, c.tokens, e, inv ? "" : "; row 0 differs by row count");
+                    c.dense ? (c.prefill ? "dense prefill" : "dense decode ") : c.prefill ? "prefill" : c.var ? "mixed  " : "decode ", c.K, c.N, c.tokens, e, inv ? "" : "; row 0 differs by row count");
     }
     std::printf(fail ? "%d FAILED\n" : "all passed\n", fail);
     return fail ? 1 : 0;

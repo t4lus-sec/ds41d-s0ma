@@ -159,7 +159,8 @@ struct Phase {
 };
 // s0ma change 32 (N4): programmatic edges between ds41d's own kernels in each captured graph (pdl_graph.cpp)
 extern "C" int ds41_pdl_mode();
-extern "C" int ds41_pdl_rewrite(cudaGraph_t graph, int mode, size_t *edges);
+extern "C" int ds41_pdl_rewrite(cudaGraph_t graph, int mode, size_t *edges, const char **step);
+extern "C" const char *ds41_pdl_node_name(cudaGraphNode_t node);
 struct Graph {
   cudaGraph_t graph = nullptr;
   cudaGraphExec_t exec = nullptr;
@@ -227,6 +228,15 @@ class Native final : public Forward, public hotpath::GateEvidence {
   cudaStream_t stream = nullptr;
   cublasHandle_t blas = nullptr;
   std::map<std::string, Weight> weights;
+  // s0ma change 34 (N1): 0xSero's dense EXL3 tensors in place of native FP8 ones (DS41_SERO_DENSE=1|DIR). Each is one
+  // DeviceExpert entry of dense_table (its gate views: trellis, then suh and svh); its FP8 weight and scale are freed.
+  struct DenseExl3 { int index = 0, k = 0, n = 0, bits = 0; };
+  std::map<std::string, DenseExl3> dense_exl3;      // the tensor's name without ".weight"
+  std::vector<Device> dense_records;
+  Device dense_table;
+  double dense_extra_gib = 0;                         // VRAM the swap gave back, for expert slots
+  std::set<std::string> dense_woa;                    // "layers.L.attn" whose wo_a runs as Sero's eight slices
+  bool dense_since_quant = false;                     // an EXL3 projection ran since the last FP8 activation quant
   std::unique_ptr<ds41::OffloadStore> experts;
   // --exl3-experts: `experts` holds EXL3 K3 target experts (layers 0..39) and this store the native
   // MXFP4 MTP experts, all pinned in VRAM. Without it, `experts` serves every logical ID.
@@ -268,6 +278,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
   uint64_t graph_captures = 0, initial_captures = 0;
   uint64_t pdl_edges = 0, pdl_graphs = 0;   // s0ma change 32
   bool pdl_off = false;
+  std::string pdl_error;
   uint64_t graph_evictions = 0, initial_evictions = 0;
   std::array<std::array<int,40>,6> attention_scan_bucket{};
   bool graph_ready = false;
@@ -624,6 +635,7 @@ public:
     }
     reader = std::make_unique<ds41::DirectReader>(64);
     load_weights();
+    load_sero_dense();
     if (fused_head) {
       const auto &head = w("head.weight");
       if (head.dtype != "BF16" || head.shape != std::vector<uint64_t>({uint64_t(V), uint64_t(H)}))
@@ -1171,6 +1183,7 @@ public:
       j["pdl_graphs"] = pdl_graphs;
       j["pdl_edges"] = pdl_edges;
       j["pdl_refused"] = pdl_off;
+      if (!pdl_error.empty()) j["pdl_error"] = pdl_error;
     }
     if (async_engram) {
       auto stats = async_engram->stats();
@@ -1377,9 +1390,22 @@ private:
       // s0ma change 32: rewrite a clone; if the driver refuses it, keep the graph as captured (and stop trying)
       cudaGraph_t clone = nullptr;
       size_t edges = 0;
-      bool done = cudaGraphClone(&clone, recorded->graph) == cudaSuccess &&
-                  ds41_pdl_rewrite(clone, mode, &edges) == cudaSuccess &&
-                  cudaGraphInstantiate(&recorded->exec, clone, 0) == cudaSuccess;
+      const char *step = "cloning the graph";
+      cudaGraphInstantiateParams ip{};
+      cudaError_t rc = cudaGraphClone(&clone, recorded->graph);
+      if (rc == cudaSuccess) rc = cudaError_t(ds41_pdl_rewrite(clone, mode, &edges, &step));
+      if (rc == cudaSuccess) {
+        step = "instantiating";
+        rc = cudaGraphInstantiateWithParams(&recorded->exec, clone, &ip);
+      }
+      const bool done = rc == cudaSuccess;
+      if (!done) {   // why, for the engine log and the stats (pdl_error)
+        std::ostringstream why;
+        why << step << ": " << cudaGetErrorString(rc);
+        if (ip.result_out != cudaGraphInstantiateSuccess) why << " (instantiate result " << int(ip.result_out) << ")";
+        if (ip.errNode_out) why << " at kernel " << ds41_pdl_node_name(ip.errNode_out);
+        pdl_error = why.str();
+      }
       if (done) {
         cudaGraphDestroy(recorded->graph);
         recorded->graph = clone;
@@ -1390,7 +1416,8 @@ private:
         recorded->exec = nullptr;
         cudaGetLastError();
         pdl_off = true;
-        std::cerr << "DS41_PDL: graph " << key << " refused programmatic edges; graphs stay as captured\n";
+        std::cerr << "DS41_PDL: graph " << key << " refused programmatic edges (" << pdl_error
+                  << "); graphs stay as captured\n";
       }
     }
     if (!recorded->exec) CK(cudaGraphInstantiate(&recorded->exec, recorded->graph, 0));
@@ -1581,8 +1608,167 @@ private:
         woa_scratch.p,int(weight.shape[0]),int(weight.shape[1]),stream));
     return woa_scratch.p;
   }
+  // s0ma change 34 (N1): Sero's dense EXL3 tensors. DS41_SERO_DENSE=1 reads <the Sero bank>/dense (ds41.sh sero dense),
+  // or a directory. Taken: every mul1 tensor whose native counterpart is an FP8 [n, k] weight with a k the decode
+  // kernels have (128, 256, 1280, 2304, 5120, 8192), wo_a as its eight 4096 -> 1024 slices, and not the head (its
+  // logits would come out in BF16). DS41_SERO_DENSE_ONLY=a,b keeps only names containing one of those strings.
+  void load_sero_dense() {
+    const char *v = std::getenv("DS41_SERO_DENSE");
+    if (!v || !*v || std::string(v) == "0") return;
+    if (config.exl3_experts.empty()) throw std::invalid_argument("DS41_SERO_DENSE needs Sero's bank (--exl3-experts)");
+    const std::filesystem::path dir = std::string(v) == "1"
+        ? std::filesystem::path(config.exl3_experts).parent_path() / "dense" : std::filesystem::path(v);
+    if (!std::filesystem::exists(dir / "dense.json"))
+      throw std::runtime_error("DS41_SERO_DENSE: no " + (dir / "dense.json").string() + " (ds41.sh sero dense)");
+    auto meta = read_json((dir / "dense.json").string());
+    const auto file = dir / meta.at("file").get<std::string>();
+    if (std::filesystem::file_size(file) != meta.at("bytes").get<uint64_t>())
+      throw std::runtime_error("DS41_SERO_DENSE: " + file.string() + " is not the size dense.json states");
+    std::vector<std::string> only;
+    if (const char *o = std::getenv("DS41_SERO_DENSE_ONLY"); o && *o) {
+      std::stringstream ss(o);
+      for (std::string item; std::getline(ss, item, ',');) if (!item.empty()) only.push_back(item);
+    }
+    std::ifstream in(file, std::ios::binary);
+    if (!in) throw std::runtime_error("DS41_SERO_DENSE: cannot open " + file.string());
+    std::vector<ds41::DeviceExpert> table;
+    size_t freed = 0, used = 0, skipped = 0;
+    std::map<std::string, int> kinds;
+    std::map<std::string, std::vector<const Json *>> woa_slices;   // "layers.L.attn.wo_a" -> its slices
+    auto load_record = [&](const std::string &name, const Json &t) {
+      const int k = t.at("k").get<int>(), n = t.at("n").get<int>(), bits = t.at("bits").get<int>();
+      const size_t off = t.at("offset").get<uint64_t>(), bytes = t.at("bytes").get<uint64_t>(),
+                   tb = t.at("trellis_bytes").get<uint64_t>();
+      if (tb != size_t(k / 16) * (n / 16) * 16 * bits * 2 || bytes != tb + 2 * size_t(k) + 2 * size_t(n))
+        throw std::runtime_error("DS41_SERO_DENSE: " + name + ": record sizes disagree with k, n and bits");
+      std::vector<char> host(bytes);
+      in.seekg(std::streamoff(off));
+      if (!in.read(host.data(), std::streamsize(bytes)))
+        throw std::runtime_error("DS41_SERO_DENSE: short read of " + name);
+      Device record(bytes);
+      CK(cudaMemcpy(record.p, host.data(), bytes, cudaMemcpyHostToDevice));
+      ds41::DeviceExpert e{};
+      e.gate = static_cast<const uint8_t *>(record.p);
+      e.gate_scale = static_cast<const uint8_t *>(record.p) + tb;
+      dense_exl3[name] = {int(table.size()), k, n, bits};
+      table.push_back(e);
+      dense_records.push_back(std::move(record));
+      used += bytes;
+      std::string kind = name;
+      if (kind.compare(0, 7, "layers.") == 0) kind = kind.substr(kind.find('.', 7) + 1);
+      if (const size_t sl = kind.find(".slice."); sl != std::string::npos) kind = kind.substr(0, sl) + " slices";
+      ++kinds[kind + " K" + std::to_string(bits)];
+    };
+    for (const auto &t : meta.at("tensors")) {
+      std::string name = t.at("name").get<std::string>();
+      if (name.compare(0, 6, "model.") == 0) name = name.substr(6);
+      const int k = t.at("k").get<int>(), n = t.at("n").get<int>(), bits = t.at("bits").get<int>();
+      auto it = weights.find(name + ".weight");
+      const bool fp8 = it != weights.end() && (it->second.dtype == "F8_E4M3" || it->second.dtype == "F8_E4M3FN");
+      const bool shape = fp8 && it->second.shape == std::vector<uint64_t>({uint64_t(n), uint64_t(k)});
+      const bool kernel = (k == 128 || k == 256 || k == 1280 || k == 2304 || k == 5120 || k == 8192) && n % 128 == 0 &&
+                          bits >= 2 && bits <= 5;
+      bool wanted = only.empty();
+      for (const auto &o : only) wanted = wanted || name.find(o) != std::string::npos;
+      // wo_a's eight groups come as eight slices (4096 -> 1024 each, K5): taken as a set, below
+      if (const size_t at = name.find(".attn.wo_a.slice."); at != std::string::npos) {
+        if (t.at("codebook").get<std::string>() == "mul1" && k == 4096 && n == 1024 && bits >= 2 && bits <= 5 && wanted)
+          woa_slices[name.substr(0, at + 10)].push_back(&t);
+        else ++skipped;
+        continue;
+      }
+      if (t.at("codebook").get<std::string>() != "mul1" || !shape || !kernel || !wanted || name == "head" ||
+          weights.count(name + ".scale") == 0) {
+        ++skipped;
+        continue;
+      }
+      load_record(name, t);
+      auto &weight = it->second, &scale = w(name + ".scale");
+      freed += weight.data.bytes + scale.data.bytes;
+      weight.data.release();
+      scale.data.release();
+      weight.dtype = "EXL3";   // dtype filters (FP8 scratch sizing, the rows check) now pass over it
+    }
+    // wo_a: a layer's eight slices replace its [8192, 4096] weight (BF16 after the load's promotion, or FP8 with
+    // --reuse-woa), group g taking o's columns g*4096.. and writing wo's columns g*1024.. (ds41d's grouped wo_a)
+    for (auto &[woa, slices] : woa_slices) {
+      auto it = weights.find(woa + ".weight");
+      std::map<int, const Json *> by_group;
+      for (const Json *t : slices) {
+        const std::string name = (*t).at("name").get<std::string>();
+        by_group[std::stoi(name.substr(name.rfind('.') + 1))] = t;
+      }
+      if (it == weights.end() || it->second.shape != std::vector<uint64_t>({8192, 4096}) || by_group.size() != 8 ||
+          by_group.begin()->first != 0 || by_group.rbegin()->first != 7) {
+        skipped += slices.size();
+        continue;
+      }
+      bool same_bits = true;
+      for (auto &[g, t] : by_group) same_bits = same_bits && (*t).at("bits") == (*by_group.begin()->second).at("bits");
+      if (!same_bits) { skipped += slices.size(); continue; }   // one launch runs them all at one width
+      for (auto &[g, t] : by_group) load_record(woa + ".slice." + std::to_string(g), *t);   // consecutive entries
+      freed += it->second.data.bytes;
+      it->second.data.release();
+      it->second.dtype = "EXL3";
+      if (auto sc = weights.find(woa + ".scale"); sc != weights.end()) { freed += sc->second.data.bytes; sc->second.data.release(); }
+      dense_woa.insert(woa.substr(0, woa.size() - 5));   // "layers.L.attn"
+    }
+    if (table.empty()) {
+      std::cerr << "DS41_SERO_DENSE: none of the " << meta.at("tensors").size() << " tensors matched; native FP8 kept\n";
+      return;
+    }
+    dense_table.resize(table.size() * sizeof(ds41::DeviceExpert));
+    CK(cudaMemcpy(dense_table.p, table.data(), table.size() * sizeof(ds41::DeviceExpert), cudaMemcpyHostToDevice));
+    dense_extra_gib = freed > used ? double(freed - used) / double(size_t(1) << 30) : 0;
+    std::cerr << "Sero dense EXL3 (" << meta.at("source").get<std::string>() << "): " << table.size() << " tensors, "
+              << used / 1e9 << " GB in place of " << freed / 1e9 << " GB of FP8 (" << skipped << " left native):";
+    for (const auto &[kind, count] : kinds) std::cerr << " " << kind << " x" << count;
+    std::cerr << "; " << dense_extra_gib << " GiB more expert slots\n";
+  }
+  const DenseExl3 *dense_of(const std::string &prefix) const {
+    if (dense_exl3.empty()) return nullptr;
+    auto it = dense_exl3.find(prefix);
+    return it == dense_exl3.end() ? nullptr : &it->second;
+  }
+  // y[m, n] = x[m, k] W^T through Sero's EXL3 tensor: the decode kernel up to 8 rows a launch (4 for k = 8192), the
+  // prefill kernel above that, 256 rows a launch. Inputs and outputs BF16, as the FP8 path's.
+  bool dense_linear(const std::string &prefix, const void *in, void *out, int m, int xs = 0, int os = 0) {
+    const DenseExl3 *d = dense_of(prefix);
+    if (!d) return false;
+    if (!xs) xs = d->k;
+    if (!os) os = d->n;
+    const auto *table = static_cast<const ds41::DeviceExpert *>(dense_table.p);
+    const int cap = m <= 8 ? (d->k > 5120 ? 4 : 8) : 256;
+    for (int r = 0; r < m; r += cap) {
+      ds41::GemmJob job{ds41::ExpertId(d->index), std::min(cap, m - r),
+                        static_cast<const uint8_t *>(in) + size_t(r) * xs * 2, nullptr,
+                        static_cast<__nv_bfloat16 *>(out) + size_t(r) * os};
+      if (m <= 8) CK(ds41::exl3_dense(table, job, d->n, d->k, d->bits, stream, xs, os));
+      else CK(ds41::exl3_dense_prefill(table, job, d->n, d->k, d->bits, stream, xs, os));
+    }
+    dense_since_quant = true;
+    return true;
+  }
+  // wo[m, 8192] = wo_a(o[m, 32768]) through Sero's eight slices: false when this layer keeps the native wo_a
+  bool dense_wo_a(const std::string &attn, const void *o, void *wo, int m) {
+    if (dense_woa.empty() || !dense_woa.count(attn)) return false;
+    if (m <= 8) {   // decode: the eight slices (consecutive table entries) in one launch
+      const DenseExl3 *d = dense_of(attn + ".wo_a.slice.0");
+      ds41::GemmJob job{ds41::ExpertId(d->index), m, static_cast<const uint8_t *>(o), nullptr,
+                        static_cast<__nv_bfloat16 *>(wo)};
+      CK(ds41::exl3_dense(static_cast<const ds41::DeviceExpert *>(dense_table.p), job, 1024, 4096, d->bits, stream,
+                          32768, 8192, 8, 4096, 1024));
+      dense_since_quant = true;
+      return true;
+    }
+    for (int g = 0; g < 8; ++g)
+      dense_linear(attn + ".wo_a.slice." + std::to_string(g), static_cast<const __nv_bfloat16 *>(o) + size_t(g) * 4096,
+                   static_cast<__nv_bfloat16 *>(wo) + size_t(g) * 1024, m, 32768, 8192);
+    return true;
+  }
   void linear(const std::string &prefix, const void *in, void *out, int n,
               int k) {
+    if (dense_linear(prefix, in, out, 1)) return;   // s0ma change 34
     auto &weight = w(prefix + ".weight");
     if (weight.shape != std::vector<uint64_t>({uint64_t(n), uint64_t(k)}))
       throw std::runtime_error("linear shape: " + prefix);
@@ -1802,8 +1988,9 @@ private:
     apply_rope(o, 64, 512, l, pos, true);
     CK(ds41_attn_roundtrip(o.p, 1, 32768, DS41_SWA_FP8, stream));
     graph(p + ".output", [&] {
-      CK(ds41_dense_cublas(blas, o.p, woa_weight(p + ".wo_a"), wo.p, 1,
-                           1024, 4096, 0, 8, stream));
+      if (!dense_wo_a(p, o.p, wo.p, 1))   // s0ma change 34: Sero's wo_a slices when loaded
+        CK(ds41_dense_cublas(blas, o.p, woa_weight(p + ".wo_a"), wo.p, 1,
+                             1024, 4096, 0, 8, stream));
       linear(p + ".wo_b", wo.p, y.p, H, 8192);
     });
   }
@@ -2063,6 +2250,7 @@ private:
       extra_gib = std::strtod(x, &end);
       if (*end || !(extra_gib >= 0) || extra_gib > 64) throw std::invalid_argument("DS41_EXPERT_EXTRA_GIB: 0..64 GiB");
     }
+    extra_gib += dense_extra_gib;   // s0ma change 34: the VRAM Sero's dense tensors gave back
     const char *cw_env = std::getenv("DS41_CLASS_WEIGHTS");
     if ((cw_env && *cw_env) || extra_gib > 0) {
       const char *cw = cw_env && *cw_env ? cw_env : "";

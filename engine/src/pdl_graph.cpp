@@ -100,15 +100,27 @@ extern "C" int ds41_pdl_mode() {
   return mode;
 }
 
-// Rewrites graph's eligible kernel->kernel edges in place; *edges gets their number. Returns a CUDA error code.
-extern "C" int ds41_pdl_rewrite(cudaGraph_t graph, int mode, size_t *edges) {
+// Rewrites graph's eligible kernel->kernel edges in place; *edges gets their number. Returns a CUDA error code and
+// names the failing step in *step. Captured graphs can already hold programmatic edges (cuBLAS launches some of its
+// kernels with PDL), and a count-only query of such a graph is refused as lossy (cudaErrorLossyQuery): the edges are
+// read with their data into arrays grown until they hold all of them.
+extern "C" int ds41_pdl_rewrite(cudaGraph_t graph, int mode, size_t *edges, const char **step) {
   *edges = 0;
+  *step = "reading the edges";
+  std::vector<cudaGraphNode_t> from, to;
+  std::vector<cudaGraphEdgeData> data;
   size_t n = 0;
-  cudaError_t rc = cudaGraphGetEdges(graph, nullptr, nullptr, nullptr, &n);
-  if (rc != cudaSuccess || !n) return rc;
-  std::vector<cudaGraphNode_t> from(n), to(n);
-  std::vector<cudaGraphEdgeData> data(n);
-  if ((rc = cudaGraphGetEdges(graph, from.data(), to.data(), data.data(), &n)) != cudaSuccess) return rc;
+  cudaError_t rc = cudaSuccess;
+  for (size_t cap = 1024;; cap *= 4) {
+    from.assign(cap, nullptr);
+    to.assign(cap, nullptr);
+    data.assign(cap, cudaGraphEdgeData{});
+    n = cap;
+    if ((rc = cudaGraphGetEdges(graph, from.data(), to.data(), data.data(), &n)) != cudaSuccess) return rc;
+    if (n < cap) break;
+    if (cap > (size_t(1) << 22)) return cudaErrorInvalidValue;
+  }
+  *step = "choosing the edges";
   std::vector<cudaGraphNode_t> f, t;
   std::vector<cudaGraphEdgeData> old, now;
   for (size_t i = 0; i < n; ++i) {
@@ -123,8 +135,21 @@ extern "C" int ds41_pdl_rewrite(cudaGraph_t graph, int mode, size_t *edges) {
     now.push_back(e);
   }
   if (f.empty()) return cudaSuccess;
+  *step = "removing the captured edges";
   if ((rc = cudaGraphRemoveDependencies(graph, f.data(), t.data(), old.data(), f.size())) != cudaSuccess) return rc;
+  *step = "adding the programmatic edges";
   if ((rc = cudaGraphAddDependencies(graph, f.data(), t.data(), now.data(), f.size())) != cudaSuccess) return rc;
   *edges = f.size();
+  *step = "";
   return cudaSuccess;
+}
+
+// The kernel name of a graph node, for a refusal's message ("" if it is not a kernel node).
+extern "C" const char *ds41_pdl_node_name(cudaGraphNode_t node) {
+  if (!node || !kernel(node)) return "";
+  CUDA_KERNEL_NODE_PARAMS p{};
+  if (cuGraphKernelNodeGetParams(reinterpret_cast<CUgraphNode>(node), &p) != CUDA_SUCCESS) return "";
+  const char *name = nullptr;
+  if ((p.func ? cuFuncGetName(&name, p.func) : cuKernelGetName(&name, p.kern)) != CUDA_SUCCESS || !name) return "";
+  return name;
 }

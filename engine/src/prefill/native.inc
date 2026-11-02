@@ -223,7 +223,8 @@ void pattention(int l,int64_t pos,bool output_projection=true) {
   else CK(ds41_attn_sparse(q.p,gather.p,w(p+".attn_sink").data.as<float>(),local_idx.as<int32_t>(),o.p,1,width+k,16,stream));
   apply_rope(o,64,512,l,pos,true);CK(ds41_attn_roundtrip(o.p,1,32768,DS41_SWA_FP8,stream));
   if(!output_projection)return;
-  CK(ds41_dense_cublas(blas,o.p,woa_weight(p+".wo_a"),wo.p,1,1024,4096,0,8,stream));
+  if(!dense_wo_a(p,o.p,wo.p,1))   // s0ma change 34: Sero's wo_a slices when loaded
+    CK(ds41_dense_cublas(blas,o.p,woa_weight(p+".wo_a"),wo.p,1,1024,4096,0,8,stream));
   linear(p+".wo_b",wo.p,y.p,H,8192);
 }
 Json pmoe(int l,ds41e::prefill::Span span) {

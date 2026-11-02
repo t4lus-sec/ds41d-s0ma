@@ -79,6 +79,9 @@ struct OffloadStore::Impl {
     size_t lend_first=0,lend_n=0,lend_per=0,lend_cbytes=0,lend_chunk_bytes=0;
     std::vector<uint8_t*> lend_base;
     LendInfo lend_counters;
+    std::mutex miss_m;                           // s0ma change 56
+    std::vector<ExpertId> miss_log;
+    std::atomic<bool> miss_on{false};
     bool lendable(size_t slot)const{return lend_n && slot>=lend_first && slot<lend_first+lend_n;}
     uint8_t* sptr(size_t slot)const{
         if(lendable(slot)){const size_t i=slot-lend_first;return lend_base[i/lend_per]+(i%lend_per)*lend_cbytes;}
@@ -446,7 +449,8 @@ struct OffloadStore::Impl {
                 ck(cudaMemcpyAsync(table+a.id,views+a.id,sizeof(DeviceExpert),cudaMemcpyHostToDevice,mapping));
                 ck(cudaEventRecord(slot_mapping[a.slot],mapping));
                 auto h=host.find(a.id);
-                if(h==host.end()){disk.push_back(a);if(!is_prefetch){++counters.nvme_misses;++layer.nvme_misses;++counters.ram.misses;++counters.class_nvme_misses[kc];}}
+                if(h==host.end()){disk.push_back(a);if(!is_prefetch){++counters.nvme_misses;++layer.nvme_misses;++counters.ram.misses;++counters.class_nvme_misses[kc];
+                    if(miss_on.load(std::memory_order_relaxed)){std::lock_guard<std::mutex> l(miss_m);miss_log.push_back(a.id);}}}
                 else if(!is_prefetch){++counters.host_hits;++layer.host_hits;++counters.ram.hits;host_prefetched.erase(a.id);++counters.class_host_hits[kc];}
                 if(is_prefetch)prefetched.insert(a.id);
             }
@@ -928,6 +932,8 @@ void OffloadStore::place(const Placement& input) {
     // s0ma change 51: the lendable slots join the pool once the pins are placed
     impl_->submit([this]{for(size_t j=0;j<impl_->lend_n;++j)impl_->pool.set_lent(impl_->lend_first+j,false);}).get();
 }
+void OffloadStore::log_nvme_misses(bool on){impl_->miss_on.store(on);}
+std::vector<ExpertId> OffloadStore::take_nvme_misses(){std::vector<ExpertId> out;std::lock_guard<std::mutex> l(impl_->miss_m);out.swap(impl_->miss_log);return out;}
 size_t OffloadStore::lend(size_t chunks){check_error();return impl_->submit([this,chunks]{return impl_->lend(chunks);}).get();}
 size_t OffloadStore::reclaim(size_t margin){check_error();return impl_->submit([this,margin]{return impl_->reclaim(margin);}).get();}
 OffloadStore::LendInfo OffloadStore::lend_info(){return impl_->submit([this]{auto x=impl_->lend_counters;x.lent=0;

@@ -119,6 +119,10 @@ public:
     // Allocate lent chunks again, empty, while cudaMemGetInfo leaves at least margin_bytes free; returns how many.
     size_t reclaim(size_t margin_bytes);
     LendInfo lend_info();
+    // s0ma change 56: a log of decode's NVMe misses (demand loads only), for measurements; off until switched on.
+    // take_nvme_misses() returns the ids logged since the last call. Thread-safe; no store round trip.
+    void log_nvme_misses(bool on);
+    std::vector<ExpertId> take_nvme_misses();
     void report_error(std::exception_ptr error) noexcept;
     void check_error();
     // bit 0: VRAM, bit 1: RAM. Advisory only; admission rechecks on the worker.

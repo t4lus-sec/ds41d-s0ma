@@ -111,6 +111,7 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
     }
     auto lookup=config.prefill_host_view;
     auto lease=std::make_shared<ds41::OffloadStore::HostLease>(experts->borrow_host(misses));
+    if(!prompt_bits.empty())for(const auto &v:lease->views)if(!v.data&&v.id<15360)prompt_bits[v.id]|=1;   // s0ma change 56
     if(!lookup)lookup=[lease](uint32_t id){
       for(const auto &v:lease->views)if(v.id==id&&v.data)
         return ds41e::prefill::HostView{v.data,v.record.bytes,lease};
@@ -243,6 +244,8 @@ Json pmoe(int l,ds41e::prefill::Span span) {
   CK(cudaMemcpyAsync(ids,pf.ids.as<char>(base*6*4),count*6*4,cudaMemcpyDeviceToHost,stream));
   CK(cudaStreamSynchronize(stream));
   double boundary=clock_ms()-host_start;
+  if(!prompt_bits.empty()&&pf.warm)   // s0ma change 56: the prompt's last 256 rows
+    for(size_t r=0;r<count;++r)if(base+r+256>=pf.rows)for(int j=0;j<6;++j)prompt_bits[ds41::expert_id(l,ids[r*6+j])]|=2;
   if(config.prefill_warm_rows && pf.warm && pf.rows>=config.prefill_warm_rows && base+count+config.prefill_warm_rows>pf.rows)
     for(size_t r=count-std::min(count,base+count+config.prefill_warm_rows-pf.rows);r<count;++r)
       for(int j=0;j<6;++j)++prefill_warm_counts[ds41::expert_id(l,ids[r*6+j])];
@@ -444,9 +447,50 @@ void tier_census() {
            <<both_b/double(1ull<<30)<<" GiB); demotions "<<st.demotions<<", victims already in RAM "<<st.demote_resident
            <<", RAM evictions "<<st.ram.evictions<<"\n";
 }
+// s0ma change 56: decode's NVMe misses after a prompt against what that prompt read from the SSD and what its last
+// 256 rows routed. A miss counted under "prompt read" is one the prompt's sweep had already brought through host
+// memory; under "last 256 rows" one its tail routed. An upper bound on what admitting them into RAM could save.
+void overlap_drain(bool step) {
+  if(!overlap_on||!experts||prompt_bits.empty())return;
+  const bool first=steps_after_prompt<32;
+  for(auto id:experts->take_nvme_misses()) {
+    if(id>=15360)continue;
+    const uint8_t b=prompt_bits[id];
+    for(auto *o:{&req_all,&after_all}){++o->n;o->disk+=b&1;o->tail+=(b>>1)&1;o->both+=(b&3)==3;}
+    if(first)for(auto *o:{&req_first,&after_first}){++o->n;o->disk+=b&1;o->tail+=(b>>1)&1;o->both+=(b&3)==3;}
+  }
+  if(step)++steps_after_prompt;
+}
+void overlap_report() {
+  if(!overlap_on||prompt_bits.empty())return;
+  overlap_drain(false);
+  size_t disk=0,tail=0,both=0;double disk_b=0,both_b=0;
+  for(size_t id=0;id<prompt_bits.size();++id){
+    const double b=width_of.empty()?double(expert_slot_bytes):double(exl3_rec_of(width_of[id]));
+    if(prompt_bits[id]&1){++disk;disk_b+=b;}
+    if(prompt_bits[id]&2)++tail;
+    if((prompt_bits[id]&3)==3){++both;both_b+=b;}
+  }
+  ++overlap_requests;
+  auto line=[](const char* name,const Overlap& a,const Overlap& f){
+    std::cerr<<name<<": decode NVMe misses "<<a.n<<" (first 32 steps "<<f.n<<"); the prompt had read from the SSD "<<a.disk
+             <<" ("<<f.disk<<"); its last 256 rows routed "<<a.tail<<" ("<<f.tail<<"); both "<<a.both<<" ("<<f.both<<")";
+  };
+  line("after prompt",req_all,req_first);
+  std::cerr<<std::fixed<<std::setprecision(1)<<". The prompt: "<<disk<<" experts from the SSD ("<<disk_b/double(1ull<<30)<<" GiB), its last 256 rows "
+           <<tail<<" routed, "<<both<<" of them from the SSD ("<<both_b/double(1ull<<30)<<" GiB)\n"<<std::defaultfloat<<std::setprecision(6);
+  line("after prompts, all",after_all,after_first);
+  std::cerr<<" ("<<overlap_requests<<" requests)\n";
+  req_all=req_first=Overlap{};
+}
 void begin_prompt(int64_t rows,bool append) override {
   (void)append;
   tier_census();
+  if(overlap_on&&experts) {   // s0ma change 56: close the previous request's count, open this prompt's
+    overlap_report();
+    if(prompt_bits.empty())experts->log_nvme_misses(true);
+    prompt_bits.assign(15360,0);steps_after_prompt=0;
+  }
   if(!lend_chunks_total||poisoned)return;
   lend_prompt=true;++lend_prompts;lend_retry=0;
   const double t0=clock_ms();

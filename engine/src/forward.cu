@@ -262,6 +262,12 @@ class Native final : public Forward, public hotpath::GateEvidence {
   bool lend_prompt = false;
   uint64_t lend_prompts = 0, lend_retry = 0;
   double lend_begin_ms = 0, lend_begin_max_ms = 0, lend_reclaim_ms = 0;   // s0ma change 52
+  // s0ma change 56: what the prompt read from the SSD (bit 0) and what its last 256 rows routed (bit 1), per target
+  // expert, and how decode's NVMe misses after it line up with them (DS41_PROMPT_OVERLAP=0 turns it off)
+  std::vector<uint8_t> prompt_bits;
+  struct Overlap { uint64_t n = 0, disk = 0, tail = 0, both = 0; } after_all, after_first, req_all, req_first;
+  uint64_t steps_after_prompt = 0, overlap_requests = 0;
+  bool overlap_on = [] { const char *v = std::getenv("DS41_PROMPT_OVERLAP"); return !(v && std::string(v) == "0"); }();
   std::set<std::string> dense_woa;                    // "layers.L.attn" whose wo_a runs as Sero's eight slices
   // s0ma change 47 (H1): the step's tier snapshot, each row's private cost so far, the cut counters
   std::vector<uint8_t> h1_snap;
@@ -1128,6 +1134,7 @@ public:
     if (poisoned)
       throw std::runtime_error("native forward/store poisoned; restart ds41d");
     if (lent_chunks && !lend_prompt && (lend_retry++ % 64) == 0) lend_reclaim();   // s0ma change 51
+    if (!lend_prompt) overlap_drain(true);   // s0ma change 56: the previous step's NVMe misses
     {   // s0ma change 48: what the first decode step starts from (the first prompt's scratch freed, its buffers kept)
       static bool ledger_first = true;
       if (ledger_first) { ledger_first = false; vram_checkpoint("first_decode_step"); }

@@ -124,6 +124,8 @@ public:
     struct Move { ExpertId id; size_t from, to; int64_t evicted; };
     std::vector<Move> lend(const std::vector<size_t>& slots, std::vector<ExpertId>& dropped);
     void set_lent(size_t slot, bool lent);
+    // s0ma change 57: an admitted expert starts with at least this LFU count and counts as just used
+    void boost(ExpertId id, uint32_t count);
     bool lent(size_t slot) const { return slot < slots_.size() && slots_[slot].lent; }
     bool busy(size_t slot) const { return slot < slots_.size() && (slots_[slot].leases || slots_[slot].pinned || slots_[slot].draining ||
                                                                     slots_[slot].retention.use_count() > 1); }

@@ -1,6 +1,7 @@
 #include "ds41/prefill/stager.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <exception>
 #include <future>
 #include <map>
@@ -76,7 +77,7 @@ Stager::Stager(std::vector<ds41::Record> records,size_t slots):impl(new Impl(std
 Stager::~Stager()=default;
 size_t Stager::device_bytes() const noexcept{return impl->slots*impl->record_bytes;}
 TransferStats Stager::stream(const std::vector<ds41::ExpertId>& ids,cudaStream_t consumer,
-    const Ready& ready,const HostLookup& host,const std::function<void()>& before_disk) {
+    const Ready& ready,const HostLookup& host,const std::function<void()>& before_disk,const Keep& keep) {
  auto &p=*impl;if(p.poison)std::rethrow_exception(p.poison);
  if(!consumer||!ready)throw std::invalid_argument("stager consumer/callback");
  // A later sweep may reuse a logical table entry in a different slot.
@@ -117,6 +118,8 @@ TransferStats Stager::stream(const std::vector<ds41::ExpertId>& ids,cudaStream_t
    p.reader.stream(disk,ring,[&](size_t i,size_t buffer){
     p.upload(disk[i]->id,ring[buffer],ram_slots+buffer,p.disk,consumer,ready,*begins[ram.size()+i],*ends[ram.size()+i]);
     ck(cudaEventRecord(p.dma_done[buffer]->e,p.disk));
+    if(keep)if(void* d=keep(disk[i]->id)){   // s0ma change 57: beside the DMA, before the slot is recycled
+     double t=ms();std::memcpy(d,ring[buffer],disk[i]->bytes);stats.keep_ms+=ms()-t;++stats.kept;}
    },[&](size_t buffer){ck(cudaEventSynchronize(p.dma_done[buffer]->e));});
    ck(cudaStreamSynchronize(p.disk));
    stats.nvme_service_host_ms=ms()-io_start;

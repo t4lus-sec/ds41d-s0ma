@@ -117,8 +117,32 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
         return ds41e::prefill::HostView{v.data,v.record.bytes,lease};
       return ds41e::prefill::HostView{};
     };
-    try{prefill_transfers=prefill_stage->stream(misses,stream,consume,lookup,[&]{p_engram_barrier();});}
+    // s0ma change 57: of this layer's drive reads, those the prompt's last 256 rows routed (most routed first) go into
+    // the RAM tier as they pass, within this layer's share of what is left of the prompt's budget
+    ds41::OffloadStore::Admission adm;
+    std::unordered_map<ds41::ExpertId,void*> keep_at;
+    if(admit_budget>admit_used&&pref&&pref->warm&&!prompt_tail_count.empty()&&!ids.empty()&&ids.front()<15360) {
+      std::vector<std::pair<int,ds41::ExpertId>> rank;
+      for(const auto &v:lease->views)if(!v.data&&v.id<15360&&prompt_tail_count[v.id])rank.push_back({-int(prompt_tail_count[v.id]),v.id});
+      if(!rank.empty()) {
+        std::sort(rank.begin(),rank.end());
+        std::vector<ds41::ExpertId> want;std::vector<uint32_t> credit;
+        for(auto [c,id]:rank){want.push_back(id);credit.push_back(uint32_t(-c));}
+        const unsigned l=ds41::expert_layer(ids.front());
+        adm=experts->admit_begin(want,credit,(admit_budget-admit_used)/std::max(1u,40u-l));
+        for(size_t i=0;i<adm.ids.size();++i)keep_at[adm.ids[i]]=adm.dst[i];
+      }
+    }
+    ds41e::prefill::Stager::Keep keep;
+    if(!keep_at.empty())keep=[&keep_at](ds41::ExpertId id)->void*{auto it=keep_at.find(id);return it==keep_at.end()?nullptr:it->second;};
+    try{prefill_transfers=prefill_stage->stream(misses,stream,consume,lookup,[&]{p_engram_barrier();},keep);}
     catch(...){join();throw;}
+    if(adm.token) {
+      if(prefill_transfers.kept!=adm.ids.size())
+        throw std::logic_error("prompt admission: an admitted expert's bytes were not copied");
+      admit_used+=adm.bytes;admit_experts+=adm.ids.size();admit_bytes+=adm.bytes;admit_copy_ms+=prefill_transfers.keep_ms;
+      experts->admit_end(std::move(adm));
+    }
   }
   join();
 }
@@ -244,8 +268,10 @@ Json pmoe(int l,ds41e::prefill::Span span) {
   CK(cudaMemcpyAsync(ids,pf.ids.as<char>(base*6*4),count*6*4,cudaMemcpyDeviceToHost,stream));
   CK(cudaStreamSynchronize(stream));
   double boundary=clock_ms()-host_start;
-  if(!prompt_bits.empty()&&pf.warm)   // s0ma change 56: the prompt's last 256 rows
-    for(size_t r=0;r<count;++r)if(base+r+256>=pf.rows)for(int j=0;j<6;++j)prompt_bits[ds41::expert_id(l,ids[r*6+j])]|=2;
+  if(!prompt_bits.empty()&&pf.warm)   // s0ma change 56: the prompt's last 256 rows (change 57: and how often)
+    for(size_t r=0;r<count;++r)if(base+r+256>=pf.rows)for(int j=0;j<6;++j){
+      const auto e=ds41::expert_id(l,ids[r*6+j]);prompt_bits[e]|=2;
+      if(!prompt_tail_count.empty()&&prompt_tail_count[e]<65535)++prompt_tail_count[e];}
   if(config.prefill_warm_rows && pf.warm && pf.rows>=config.prefill_warm_rows && base+count+config.prefill_warm_rows>pf.rows)
     for(size_t r=count-std::min(count,base+count+config.prefill_warm_rows-pf.rows);r<count;++r)
       for(int j=0;j<6;++j)++prefill_warm_counts[ds41::expert_id(l,ids[r*6+j])];
@@ -481,6 +507,10 @@ void overlap_report() {
            <<tail<<" routed, "<<both<<" of them from the SSD ("<<both_b/double(1ull<<30)<<" GiB)\n"<<std::defaultfloat<<std::setprecision(6);
   line("after prompts, all",after_all,after_first);
   std::cerr<<" ("<<overlap_requests<<" requests)\n";
+  if(admit_budget)std::cerr<<std::fixed<<std::setprecision(1)<<"prompt admission: "<<admit_experts<<" experts ("
+                           <<admit_bytes/double(1ull<<30)<<" GiB) copied into RAM from the prompts' drive reads, "
+                           <<admit_copy_ms<<" ms of copying on the reader thread ("<<admit_budget/double(1ull<<30)
+                           <<" GiB a prompt at most)\n"<<std::defaultfloat<<std::setprecision(6);
   req_all=req_first=Overlap{};
 }
 void begin_prompt(int64_t rows,bool append) override {
@@ -490,6 +520,8 @@ void begin_prompt(int64_t rows,bool append) override {
     overlap_report();
     if(prompt_bits.empty())experts->log_nvme_misses(true);
     prompt_bits.assign(15360,0);steps_after_prompt=0;
+    if(admit_budget)prompt_tail_count.assign(15360,0);
+    admit_used=0;
   }
   if(!lend_chunks_total||poisoned)return;
   lend_prompt=true;++lend_prompts;lend_retry=0;
@@ -706,7 +738,12 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
       CK(cudaStreamSynchronize(stream));
     }
     mark("head");
-    if(!residency_before.empty()&&p_residency(*experts)!=residency_before)
+    // s0ma change 57: a prompt that admitted experts into RAM changed RAM membership on purpose; VRAM's must still hold
+    if(!residency_before.empty()&&admit_used) {
+      const auto after=p_residency(*experts);
+      for(size_t i=0;i<after.size()&&i<residency_before.size();++i)
+        if((after[i]&1)!=(residency_before[i]&1))throw std::runtime_error("prefill changed decode VRAM membership");
+    } else if(!residency_before.empty()&&p_residency(*experts)!=residency_before)
       throw std::runtime_error("prefill changed decode tier membership; quiesce competing admissions");
     prefix.commit(input,input.size());
     committed=pf.end;

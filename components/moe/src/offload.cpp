@@ -82,6 +82,8 @@ struct OffloadStore::Impl {
     std::mutex miss_m;                           // s0ma change 56
     std::vector<ExpertId> miss_log;
     std::atomic<bool> miss_on{false};
+    std::map<uint64_t,std::vector<SlotPool::Allocation>> admitting;   // s0ma change 57: held RAM slots
+    uint64_t admit_serial=0;
     bool lendable(size_t slot)const{return lend_n && slot>=lend_first && slot<lend_first+lend_n;}
     uint8_t* sptr(size_t slot)const{
         if(lendable(slot)){const size_t i=slot-lend_first;return lend_base[i/lend_per]+(i%lend_per)*lend_cbytes;}
@@ -931,6 +933,35 @@ void OffloadStore::place(const Placement& input) {
     pin_vram(p.vram_pins);
     // s0ma change 51: the lendable slots join the pool once the pins are placed
     impl_->submit([this]{for(size_t j=0;j<impl_->lend_n;++j)impl_->pool.set_lent(impl_->lend_first+j,false);}).get();
+}
+OffloadStore::Admission OffloadStore::admit_begin(const std::vector<ExpertId>& ids,const std::vector<uint32_t>& credit,size_t budget){
+    if(credit.size()!=ids.size())throw std::invalid_argument("admit_begin: a credit for each id");
+    check_error();
+    return impl_->submit([this,ids,credit,budget]{
+        auto& I=*impl_;Admission a;
+        if(!I.cfg.dynamic_host||!I.host_pool)return a;
+        std::vector<SlotPool::Allocation> held;
+        for(size_t j=0;j<ids.size();++j){
+            const auto id=ids[j];const auto& r=I.records.at(id);
+            if(I.host.count(id)||I.pool.residency(id)>=0)continue;
+            if(a.bytes+r.bytes>budget)break;
+            const int slot=I.admit_host(id,true,&held);
+            if(slot<0)break;
+            I.host_pool->boost(id,credit[j]);
+            a.ids.push_back(id);a.dst.push_back(static_cast<char*>(I.host_arena->data())+I.hoff(size_t(slot)));a.bytes+=r.bytes;
+            I.counters.refill_bytes+=r.bytes;
+        }
+        a.token=++I.admit_serial;I.admitting.emplace(a.token,std::move(held));
+        return a;
+    }).get();
+}
+void OffloadStore::admit_end(Admission a){
+    impl_->submit([this,token=a.token]{
+        auto it=impl_->admitting.find(token);
+        if(it==impl_->admitting.end())throw std::logic_error("admit_end: unknown admission");
+        if(!it->second.empty())impl_->host_pool->release(it->second);
+        impl_->admitting.erase(it);
+    }).get();
 }
 void OffloadStore::log_nvme_misses(bool on){impl_->miss_on.store(on);}
 std::vector<ExpertId> OffloadStore::take_nvme_misses(){std::vector<ExpertId> out;std::lock_guard<std::mutex> l(impl_->miss_m);out.swap(impl_->miss_log);return out;}

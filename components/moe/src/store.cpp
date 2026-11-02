@@ -200,6 +200,11 @@ void SlotPool::drained(size_t slot) {
     slots_[slot].draining=false;
 }
 void SlotPool::exclusive(bool enabled) { exclusive_=enabled;dirty_.fill(true); }
+void SlotPool::boost(ExpertId id,uint32_t count) {
+    if(id>=expert_count)throw std::out_of_range("expert id");
+    const auto l=layer_of(id);
+    frequency_[id]=std::max(frequency_[id],count);last_use_[id]=layer_clocks_[l];dirty_[l]=true;
+}
 void SlotPool::set_lent(size_t slot,bool lent) {
     if(slot>=slots_.size())throw std::out_of_range("slot");
     auto& s=slots_[slot];

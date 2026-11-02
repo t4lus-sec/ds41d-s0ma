@@ -268,6 +268,20 @@ class Native final : public Forward, public hotpath::GateEvidence {
   struct Overlap { uint64_t n = 0, disk = 0, tail = 0, both = 0; } after_all, after_first, req_all, req_first;
   uint64_t steps_after_prompt = 0, overlap_requests = 0;
   bool overlap_on = [] { const char *v = std::getenv("DS41_PROMPT_OVERLAP"); return !(v && std::string(v) == "0"); }();
+  // s0ma change 57: DS41_PROMPT_ADMIT_GIB=N copies up to N GiB a prompt of the experts its last 256 rows routed and its
+  // sweep read from the drive into the RAM tier, as they pass through the stager's pinned ring (no extra reads)
+  std::vector<uint16_t> prompt_tail_count;
+  size_t admit_budget = [] {
+    const char *v = std::getenv("DS41_PROMPT_ADMIT_GIB");
+    if (!v || !*v) return size_t(0);
+    char *end = nullptr;
+    const double g = std::strtod(v, &end);
+    if (*end || !(g >= 0) || g > 64) throw std::invalid_argument("DS41_PROMPT_ADMIT_GIB: 0..64");
+    return size_t(g * double(1ull << 30));
+  }();
+  size_t admit_used = 0;
+  uint64_t admit_experts = 0, admit_bytes = 0;
+  double admit_copy_ms = 0;
   std::set<std::string> dense_woa;                    // "layers.L.attn" whose wo_a runs as Sero's eight slices
   // s0ma change 47 (H1): the step's tier snapshot, each row's private cost so far, the cut counters
   std::vector<uint8_t> h1_snap;

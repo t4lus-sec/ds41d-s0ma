@@ -122,6 +122,13 @@ public:
     // s0ma change 56: a log of decode's NVMe misses (demand loads only), for measurements; off until switched on.
     // take_nvme_misses() returns the ids logged since the last call. Thread-safe; no store round trip.
     void log_nvme_misses(bool on);
+    // s0ma change 57: RAM-tier slots for experts a prompt is streaming from the drive anyway. admit_begin takes ids in
+    // priority order (each with an LFU credit), skips those already in VRAM or RAM, and reserves slots (the least
+    // valued RAM residents are evicted) until byte_budget or a blocked admission; dst[i] is where ids[i]'s record
+    // bytes go. They stay held, and must be written, before admit_end publishes them.
+    struct Admission { uint64_t token = 0; std::vector<ExpertId> ids; std::vector<void*> dst; size_t bytes = 0; };
+    Admission admit_begin(const std::vector<ExpertId>& ids, const std::vector<uint32_t>& credit, size_t byte_budget);
+    void admit_end(Admission admission);
     std::vector<ExpertId> take_nvme_misses();
     void report_error(std::exception_ptr error) noexcept;
     void check_error();

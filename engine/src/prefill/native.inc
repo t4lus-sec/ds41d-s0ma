@@ -17,8 +17,9 @@ struct PrefillData {
   std::array<std::vector<int64_t>,2> rowids;
   // 1 for rows inside an image span: no Engram contribution, n-grams stop at them, vision routing bias.
   std::vector<uint8_t> image;
-  std::unique_ptr<ds41::HostBuffer> route_host;
-  std::unique_ptr<ds41::HostBuffer> descriptors;
+  // s0ma change 55: both point into pinned buffers the engine keeps between prompts (prefill_pinned)
+  ds41::HostBuffer* route_host=nullptr;
+  ds41::HostBuffer* descriptors=nullptr;
   Json layers=Json::array();
   std::array<std::unique_ptr<EngramAsync::Ticket>,2> engram;
   std::array<const char*,2> engram_raw{};
@@ -48,7 +49,6 @@ struct PrefillData {
     ids.resize(n*6*4);weights.resize(n*6*4);
     quant.resize(n*H);scales.resize(n*H/32);routed.resize(n*6*H*2);
     capture.resize(std::min<size_t>(128,n)*3*H*2);
-    route_host=std::make_unique<ds41::HostBuffer>(n*6*4,true);
   }
 };
 
@@ -227,6 +227,15 @@ void pattention(int l,int64_t pos,bool output_projection=true) {
     CK(ds41_dense_cublas(blas,o.p,woa_weight(p+".wo_a"),wo.p,1,1024,4096,0,8,stream));
   linear(p+".wo_b",wo.p,y.p,H,8192);
 }
+// s0ma change 55: the prompt's pinned host scratch, kept and grown instead of allocated per prompt and per layer. Each
+// HostBuffer is a 2 MiB-aligned MADV_HUGEPAGE mapping, faulted in and cudaHostRegister'ed: 41 of them a prompt,
+// each a huge-page fault that compacts memory under pressure (a 48 GiB tier: 5,906 compaction stalls, 99% failed).
+// Callers reach these only after the stream has finished with the previous contents.
+std::unique_ptr<ds41::HostBuffer> prefill_route_buf,prefill_desc_buf;
+ds41::HostBuffer* prefill_pinned(std::unique_ptr<ds41::HostBuffer>& b,size_t n) {
+  if(!b||b->size()<n)b=std::make_unique<ds41::HostBuffer>(std::max(n+n/2,size_t(2)<<20),true);
+  return b.get();
+}
 Json pmoe(int l,ds41e::prefill::Span span) {
   auto &pf=*pref;size_t base=size_t(span.begin-pf.begin),count=size_t(span.size());
   auto* ids=static_cast<int32_t*>(pf.route_host->data());
@@ -246,7 +255,7 @@ Json pmoe(int l,ds41e::prefill::Span span) {
   }
   const size_t variants=exl3?size_t(prefill_lanes()):1;   // s0ma change 27: each lane's jobs point at its own scratch
   size_t descriptor_bytes=(variants*chunks*3*sizeof(ds41::GemmJob)+63)&~size_t(63);
-  pf.descriptors=std::make_unique<ds41::HostBuffer>(descriptor_bytes+count*6*4,true);
+  pf.descriptors=prefill_pinned(prefill_desc_buf,descriptor_bytes+count*6*4);
   auto* cpu_jobs=static_cast<ds41::GemmJob*>(pf.descriptors->data());
   auto* gpu_jobs=static_cast<ds41::GemmJob*>(pf.descriptors->device_data());
   auto* cpu_slots=reinterpret_cast<int32_t*>(static_cast<char*>(pf.descriptors->data())+descriptor_bytes);
@@ -517,6 +526,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
   pref=std::make_unique<PrefillData>(input.size(),committed,options.mode==PrefillMode::Cold,
       options.logits_tail,config.prefill_budget_bytes);
   auto &pf=*pref;pf.dense_batch=int(options.dense_batch_rows);pf.warm=options.warm;pf.image=std::move(image_rows);
+  pf.route_host=prefill_pinned(prefill_route_buf,input.size()*6*4);
   prefill_chunk.reset();
   if(config.prefill_chunk_rows) {
     // Optional scratch: allocated only beside the live decode cache, otherwise the M1 path runs.
@@ -679,7 +689,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
                <<lend_chunks_total<<" chunks, ms:";
       double at=begin_ms;
       for(auto &[name,t]:phase_marks){std::cerr<<" "<<name<<" "<<std::fixed<<std::setprecision(1)<<t-at;at=t;}
-      std::cerr<<std::defaultfloat<<"\n";
+      std::cerr<<std::defaultfloat<<std::setprecision(6)<<"\n";
     }
     prefill_summary={{"mode",options.mode==PrefillMode::Cold?"cold-full-N-M1-dense-candidate":"append-decode-layout"},
         {"rows",input.size()},{"chunk_rows",options.chunk_rows},{"dense_batch_rows",options.dense_batch_rows},{"batched_chunk_rows",chunk_rows},{"cache_reused_tokens",result.begin_position},

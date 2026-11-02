@@ -101,6 +101,8 @@ extern "C" int ds41_pdl_mode() {
   return mode;
 }
 
+#define DS41_PDL_SKIPPED (-100)
+extern "C" const char *ds41_pdl_node_name(cudaGraphNode_t node);
 // Rewrites graph's eligible kernel->kernel edges in place; *edges gets their number. Returns a CUDA error code and
 // names the failing step in *step. Captured graphs can already hold programmatic edges (cuBLAS launches some of its
 // kernels with PDL), and a count-only query of such a graph is refused as lossy (cudaErrorLossyQuery): the edges are
@@ -120,6 +122,36 @@ extern "C" int ds41_pdl_rewrite(cudaGraph_t graph, int mode, size_t *edges, cons
     if ((rc = cudaGraphGetEdges(graph, from.data(), to.data(), data.data(), &n)) != cudaSuccess) return rc;
     if (n < cap) break;
     if (cap > (size_t(1) << 22)) return cudaErrorInvalidValue;
+  }
+  // s0ma change 38: a graph that holds memory allocation or free nodes can be neither cloned nor have dependencies
+  // removed. Leave it as captured (DS41_PDL_SKIPPED) and name the kernels next to those nodes, to find who allocates.
+  {
+    static thread_local std::string note;
+    note.clear();
+    std::vector<std::string> near;
+    auto type_of = [](cudaGraphNode_t node) { cudaGraphNodeType t{}; cudaGraphNodeGetType(node, &t); return t; };
+    for (size_t i = 0; i < n; ++i) {
+      const auto a = type_of(from[i]), b = type_of(to[i]);
+      if (a == cudaGraphNodeTypeMemAlloc && b == cudaGraphNodeTypeKernel) near.push_back(std::string("alloc->") + ds41_pdl_node_name(to[i]));
+      if (b == cudaGraphNodeTypeMemFree && a == cudaGraphNodeTypeKernel) near.push_back(std::string(ds41_pdl_node_name(from[i])) + "->free");
+    }
+    bool alloc = !near.empty();
+    if (!alloc) {
+      size_t count = 0;
+      if (cudaGraphGetNodes(graph, nullptr, &count) == cudaSuccess) {
+        std::vector<cudaGraphNode_t> nodes(count);
+        if (count && cudaGraphGetNodes(graph, nodes.data(), &count) == cudaSuccess)
+          for (auto node : nodes) {
+            const auto t = type_of(node);
+            alloc = alloc || t == cudaGraphNodeTypeMemAlloc || t == cudaGraphNodeTypeMemFree;
+          }
+      }
+    }
+    if (alloc) {
+      for (size_t i = 0; i < near.size() && i < 6; ++i) note += (i ? "; " : "") + near[i];
+      *step = note.empty() ? "memory allocation nodes" : note.c_str();
+      return DS41_PDL_SKIPPED;
+    }
   }
   *step = "choosing the edges";
   std::vector<cudaGraphNode_t> f, t;

@@ -299,7 +299,8 @@ class Native final : public Forward, public hotpath::GateEvidence {
       throw std::runtime_error("cublasSetWorkspace (DS41_PDL)");
   }
   bool pdl_off = false;
-  std::string pdl_error;
+  std::string pdl_error, pdl_alloc_note;   // s0ma change 38
+  uint64_t pdl_skipped = 0;
   uint64_t graph_evictions = 0, initial_evictions = 0;
   std::array<std::array<int,40>,6> attention_scan_bucket{};
   bool graph_ready = false;
@@ -1206,6 +1207,8 @@ public:
       j["pdl_edges"] = pdl_edges;
       j["pdl_refused"] = pdl_off;
       if (!pdl_error.empty()) j["pdl_error"] = pdl_error;
+      j["pdl_skipped"] = pdl_skipped;   // s0ma change 38: graphs with allocation nodes, left as captured
+      if (!pdl_alloc_note.empty()) j["pdl_alloc_note"] = pdl_alloc_note;
     }
     if (async_engram) {
       auto stats = async_engram->stats();
@@ -1415,8 +1418,16 @@ private:
       size_t edges = 0;
       const char *step = "";
       cudaGraphInstantiateParams ip{};
-      cudaError_t rc = cudaError_t(ds41_pdl_rewrite(recorded->graph, mode, &edges, &step));
-      if (rc == cudaSuccess) {
+      const int rewrite = ds41_pdl_rewrite(recorded->graph, mode, &edges, &step);
+      if (rewrite == -100) {   // s0ma change 38: allocation nodes: this graph runs as captured, the others go on
+        ++pdl_skipped;
+        if (pdl_alloc_note.empty()) {
+          pdl_alloc_note = std::string(key) + ": " + step;
+          std::cerr << "DS41_PDL: graph " << pdl_alloc_note << " (memory allocation nodes; left as captured)\n";
+        }
+      }
+      cudaError_t rc = rewrite == -100 ? cudaSuccess : cudaError_t(rewrite);
+      if (rc == cudaSuccess && rewrite != -100) {
         step = "instantiating";
         rc = cudaGraphInstantiateWithParams(&recorded->exec, recorded->graph, &ip);
       }
@@ -1432,8 +1443,10 @@ private:
                   << "); stopping (unset DS41_PDL to run without it)\n" << std::flush;
         throw std::runtime_error("DS41_PDL refused by the driver: " + pdl_error);
       }
-      pdl_edges += edges;
-      ++pdl_graphs;
+      if (rewrite != -100) {
+        pdl_edges += edges;
+        ++pdl_graphs;
+      }
     }
     if (!recorded->exec) CK(cudaGraphInstantiate(&recorded->exec, recorded->graph, 0));
     CK(cudaGraphLaunch(recorded->exec, stream));

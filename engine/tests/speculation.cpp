@@ -151,6 +151,16 @@ public:
     ++aborts; last_nonce_ = nonce_; live_ = false;
   }
 };
+// s0ma change 47 (H1): a target that cuts its verify after `keep` rows, as DS41_H1 does mid-forward
+class CutTarget : public Target {
+public:
+  size_t keep = 8;
+  std::vector<std::vector<float>> verify(const std::vector<int> &ids) override {
+    auto out = Target::verify(ids);
+    if (out.size() > keep) { out.resize(keep); pending.resize(keep); }
+    return out;
+  }
+};
 void seed(Target &t) {
   t.verify({1, 2, 3});
   t.commit(3);
@@ -169,6 +179,23 @@ int main() {
            step.observation().host_misses == 3 * width);
     step.finish(step.result().emitted.size(), false);
     assert(t.snapshots == 2);
+  }
+  // s0ma change 47 (H1): rows cut to 2 of 6. Every kept draft right: the two drafts are emitted without a bonus
+  // and two input rows committed; the drafter rolls back to the same length. A wrong second draft: d_1 and the
+  // target's correction, two rows.
+  for (int bad : {-1, 1}) {
+    CutTarget t; seed(t); t.keep = 2; Draft d(t); d.width = 6; d.bad = bad;
+    SpeculativeStep step(t, &d, 0, 3, sampling, 4, 1, 6);
+    assert(step.inputs().size() == 6);
+    const auto &r = step.result();
+    if (bad < 0) assert(r.accepted == 2 && r.emitted.size() == 2 && !r.rejected);
+    else assert(r.accepted == 1 && r.emitted.size() == 2 && r.rejected);
+    const size_t rows = step.finish(r.emitted.size(), false);
+    assert(rows == 2 && t.committed.size() == 5 && d.rolled == 5);
+    // what was emitted is what the uncut target would emit for the same inputs
+    std::vector<int> prefix(t.committed.begin(), t.committed.begin() + 3);
+    prefix.push_back(step.inputs()[0]);
+    assert(r.emitted[0] == argmax(row(prefix)));
   }
   // Invalid or regressing snapshots abort the pending target transaction.
   for (bool nonfinite : {false, true}) {

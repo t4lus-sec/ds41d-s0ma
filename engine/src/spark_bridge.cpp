@@ -601,7 +601,10 @@ public:
     int rows = 0;
     const float *logits = target_->device_logits(rows);
     const size_t n = size_t(vocab());
-    if (!logits || rows != int(proposals.size()) + 1) { ++gpu_verify_fallbacks_; return false; }
+    // s0ma change 47 (H1): a cut step has one row a kept draft and no bonus row; the target copied the last kept row
+    // into the buffer's next row as a stand-in, and the caller drops a bonus token drawn from it
+    const bool cut = rows == int(proposals.size());
+    if (!logits || (rows != int(proposals.size()) + 1 && !cut) || rows > 5) { ++gpu_verify_fallbacks_; return false; }
     if (!verify_p_dev_) {
       cuda_checked(cudaMalloc(reinterpret_cast<void **>(&verify_p_dev_), 6 * n * sizeof(double)));
       cuda_checked(cudaMalloc(&verify_scratch_, ds41_verify_draw_scratch_bytes()));
@@ -628,8 +631,8 @@ public:
     rejected = r[8] != 0;
     ++gpu_verify_steps_;
     if (gpu_verify_mode() == 2) {   // the host's acceptance on the same inputs; its result is the one used
-      std::vector<std::vector<float>> x(static_cast<size_t>(rows), std::vector<float>(n));
-      for (int i = 0; i < rows; ++i)
+      std::vector<std::vector<float>> x(static_cast<size_t>(rows + (cut ? 1 : 0)), std::vector<float>(n));
+      for (int i = 0; i < int(x.size()); ++i)
         cuda_checked(cudaMemcpyAsync(x[i].data(), logits + size_t(i) * n, n * 4, cudaMemcpyDeviceToHost, stream));
       std::vector<Distribution> qh(q.size());
       for (size_t k = 0; k < q.size(); ++k) fetch_q(q[k], qh[k]);

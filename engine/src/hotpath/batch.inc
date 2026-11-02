@@ -271,6 +271,48 @@ void bmoe_scores(int l,int m) {
     lookahead_layer=l+1; lookahead_m=m;
   }
 }
+// s0ma change 47 (H1): verify rows cut mid-forward when their own expert loads cost more than they are worth.
+// DS41_H1=1. At layer l, row i's private cost is the price of its experts no row < i uses, by each expert's tier when
+// the step began (a snapshot taken before any of this step's demands: VRAM 0, RAM DS41_H1_RAM_MS, NVMe
+// DS41_H1_NVME_MS). Rows i.. are cut when row i's cost so far, extrapolated over the layers left and the rows from i
+// on, exceeds DS41_H1_THETA x their worth: sum over j >= i of a^j tokens (a = DS41_H1_ACCEPT) at DS41_H1_MS_TOKEN.
+// The decision for row i reads rows 0..i only (their inputs are the last token and d_1..d_i), so whether d_(i+1) is
+// verified is a stopping time of the drafted prefix: speculative sampling stays exact (novel doc, H1). Row i-1 still
+// verifies d_i; if every kept draft passes, the step emits them without a bonus token.
+struct H1Config { bool on=false; double theta=2.5, accept=0.73, ms_token=24.0, nvme_ms=1.76, ram_ms=0.32; };
+static const H1Config &h1_config() {
+  static const H1Config c=[]{
+    H1Config h; const char *v=std::getenv("DS41_H1"); h.on=v&&std::string(v)=="1";
+    auto num=[](const char *name,double &out){ if(const char *x=std::getenv(name); x&&*x) out=std::stod(x); };
+    num("DS41_H1_THETA",h.theta); num("DS41_H1_ACCEPT",h.accept); num("DS41_H1_MS_TOKEN",h.ms_token);
+    num("DS41_H1_NVME_MS",h.nvme_ms); num("DS41_H1_RAM_MS",h.ram_ms);
+    return h;
+  }();
+  return c;
+}
+int h1_cut(int l,int m,const int *selected) {
+  const auto &h=h1_config();
+  if(!h.on || lane_b_active || m<2 || l>=40 || h1_snap.empty()) return m;
+  const double left=40.0/(l+1)-1.0;
+  for(int i=1;i<m;++i) {
+    double cost=0;
+    for(int j=0;j<6;++j) {
+      const int e=selected[i*6+j];
+      bool shared=false;
+      for(int k=0;k<i*6 && !shared;++k) shared=selected[k]==e;
+      for(int k=i*6;k<i*6+j && !shared;++k) shared=selected[k]==e;   // a row's six are distinct; kept for safety
+      if(shared) continue;
+      const uint8_t b=h1_snap[size_t(l)*384+e];
+      cost+=(b&1)?0.0:(b&2)?h.ram_ms:h.nvme_ms;
+    }
+    h1_spent[i]+=cost;
+    if(h1_spent[i]<=0) continue;
+    double worth=0,a=1;
+    for(int j=0;j<m;++j){ if(j>=i) worth+=a; a*=h.accept; }
+    if(h1_spent[i]*left*(m-i)>h.theta*worth*h.ms_token) { ++h1_cuts; h1_rows_cut+=m-i; h1_last_m=i; return i; }
+  }
+  return m;
+}
 void bmoe(int l,int m) {
   std::string p="layers."+std::to_string(l)+".ffn";
   double t=clock_ms();
@@ -289,6 +331,7 @@ void bmoe(int l,int m) {
     });
     std::copy_n(order.begin(),6,selected.begin()+r*6);
   }
+  if(const int cut=h1_cut(l,m,selected.data()); cut<m) m=cut;   // s0ma change 47 (H1): rows cut..m-1 end here
   auto plan=hotpath::plan_routes(selected.data(),m,l);
   if(lookahead_audit.is_open() && m==1) {
     auto snap=experts->residency_snapshot();
@@ -431,6 +474,7 @@ struct BatchLane { int64_t pos=0; int m=0; std::array<std::vector<int64_t>,2> ro
 struct StepMarks { double start=0,io=0,route=0,engram=0,plan=0,enqueue=0; ds41::Stats stats{}; };
 StepMarks step_marks(int64_t pos) {
   lookahead_layer=-1; lookahead_far_layer=-1;
+  h1_snap.clear();   // s0ma change 47: batch() takes its own snapshot; the pipelined verify never cuts
   audit_pos=pos;
   for(auto &layer:audit_pred) for(auto &v:layer) v.clear();
   StepMarks k;
@@ -543,9 +587,11 @@ void batch_front(int l,BatchLane &lane) {
 }
 // Back of layer l: route sync, expert demand and reduction, FFN HC post.
 void batch_back(int l,BatchLane &lane) {
-  const int m=lane.m;
   lane_phase("moe",[&]{
-    bmoe(l,m);
+    const int64_t cuts=h1_cuts;
+    bmoe(l,lane.m);
+    if(h1_cuts!=cuts) lane.m=h1_last_m;   // s0ma change 47 (H1): the step goes on with rows 0..m'-1
+    const int m=lane.m;
     btrace(lane.pos,m,l,"ffn_output",y,H);
     CK(ds41_dense_hc_post(y.p,h.p,post.as<float>(),comb.as<float>(),next_h.p,m,H,stream));
     std::swap(h,next_h); std::swap(pre,ffn_pre);
@@ -623,12 +669,15 @@ std::vector<std::vector<float>> batch_finish(int64_t pos,int m,const StepMarks &
 std::vector<std::vector<float>> batch(const std::vector<int> &tokens,int64_t pos) {
   int m=int(tokens.size());
   auto marks=step_marks(pos);
+  // s0ma change 47 (H1): each expert's tier before any of this step's demands (bit 0 VRAM, bit 1 RAM)
+  h1_spent.fill(0);
+  if(h1_config().on && m>1) h1_snap=experts->residency_snapshot(); else h1_snap.clear();
   BatchLane lane;
   batch_begin(tokens.data(),m,pos,lane);
   for(int l=0;l<40;++l) { batch_front(l,lane); batch_back(l,lane); }
   batch_head(lane,0);
   CK(cudaStreamSynchronize(stream));
-  return batch_finish(pos,m,marks);
+  return batch_finish(pos,lane.m,marks);
 }
 // Lane B runs on swapped-in spare scratch, its own stream and cuBLAS handle. Captured graphs and
 // enqueued work hold raw pointers, so swapping the owning members between enqueues is safe.

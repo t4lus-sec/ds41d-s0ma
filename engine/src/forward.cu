@@ -237,6 +237,11 @@ class Native final : public Forward, public hotpath::GateEvidence {
   Device dense_table;
   double dense_extra_gib = 0;                         // VRAM the swap gave back, for expert slots
   std::set<std::string> dense_woa;                    // "layers.L.attn" whose wo_a runs as Sero's eight slices
+  // s0ma change 47 (H1): the step's tier snapshot, each row's private cost so far, the cut counters
+  std::vector<uint8_t> h1_snap;
+  std::array<double, 8> h1_spent{};
+  int h1_last_m = 0;
+  int64_t h1_cuts = 0, h1_rows_cut = 0;
   // s0ma change 37: decode's split-K scratch, one set a verify lane (partial sums; counts, zeroed and left zeroed),
   // and prefill's: one layer's tensors decoded to FP16 (filled on a layer's first use, reused by its other chunks),
   // the rows rotated into FP16 and the GEMM's FP32 result, 256 rows at a time
@@ -1093,7 +1098,17 @@ public:
         capture_slot = int(i);
         out.push_back(one(input[i], committed + i));
       }
-      if (config.batched_verify && vlogits.p) vlogits_rows = int(input.size());
+      if (config.batched_verify && vlogits.p) vlogits_rows = int(out.size());
+      if (out.size() < input.size()) {   // s0ma change 47 (H1): rows were cut; only the kept ones can be committed
+        pending = int(out.size());
+        pending_ids.resize(out.size());
+        capture_rows = pending;
+        // the acceptance kernel reads a bonus row after the kept ones: the last kept row stands in (its token is dropped)
+        if (vlogits_rows)
+          CK(cudaMemcpyAsync(static_cast<float *>(vlogits.p) + out.size() * size_t(V),
+                             static_cast<float *>(vlogits.p) + (out.size() - 1) * size_t(V), size_t(V) * 4,
+                             cudaMemcpyDeviceToDevice, stream));
+      }
       const double retire_begin=config.hotpath_profile?clock_ms():0;
       check_moe_retirement(true);
       if(config.hotpath_profile && config.batched_verify && !profile_steps.empty()) {
@@ -1162,6 +1177,7 @@ public:
               {"expert_spec_waits", s.spec_waits - initial_stats.spec_waits},
               {"expert_spec_dropped", s.spec_dropped - initial_stats.spec_dropped},
               {"need_host_ms", io_ms},
+              {"h1_cut_steps", h1_cuts}, {"h1_rows_cut", h1_rows_cut},   // s0ma change 47
               {"route_wait_ms", route_ms},
               {"engram_read_ms", engram_ms},
               {"forward_ms", total_ms},

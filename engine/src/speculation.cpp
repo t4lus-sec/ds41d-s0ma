@@ -198,8 +198,17 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
     observed_.nvme_misses = delta(before.nvme_misses, after.nvme_misses);
     observed_.host_misses =
         observed_.nvme_misses + delta(before.host_hits, after.host_hits);
-    if (rows_.size() != inputs_.size())
+    // s0ma change 47 (H1): the target may cut rows mid-forward (DS41_H1=1). Rows 0..r-1 came back: they verify
+    // d_1..d_r, and with every one accepted the step emits them without a bonus token (no row r to draw it from).
+    if (rows_.empty() || rows_.size() > inputs_.size())
       throw std::runtime_error("target verify returned wrong row count");
+    const bool cut = rows_.size() < inputs_.size();
+    if (cut) {
+      if (!draft) throw std::runtime_error("target verify cut rows without drafts");
+      proposals.resize(rows_.size());
+      if (q.size() > proposals.size()) q.resize(proposals.size());
+      if (qdev.size() > proposals.size()) qdev.resize(proposals.size());
+    }
     const double probs_start = milliseconds();
     for (const auto &row : rows_)
       if (row.size() != size_t(target.vocab()))
@@ -226,10 +235,16 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
         }
       std::vector<Distribution> p =
           probabilities_rows(rows_, sampling.temperature, sampling.top_p);
+      if (cut) p.push_back(p.back());   // s0ma change 47: a stand-in bonus row; its token is dropped below
       reject_start = milliseconds();
       result_ = reject_sample(proposals, q, p, rng, step, sampling.temperature);
     }
     const double reject_end = milliseconds();
+    if (cut && result_.accepted == proposals.size()) {   // s0ma change 47: every kept draft passed: no bonus
+      if (!result_.emitted.empty()) result_.emitted.pop_back();
+      result_.rejected = false;
+    }
+    if (cut) result_.accepted_input_rows = std::min(result_.accepted_input_rows, rows_.size());
     observed_.accepted_drafts = result_.accepted;
     observed_.tested_drafts = result_.accepted + size_t(result_.rejected);
     if (stop_log_) {
@@ -285,7 +300,8 @@ size_t SpeculativeStep::finish(size_t delivered, bool terminal, bool cancelled) 
   if (!pending_ || delivered > result_.emitted.size() ||
       (!terminal && delivered != result_.emitted.size()) || (cancelled && !terminal))
     throw std::invalid_argument("speculative delivered prefix/transaction");
-  size_t rows = 1 + std::min(delivered, result_.accepted);
+  // s0ma change 47: never more input rows than the target computed (a cut step whose kept drafts all passed)
+  size_t rows = std::min(1 + std::min(delivered, result_.accepted), rows_.empty() ? size_t(1) : rows_.size());
   try {
     target_.commit(rows);
     pending_ = false;

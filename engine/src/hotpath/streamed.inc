@@ -5,7 +5,7 @@ void bmoe_streamed(const std::string &p,int m,const hotpath::RoutePlan &plan,
                   const std::vector<ds41::GemmJob> &gj,
                   const std::vector<ds41::GemmJob> &uj,
                   const std::vector<ds41::GemmJob> &dj) {
-  bgraph(p+".shared",m,[&]{bshared(p,m);});
+  // s0ma change 62: the shared expert was queued by bmoe before its route wait
   const int layer=int(plan.ids.front()/384);
   const bool readiness=consumer_readiness && !lane_b_active;
   if(readiness) consumer_readiness->shared_done(layer,stream);

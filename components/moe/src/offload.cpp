@@ -82,6 +82,7 @@ struct OffloadStore::Impl {
     std::mutex miss_m;                           // s0ma change 56
     std::vector<ExpertId> miss_log, ram_log;
     std::atomic<bool> miss_on{false};
+    std::atomic<uint64_t> demand_host_hits{0}, demand_nvme{0};   // s0ma change 62
     std::map<uint64_t,std::vector<SlotPool::Allocation>> admitting;   // s0ma change 57: held RAM slots
     std::map<uint64_t,std::vector<SlotPool::Allocation>> admitting_vram;   // s0ma change 60: held VRAM slots
     VramAdmitStats vram_admit;
@@ -453,9 +454,9 @@ struct OffloadStore::Impl {
                 ck(cudaMemcpyAsync(table+a.id,views+a.id,sizeof(DeviceExpert),cudaMemcpyHostToDevice,mapping));
                 ck(cudaEventRecord(slot_mapping[a.slot],mapping));
                 auto h=host.find(a.id);
-                if(h==host.end()){disk.push_back(a);if(!is_prefetch){++counters.nvme_misses;++layer.nvme_misses;++counters.ram.misses;++counters.class_nvme_misses[kc];
+                if(h==host.end()){disk.push_back(a);if(!is_prefetch){++counters.nvme_misses;demand_nvme.fetch_add(1,std::memory_order_relaxed);++layer.nvme_misses;++counters.ram.misses;++counters.class_nvme_misses[kc];
                     if(miss_on.load(std::memory_order_relaxed)){std::lock_guard<std::mutex> l(miss_m);miss_log.push_back(a.id);}}}
-                else if(!is_prefetch){++counters.host_hits;++layer.host_hits;++counters.ram.hits;host_prefetched.erase(a.id);++counters.class_host_hits[kc];
+                else if(!is_prefetch){++counters.host_hits;demand_host_hits.fetch_add(1,std::memory_order_relaxed);++layer.host_hits;++counters.ram.hits;host_prefetched.erase(a.id);++counters.class_host_hits[kc];
                     if(miss_on.load(std::memory_order_relaxed)){std::lock_guard<std::mutex> l(miss_m);ram_log.push_back(a.id);}}
                 if(is_prefetch)prefetched.insert(a.id);
             }
@@ -551,7 +552,12 @@ struct OffloadStore::Impl {
             // still execute. Retain all source slots through a copy event.
             if(!host_holds.empty()){cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,cs));host_retired.push_back({std::move(host_holds),done});}
             if(!is_prefetch && !streaming)for(auto a:allocations)order(a,consumer);
-            if(demote && batch_callback && !is_prefetch)top_up(ids);
+            // s0ma change 62: the demotion reserve is topped up by the next task on this worker, after the lease
+            // has gone back to the caller (same order of store operations; the caller no longer waits for it)
+            if(demote && batch_callback && !is_prefetch){
+                std::lock_guard<std::mutex> lock(mutex);
+                demand.emplace_front([this,ids]{try{top_up(ids);}catch(...){fail(std::current_exception());}});
+            }
             // Keep prefetch leases until DMA finishes; demand ownership is
             // transferred to the caller and released only after its consumer.
             uint64_t id=++serial;
@@ -1020,6 +1026,9 @@ void OffloadStore::admit_end(Admission a){
     }).get();
 }
 void OffloadStore::log_nvme_misses(bool on){impl_->miss_on.store(on);}
+std::pair<uint64_t,uint64_t> OffloadStore::demand_totals() const{
+    return {impl_->demand_host_hits.load(std::memory_order_relaxed),impl_->demand_nvme.load(std::memory_order_relaxed)};
+}
 std::vector<ExpertId> OffloadStore::take_ram_hits(){std::vector<ExpertId> out;std::lock_guard<std::mutex> l(impl_->miss_m);out.swap(impl_->ram_log);return out;}
 std::vector<ExpertId> OffloadStore::take_nvme_misses(){std::vector<ExpertId> out;std::lock_guard<std::mutex> l(impl_->miss_m);out.swap(impl_->miss_log);return out;}
 size_t OffloadStore::lend(size_t chunks){check_error();return impl_->submit([this,chunks]{return impl_->lend(chunks);}).get();}

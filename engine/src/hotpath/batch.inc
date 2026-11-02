@@ -317,6 +317,9 @@ void bmoe(int l,int m) {
   std::string p="layers."+std::to_string(l)+".ffn";
   double t=clock_ms();
   auto *score_host=lane_scores();
+  // s0ma change 62: the shared expert needs no routing; queue it before waiting for the route scores, so the GPU has
+  // it to run while the host picks and plans this layer's experts (bmoe_streamed then skips it)
+  if(config.streamed_experts) bgraph(p+".shared",m,[&]{bshared(p,m);});
   CK(cudaEventSynchronize(route_events[lane_b_active]));
   route_ms+=clock_ms()-t;
   check_moe_retirement(false);

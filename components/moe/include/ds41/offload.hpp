@@ -122,6 +122,8 @@ public:
     // s0ma change 56: a log of decode's NVMe misses (demand loads only), for measurements; off until switched on.
     // take_nvme_misses() returns the ids logged since the last call. Thread-safe; no store round trip.
     void log_nvme_misses(bool on);
+    // s0ma change 62: decode's RAM hits and NVMe misses so far (demand loads), read without a store round trip
+    std::pair<uint64_t, uint64_t> demand_totals() const;
     // s0ma change 57: RAM-tier slots for experts a prompt is streaming from the drive anyway. admit_begin takes ids in
     // priority order (each with an LFU credit), skips those already in VRAM or RAM, and reserves slots (the least
     // valued RAM residents are evicted) until byte_budget or a blocked admission; dst[i] is where ids[i]'s record

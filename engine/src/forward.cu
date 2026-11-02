@@ -670,6 +670,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::vector<int> pending_ids;
   int shared_topk = 0, candidate_count = 0, eos_id = 1;
   ds41::Stats initial_stats{};
+  std::pair<uint64_t, uint64_t> initial_demand{};   // s0ma change 62
   mutable ds41::Stats last_expert_stats{};
   mutable bool expert_stats_available=false;
   double io_ms = 0, route_ms = 0, engram_ms = 0, total_ms = 0;
@@ -1133,6 +1134,7 @@ public:
     host_plan_ms=callback_enqueue_ms=0; profile_steps=Json::array();
     stream_callbacks=stream_hit_batches=0;
     initial_stats = sample_expert_stats();
+    initial_demand = experts->demand_totals();
     if (async_engram)
       initial_engram_stats = async_engram->stats();
     initial_replays = graph_replays;
@@ -1286,12 +1288,11 @@ public:
     }
   }
   DemandCounters demand_counters() const override {
-    const auto s = sample_expert_stats();
-    if(s.host_hits < initial_stats.host_hits ||
-       s.nvme_misses < initial_stats.nvme_misses)
+    // s0ma change 62: read twice a verify step; atomics instead of a blocking store stats() round trip
+    const auto s = experts->demand_totals();
+    if(s.first < initial_demand.first || s.second < initial_demand.second)
       throw std::runtime_error("target tier counter moved backwards");
-    return {double(s.host_hits - initial_stats.host_hits),
-            double(s.nvme_misses - initial_stats.nvme_misses)};
+    return {double(s.first - initial_demand.first), double(s.second - initial_demand.second)};
   }
   Json counters() const override {
     ds41::Stats s{};bool stale=false;std::string stats_error;

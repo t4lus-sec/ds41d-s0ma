@@ -272,6 +272,12 @@ def command(cfg, socket):
             if flag in cmd:
                 at = cmd.index(flag)
                 del cmd[at:at + 2]
+        # s0ma change 45: no CUDA graphs. ds41d captures a graph for nearly every new shape (rows, layer, scan bucket,
+        # position mod 8) and here the GPU mostly waits on the host and the drive, so capturing costs more than
+        # replaying saves. Two runs each (Sero, no warm-up): decode 38.32 / 39.19 -> 39.68 / 39.69 tok/s, verify
+        # 58.0 / 56.9 -> 55.2 ms a step, first token 6.43 / 6.37 -> 5.59 s mean (an 8K prompt 15.1 -> 10.2 s)
+        if '--graphs' in cmd:
+            cmd.remove('--graphs')
     return cmd
 
 

@@ -264,6 +264,14 @@ def command(cfg, socket):
     if mixed:
         bank = bank_dir(cfg)
         cmd += ['--exl3-experts', str(bank / 'records-mixed.tsv'), '--exl3-receipts', str(bank / 'receipts.json')]
+    if cfg['experts'] == 'sero':
+        # s0ma change 44: no RAM warm-up after a prompt. On a 48 GiB tier it read ~1,000 experts (~12 GiB) from the
+        # drive before every 256+ row prompt's first token, 1.8 s each: first token 7.21 -> 6.37 s mean, decode
+        # unchanged (38.86 / 39.14 tok/s), 41 GB less read from the drive in a bench
+        for flag in ('--prefill-warm-rows', '--prefill-warm-gib'):
+            if flag in cmd:
+                at = cmd.index(flag)
+                del cmd[at:at + 2]
     return cmd
 
 

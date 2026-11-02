@@ -318,6 +318,16 @@ void bmoe(int l,int m) {
   }
   if(config.hotpath_profile) step_demands.push_back({
       {"layer",l},{"logical_ids",plan.ids},{"consumer_backend","gpu"}});
+  // s0ma change 42: DS41_PROFILE_ROWS=1 adds each row's six experts and their tier at demand (0 VRAM, 1 RAM, 2 NVMe
+  // only), for the probe's replay of cutting expensive verify rows (H1). A residency snapshot a layer: profile only.
+  static const bool profile_rows=[]{const char*v=std::getenv("DS41_PROFILE_ROWS");return v&&v[0]=='1';}();
+  if(config.hotpath_profile && profile_rows) {
+    auto snap=experts->residency_snapshot();
+    std::vector<int> rows(selected.begin(),selected.begin()+m*6), tiers;
+    for(int j=0;j<m*6;++j){uint8_t b=snap[size_t(l)*384+selected[j]];tiers.push_back((b&1)?0:(b&2)?1:2);}
+    step_demands.back()["rows"]=rows;
+    step_demands.back()["tiers"]=tiers;
+  }
 
   std::vector<ds41::GemmJob> gj,uj,dj;
   for(const auto &e:plan.experts) {

@@ -396,22 +396,26 @@ __global__ __launch_bounds__(512,1) void decode_var_splitk(const DeviceExpert* t
 // s0ma change 37: prefill of a dense tensor as exllamav3 does for many rows: the weights decoded once into FP16
 // [K, N] (row k = input feature), the rows rotated into FP16, one FP16 GEMM with FP32 sums (the caller's cuBLAS), and
 // the FP32 result rotated and scaled into BF16. The same products as prefill_body, summed in cuBLAS's order.
+// s0ma change 42: a block decodes one 16-row strip of 8 tiles (128 columns) into shared memory and writes it out in
+// 16-byte rows, coalesced (change 37 wrote each weight on its own: 2-byte stores 16 rows apart)
 template<int BITS>
 __global__ __launch_bounds__(256) void reconstruct(const DeviceExpert* table,int index,int N,int K,half* W) {DS41_PDL_WAIT();
-    const int lane=threadIdx.x%32, tile=blockIdx.x*8+threadIdx.x/32, tiles=(K/16)*(N/16);
-    if(tile>=tiles)return;
-    const int kt=tile/(N/16), nt=tile%(N/16);
-    const uint32_t* B=weights(table[index],0)+size_t(tile)*(8*BITS);
+    __shared__ __align__(16) half strip[16][136];
+    const int lane=threadIdx.x%32, warp=threadIdx.x/32, kt=blockIdx.y, nt=blockIdx.x*8+warp;
+    const uint32_t* B=weights(table[index],0)+(size_t(kt)*(N/16)+nt)*(8*BITS);
     TileW<BITS> w=load_tile<BITS>(B,lane);
     Pair f[2];
     dqk<BITS>(w,f[0],f[1],lane);
     #pragma unroll
     for(int h=0;h<2;++h){
         const half2 lo=*reinterpret_cast<const half2*>(&f[h].v[0]), hi=*reinterpret_cast<const half2*>(&f[h].v[1]);
-        const int n=nt*16+h*8+lane/4, k=kt*16+(lane%4)*2;   // the m16n8k16 B fragment: jj 0,1 at k, k+1; 2,3 at k+8, k+9
-        W[size_t(k)*N+n]=__low2half(lo); W[size_t(k+1)*N+n]=__high2half(lo);
-        W[size_t(k+8)*N+n]=__low2half(hi); W[size_t(k+9)*N+n]=__high2half(hi);
+        const int n=warp*16+h*8+lane/4, k=(lane%4)*2;   // the m16n8k16 B fragment: jj 0,1 at k, k+1; 2,3 at k+8, k+9
+        strip[k][n]=__low2half(lo); strip[k+1][n]=__high2half(lo);
+        strip[k+8][n]=__low2half(hi); strip[k+9][n]=__high2half(hi);
     }
+    __syncthreads();
+    const int row=threadIdx.x/16, col=(threadIdx.x%16)*8;
+    *reinterpret_cast<uint4*>(W+(size_t(kt)*16+row)*N+size_t(blockIdx.x)*128+col)=*reinterpret_cast<const uint4*>(&strip[row][col]);
 }
 __global__ __launch_bounds__(256) void rotate_rows_in(const DeviceExpert* table,int index,const __nv_bfloat16* x,int rows,
                                                       int K,int xs,half* A) {DS41_PDL_WAIT();
@@ -594,7 +598,7 @@ cudaError_t exl3_dense_prefill(const DeviceExpert* t,GemmJob j,int n,int k,int b
 // s0ma change 37: prefill pieces for the caller's FP16 GEMM
 cudaError_t exl3_dense_reconstruct(const DeviceExpert* t,int index,int n,int k,int bits,half* w,cudaStream_t s){
     if(!t||!w||n<=0||n%128||k<=0||k%128)return cudaErrorInvalidValue;
-    const int blocks=int((size_t(k/16)*(n/16)+7)/8);
+    const dim3 blocks(n/128,k/16);
     switch(bits){
         case 2: exl3_detail::reconstruct<2><<<blocks,256,0,s>>>(t,index,n,k,w); break;
         case 3: exl3_detail::reconstruct<3><<<blocks,256,0,s>>>(t,index,n,k,w); break;

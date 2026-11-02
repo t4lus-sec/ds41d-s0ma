@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <cxxabi.h>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -152,4 +153,28 @@ extern "C" const char *ds41_pdl_node_name(cudaGraphNode_t node) {
   const char *name = nullptr;
   if ((p.func ? cuFuncGetName(&name, p.func) : cuKernelGetName(&name, p.kern)) != CUDA_SUCCESS || !name) return "";
   return name;
+}
+
+// "kernel 120, memcpy 4, mem alloc 2, ..." for a refusal's message: which node types the graph holds
+extern "C" const char *ds41_pdl_node_types(cudaGraph_t graph) {
+  static thread_local std::string out;
+  size_t n = 0;
+  out.clear();
+  if (cudaGraphGetNodes(graph, nullptr, &n) != cudaSuccess) return "?";
+  std::vector<cudaGraphNode_t> nodes(n);
+  if (n && cudaGraphGetNodes(graph, nodes.data(), &n) != cudaSuccess) return "?";
+  std::map<int, size_t> count;
+  for (auto node : nodes) {
+    cudaGraphNodeType t;
+    if (cudaGraphNodeGetType(node, &t) == cudaSuccess) ++count[int(t)];
+  }
+  static const char *names[] = {"kernel", "memcpy", "memset", "host", "child graph", "empty", "event wait",
+                                "event record", "semaphore signal", "semaphore wait", "mem alloc", "mem free",
+                                "batch memop", "conditional"};
+  for (auto &[t, c] : count) {
+    if (!out.empty()) out += ", ";
+    out += (t >= 0 && t < int(sizeof names / sizeof *names) ? names[t] : "type " + std::to_string(t));
+    out += " " + std::to_string(c);
+  }
+  return out.c_str();
 }

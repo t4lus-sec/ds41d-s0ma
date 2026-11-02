@@ -161,6 +161,7 @@ struct Phase {
 extern "C" int ds41_pdl_mode();
 extern "C" int ds41_pdl_rewrite(cudaGraph_t graph, int mode, size_t *edges, const char **step);
 extern "C" const char *ds41_pdl_node_name(cudaGraphNode_t node);
+extern "C" const char *ds41_pdl_node_types(cudaGraph_t graph);
 struct Graph {
   cudaGraph_t graph = nullptr;
   cudaGraphExec_t exec = nullptr;
@@ -277,6 +278,16 @@ class Native final : public Forward, public hotpath::GateEvidence {
   uint64_t graph_replays = 0, initial_replays = 0;
   uint64_t graph_captures = 0, initial_captures = 0;
   uint64_t pdl_edges = 0, pdl_graphs = 0;   // s0ma change 32
+  // s0ma change 36: with DS41_PDL, each cuBLAS handle gets a fixed 32 MiB workspace (cuBLAS's own default size on this
+  // card). Without one, cuBLAS allocates its workspace stream-ordered while a graph is captured: the graph then holds
+  // memory allocation nodes, and such a graph can be neither cloned nor have edges removed (the two refusals seen).
+  Device pdl_blas_workspace, pdl_lane_workspace;
+  void pdl_workspace(cublasHandle_t handle, Device &ws) {
+    if (ds41_pdl_mode() <= 0) return;
+    ws.resize(size_t(32) << 20);
+    if (cublasSetWorkspace(handle, ws.p, ws.bytes) != CUBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("cublasSetWorkspace (DS41_PDL)");
+  }
   bool pdl_off = false;
   std::string pdl_error;
   uint64_t graph_evictions = 0, initial_evictions = 0;
@@ -585,6 +596,7 @@ public:
     vram_checkpoint("native_members_before_cublas");
     if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS)
       throw std::runtime_error("cublasCreate");
+    pdl_workspace(blas, pdl_blas_workspace);   // s0ma change 36
     vram_checkpoint("native_after_cublas");
     if (c.cuda_stack_bytes) {
       if (c.cuda_stack_bytes > 65536) throw std::invalid_argument("CUDA stack request exceeds bounded candidate limit");
@@ -1400,7 +1412,7 @@ private:
       }
       if (rc != cudaSuccess) {
         std::ostringstream why;
-        why << step << ": " << cudaGetErrorString(rc);
+        why << step << ": " << cudaGetErrorString(rc) << "; nodes " << ds41_pdl_node_types(recorded->graph);
         if (ip.result_out != cudaGraphInstantiateSuccess) why << " (instantiate result " << int(ip.result_out) << ")";
         if (ip.errNode_out) why << " at kernel " << ds41_pdl_node_name(ip.errNode_out);
         pdl_error = why.str();

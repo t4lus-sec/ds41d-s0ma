@@ -572,7 +572,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
     for(size_t r=input.size()-options.logits_tail;r<input.size();++r) {
       pcopy(h.p,pf.hidden.as<char>(r*HC*H*2),HC*H*2);pcopy(pre.p,pf.previous_pre.as<char>(r*4*4),4*4);
       CK(ds41_dense_hc_pre(h.p,pre.as<float>(),x.p,1,H,stream));norm("norm",x.p,x.p,H);
-      bf16_float(x.p,f32.as<float>(),H,stream);if(fused_head)fused_head_logits(f32.p,logits.p,1);else linear("head",f32.p,logits.p,V,H);
+      bf16_float(x.p,f32.as<float>(),H,stream);if(sero_head(x.p,logits.p,1,stream)){}else if(fused_head)fused_head_logits(f32.p,logits.p,1);else linear("head",f32.p,logits.p,V,H);
       result.logits.emplace_back(V);
       CK(cudaMemcpyAsync(result.logits.back().data(),logits.p,V*4,cudaMemcpyDeviceToHost,stream));
       CK(cudaStreamSynchronize(stream));

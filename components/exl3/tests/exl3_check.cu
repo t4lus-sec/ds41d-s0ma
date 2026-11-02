@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -87,6 +88,48 @@ static void dense_split(const ds41::DeviceExpert* t, ds41::GemmJob j, int N, int
         for (unsigned v : h) if (v) { *invariant = false; break; }
         cudaFree(partial); cudaFree(counts);
     }
+}
+// s0ma change 43: the FP32-output decode (Sero's K4 head): its values rounded to BF16 are the BF16 launch's bit for bit,
+// and row 0 alone is row 0 among the others, bit for bit
+static bool f32_case(int bits, int K, int N, int M, std::mt19937& rng) {
+    const size_t words = size_t(K / 16) * (N / 16) * 8 * bits;
+    std::vector<uint32_t> tr(words);
+    for (auto& w : tr) w = rng();
+    std::vector<half> sc(K + N);
+    std::uniform_real_distribution<float> mag(0.5f, 1.5f);
+    for (auto& v : sc) v = __float2half((rng() & 1 ? 1.f : -1.f) * mag(rng) * 0.05f);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<__nv_bfloat16> x(size_t(M) * K);
+    for (auto& v : x) v = __float2bfloat16(nd(rng));
+    uint32_t* dtr; half* dsc; __nv_bfloat16 *dx, *db; float *df, *d1;
+    CK(cudaMalloc(&dtr, words * 4)); CK(cudaMalloc(&dsc, (K + N) * 2)); CK(cudaMalloc(&dx, size_t(M) * K * 2));
+    CK(cudaMalloc(&db, size_t(M) * N * 2)); CK(cudaMalloc(&df, size_t(M) * N * 4)); CK(cudaMalloc(&d1, size_t(N) * 4));
+    CK(cudaMemcpy(dtr, tr.data(), words * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dsc, sc.data(), (K + N) * 2, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dx, x.data(), size_t(M) * K * 2, cudaMemcpyHostToDevice));
+    ds41::DeviceExpert e{};
+    e.gate = e.up = e.down = reinterpret_cast<const uint8_t*>(dtr);
+    e.gate_scale = e.up_scale = e.down_scale = reinterpret_cast<const uint8_t*>(dsc);
+    ds41::DeviceExpert* dt;
+    CK(cudaMalloc(&dt, sizeof e)); CK(cudaMemcpy(dt, &e, sizeof e, cudaMemcpyHostToDevice));
+    const uint8_t* xin = reinterpret_cast<const uint8_t*>(dx);
+    CK(ds41::exl3_dense(dt, ds41::GemmJob{0, M, xin, nullptr, db}, N, K, bits, 0));     // no scratch: the unsplit launch
+    CK(ds41::exl3_dense_f32(dt, ds41::GemmJob{0, M, xin, nullptr, reinterpret_cast<__nv_bfloat16*>(df)}, N, K, bits, 0));
+    CK(ds41::exl3_dense_f32(dt, ds41::GemmJob{0, 1, xin, nullptr, reinterpret_cast<__nv_bfloat16*>(d1)}, N, K, bits, 0));
+    CK(cudaDeviceSynchronize());
+    std::vector<__nv_bfloat16> hb(size_t(M) * N); std::vector<float> hf(size_t(M) * N), h1(N);
+    CK(cudaMemcpy(hb.data(), db, hb.size() * 2, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(hf.data(), df, hf.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h1.data(), d1, h1.size() * 4, cudaMemcpyDeviceToHost));
+    size_t round = 0, row = 0;
+    for (size_t i = 0; i < hb.size(); ++i)
+        round += __bfloat16_as_ushort(__float2bfloat16_rn(hf[i])) != __bfloat16_as_ushort(hb[i]);
+    for (int n = 0; n < N; ++n) row += std::memcmp(&h1[n], &hf[n], 4) != 0;
+    cudaFree(dtr); cudaFree(dsc); cudaFree(dx); cudaFree(db); cudaFree(df); cudaFree(d1); cudaFree(dt);
+    const bool ok = !round && !row;
+    std::printf("%s K%d dense f32   k=%d n=%d rows=%d: %zu of %zu values round differently from the BF16 launch; row 0 alone "
+                "differs in %zu\n", ok ? "ok  " : "FAIL", bits, K, N, M, round, hb.size(), row);
+    return ok;
 }
 struct Case { int bits, K, N, tokens; bool prefill; ds41::Projection p; bool var = false; bool dense = false; int stride = 1; bool dq = false; bool vsplit = false; };
 
@@ -283,6 +326,10 @@ int main() {
         std::printf("%s K%d %s k=%d n=%d rows=%d: relative error %.2e%s\n", ok ? "ok  " : "FAIL", c.bits,
                     c.vsplit ? "experts split-K" : c.dq ? "dense dequant+gemm" : c.dense ? (c.prefill ? "dense prefill" : "dense decode ") : c.prefill ? "prefill" : c.var ? "mixed  " : "decode ", c.K, c.N, c.tokens, e, inv ? "" : "; row 0 differs by row count");
     }
+    // s0ma change 43: Sero's K4 head (k 5120, n 129280) in FP32, at a smaller n; K5 and the k = 8192 four-row case too
+    fail += !f32_case(4, 5120, 2048, 6, rng);
+    fail += !f32_case(4, 5120, 1280, 1, rng);
+    fail += !f32_case(5, 8192, 1024, 4, rng);
     std::printf(fail ? "%d FAILED\n" : "all passed\n", fail);
     return fail ? 1 : 0;
 }

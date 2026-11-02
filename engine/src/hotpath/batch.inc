@@ -564,7 +564,8 @@ void batch_head(BatchLane &lane,int row) {
       bnorm("norm",x.p,x.p,H,m);
       bf16_float(x.p,f32.as<float>(),m*H,stream);
     }
-    if(fused_head) fused_head_logits(f32.p,logits.p,m);
+    if(sero_head(x.p,logits.p,m,stream)) {}   // s0ma change 43: Sero's K4 head
+    else if(fused_head) fused_head_logits(f32.p,logits.p,m);
     else blinear("head",f32.p,logits.p,V,H,m);
   }); });
   zc(host_alias(static_cast<float *>(host->data())+size_t(row)*V),logits.p,size_t(m)*V*4);

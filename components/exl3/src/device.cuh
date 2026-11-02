@@ -120,4 +120,14 @@ __device__ __forceinline__ void rotate_output(const float* x,const half* sv,__nv
     out[lane*4+2]=__float2bfloat16_rn(c*__half2float(sv[lane*4+2]));
     out[lane*4+3]=__float2bfloat16_rn(d*__half2float(sv[lane*4+3]));
 }
+// s0ma change 43: the same rotation and scale, the FP32 result kept (a head's logits; its BF16 rounding is this rounded)
+__device__ __forceinline__ void rotate_output(const float* x,const half* sv,float* out,int lane) {
+    float4 v=reinterpret_cast<const float4*>(x)[lane];
+    float a=v.x,b=v.y,c=v.z,d=v.w;
+    had128(a,b,c,d,lane);
+    out[lane*4]=a*__half2float(sv[lane*4]);
+    out[lane*4+1]=b*__half2float(sv[lane*4+1]);
+    out[lane*4+2]=c*__half2float(sv[lane*4+2]);
+    out[lane*4+3]=d*__half2float(sv[lane*4+3]);
+}
 }

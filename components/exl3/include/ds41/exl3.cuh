@@ -56,6 +56,10 @@ cudaError_t exl3_dense_rotate_out(const DeviceExpert* table, int index, const fl
                                   __nv_bfloat16* out, int out_stride, cudaStream_t stream);
 cudaError_t exl3_dense_prefill(const DeviceExpert* table, GemmJob job, int n, int k, int bits, cudaStream_t stream,
                                int x_stride = 0, int out_stride = 0);
+// s0ma change 43: exl3_dense's decode (no split, no groups) writing FP32 rows: job.output points to floats and
+// out_stride counts floats. The values are those the BF16 launch rounds. Decode rows: 1..8 (1..4 for k = 8192).
+cudaError_t exl3_dense_f32(const DeviceExpert* table, GemmJob job, int n, int k, int bits, cudaStream_t stream,
+                           int x_stride = 0, int out_stride = 0);
 cudaError_t grouped_exl3_var(const DeviceExpert* table, const GemmJob* jobs, int count,
                              Projection projection, int n, int k, const uint8_t* bits, cudaStream_t stream);
 }

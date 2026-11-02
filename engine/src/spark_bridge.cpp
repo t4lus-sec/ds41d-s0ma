@@ -206,6 +206,7 @@ public:
     config.user = services_.user;
     config.experts = services_.experts;
     config.rollback = services_.rollback;
+    config.head = services_.head;   // s0ma change 43
     ds41_spark *raw = nullptr;
     checked(ds41_spark_create(&config, &raw));
     spark_.reset(raw);
@@ -215,6 +216,8 @@ public:
       throw std::runtime_error("native Spark needs --load-mtp bindings: " +
                                callback_error_);
     for (const char *name : {"embed.weight", "head.weight", "rope"}) {
+      // s0ma change 43: the target serves the draft logits through its own head (Sero's K4): no BF16 head to bind
+      if (services_.head && std::string(name) == "head.weight") continue;
       ds41_target_tensor_v1 view{};
       if (ds41_target_tensor(target_.get(), name, 1, &view, sizeof(view)))
         throw std::runtime_error(std::string("missing shared native tensor ") +

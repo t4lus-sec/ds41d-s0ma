@@ -687,7 +687,7 @@ public:
     load_weights();
     load_sero_dense();
     splitk_scratch(0);   // s0ma change 40
-    if (fused_head) {
+    if (fused_head && !dense_of("head")) {   // s0ma change 43: unless Sero's head replaced it
       const auto &head = w("head.weight");
       if (head.dtype != "BF16" || head.shape != std::vector<uint64_t>({uint64_t(V), uint64_t(H)}))
         throw std::runtime_error("--fused-head requires the native BF16 [vocab, hidden] head");
@@ -870,7 +870,12 @@ public:
             },
             [](void *user) -> const char * {
               return static_cast<Native *>(user)->callback_error.c_str();
-            }};
+            },
+            // s0ma change 43: the drafter's logits through Sero's head when it replaced the native one
+            dense_of("head") ? +[](void *user, const void *x, float *out, int rows, void *s) -> int {
+              auto *self = static_cast<Native *>(user);
+              return self->service_call([&] { self->sero_head(x, out, rows, static_cast<cudaStream_t>(s)); });
+            } : nullptr};
   }
   ds41_target_tensor_v1
   resident_tensor(const std::string &name) const override {
@@ -1733,7 +1738,22 @@ private:
         else ++skipped;
         continue;
       }
-      if (t.at("codebook").get<std::string>() != "mul1" || !shape || !kernel || !wanted || name == "head" ||
+      // s0ma change 43: Sero's K4 head in place of the native BF16 one (DS41_SERO_HEAD=1): the target's logits and the
+      // drafter's (through the services' head callback) both come from it, in FP32
+      if (name == "head") {
+        const char *hv = std::getenv("DS41_SERO_HEAD");
+        auto hit = weights.find("head.weight");
+        if (hv && std::string(hv) == "1" && t.at("codebook").get<std::string>() == "mul1" && k == H && n == V &&
+            bits >= 2 && bits <= 5 && hit != weights.end() && hit->second.dtype == "BF16" &&
+            hit->second.shape == std::vector<uint64_t>({uint64_t(V), uint64_t(H)})) {
+          load_record("head", t);
+          freed += hit->second.data.bytes;
+          hit->second.data.release();
+          hit->second.dtype = "EXL3";
+        } else ++skipped;
+        continue;
+      }
+      if (t.at("codebook").get<std::string>() != "mul1" || !shape || !kernel || !wanted ||
           weights.count(name + ".scale") == 0) {
         ++skipped;
         continue;
@@ -1779,6 +1799,7 @@ private:
     std::map<std::string, size_t> layer_bytes;
     size_t widest_k = 0, widest_n = 0;
     for (const auto &[name, d] : dense_exl3) {
+      if (name == "head") continue;   // s0ma change 43: decode only (sero_head): no split-K or prefill scratch
       const bool slice = name.find(".wo_a.slice.") != std::string::npos;
       dense_split_floats = std::max(dense_split_floats, ds41::exl3_dense_splitk_floats(d.n, d.k, slice ? 8 : 1));
       layer_bytes[name.substr(0, name.find('.', 7))] += (size_t(d.k) * d.n * 2 + 255) / 256 * 256;
@@ -1805,6 +1826,19 @@ private:
     if (dense_exl3.empty()) return nullptr;
     auto it = dense_exl3.find(prefix);
     return it == dense_exl3.end() ? nullptr : &it->second;
+  }
+  // s0ma change 43: FP32 logits [m, V] from the final norm's BF16 rows [m, H] through Sero's K4 head, 8 rows a launch;
+  // false (nothing enqueued) when the native head is in use
+  bool sero_head(const void *in, void *out, int m, cudaStream_t s) {
+    const DenseExl3 *d = dense_of("head");
+    if (!d) return false;
+    const auto *table = static_cast<const ds41::DeviceExpert *>(dense_table.p);
+    for (int r = 0; r < m; r += 8) {
+      ds41::GemmJob job{ds41::ExpertId(d->index), std::min(8, m - r), static_cast<const uint8_t *>(in) + size_t(r) * H * 2,
+                        nullptr, reinterpret_cast<__nv_bfloat16 *>(static_cast<float *>(out) + size_t(r) * V)};
+      CK(ds41::exl3_dense_f32(table, job, V, H, d->bits, s));
+    }
+    return true;
   }
   // y[m, n] = x[m, k] W^T through Sero's EXL3 tensor: the decode kernel up to 8 rows a launch (4 for k = 8192), the
   // prefill kernel above that, 256 rows a launch. Inputs and outputs BF16, as the FP8 path's.
@@ -2271,7 +2305,8 @@ private:
       CK(ds41_dense_hc_pre(h.p, pre.as<float>(), x.p, 1, H, stream));
       norm("norm", x.p, x.p, H);
       bf16_float(x.p, f32.as<float>(), H, stream);
-      if (fused_head) fused_head_logits(f32.p, logits.p, 1);
+      if (sero_head(x.p, logits.p, 1, stream)) {}   // s0ma change 43
+      else if (fused_head) fused_head_logits(f32.p, logits.p, 1);
       else linear("head", f32.p, logits.p, V, H);
     });
     auto output = static_cast<float *>(host->data());

@@ -30,12 +30,16 @@ typedef int (*ds41_target_experts_fn)(void *user, int stage, const void *x_bf16,
                                       void *out_bf16, int rows, void *stream);
 typedef int (*ds41_target_rollback_fn)(void *user, int64_t committed_inputs,
                                        void *stream);
+/* s0ma change 43: FP32 logits [rows,129280] from BF16 rows [rows,5120] through the target's own head when it is not
+ * the native BF16 one (Sero's K4 head); NULL when the native head is bound. */
+typedef int (*ds41_target_head_fn)(void *user, const void *x_bf16, float *logits, int rows, void *stream);
 typedef struct ds41_target_services_v1 {
   uint32_t abi_version;
   void *user;
   ds41_target_experts_fn experts;
   ds41_target_rollback_fn rollback;
   const char *(*error)(void *user);
+  ds41_target_head_fn head; /* s0ma change 43 */
 } ds41_target_services_v1;
 /* BF16 concatenation of mean_hc(INPUT of layer37), layer38, layer39. Storage
  * is stable; CONTENTS are overwritten by the next verify(). Enqueue ingest of

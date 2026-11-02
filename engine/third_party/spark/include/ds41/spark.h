@@ -31,6 +31,9 @@ typedef struct {
     ds41_spark_experts_fn experts; /* NULL => use bound native expert tensors */
     ds41_spark_topk_fn topk;
     ds41_spark_rollback_fn rollback;
+    /* s0ma change 43: draft logits F32[rows,129280] from the final norm's BF16[rows,5120] through the target's head
+     * (Sero's K4); NULL => the bound head tensors */
+    int (*head)(void*, const void *x_bf16, float *logits, int rows, void *stream);
 } ds41_spark_config;
 /* Creation allocates bounded scratch and rings (~12 MiB); weights stay borrowed.
  * Caller serializes access, owns the stream/BLAS handle and all bound tensors. */

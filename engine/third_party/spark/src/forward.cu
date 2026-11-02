@@ -138,7 +138,8 @@ struct ds41_spark{
   }
   CK(ds41_dense_hc_pre(h.p,pre.at<float>(),hd.p,B,H,stream));norm("mtp.2.norm",hd.p,x.p,B,H);CK(ds41_dense_promote(x.p,promoted.at<float>(),B*H,stream));
   // Native BF16 target head bound as draft.head.weight (engine --fused-head): compact BF16 head, draft logits only.
-  if(w.count("draft.head.weight"))CK(ds41_dense_head_compact(promoted.at<float>(),w.at("draft.head.weight").data,U.at<float>(),B,V,H,stream));
+  if(c.head)CK(c.head(c.user,x.p,U.at<float>(),B,c.stream));   // s0ma change 43: the target's own head (Sero's K4)
+  else if(w.count("draft.head.weight"))CK(ds41_dense_head_compact(promoted.at<float>(),w.at("draft.head.weight").data,U.at<float>(),B,V,H,stream));
   else linear("head",promoted.p,U.p,B,V,H);drafted=true;capture=false;
  }
  void markov(int k,int previous){if(!drafted||k<0||k>=5||previous<0||previous>=V)throw std::invalid_argument("Markov state/k/token");const auto&e=weight("mtp.2.markov_head.embed.weight");if(e.dtype!=DS41_SPARK_BF16||e.rows!=V||e.cols!=256)throw std::runtime_error("Markov embedding shape/dtype");

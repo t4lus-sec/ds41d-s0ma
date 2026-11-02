@@ -17,7 +17,8 @@ namespace exl3_detail {
 // geometry, K order, rounding, or reduction order. No inter-CTA communication.
 // s0ma change 34 (N1): ROWS is the most rows a job may hold (8; 4 for k=8192, whose 8-row input would not fit the
 // 99 KB of shared memory a block may have). Rows past a job's count are never read, so ROWS changes nothing else.
-template<int K,int BITS,int ROWS=8>
+// s0ma change 43: OutT float keeps the FP32 result (job.output then points to floats; os in floats)
+template<int K,int BITS,int ROWS=8,typename OutT=__nv_bfloat16>
 // s0ma change 34: xs and os are the input's and output's row strides in elements (K and N unless a slice of wider
 // rows, as 0xSero's wo_a groups: 4096 of each 32,768-wide row in, 1024 of each 8192-wide row out)
 __device__ __forceinline__ void decode_body(const DeviceExpert* table,const GemmJob job,int projection,int N,int xs=K,int os=-1) {
@@ -84,21 +85,21 @@ __device__ __forceinline__ void decode_body(const DeviceExpert* table,const Gemm
         out[i]=sum;
     }
     __syncthreads();
-    if(warp<job.tokens)rotate_output(out+warp*128,sv+blockIdx.x*128,job.output+size_t(warp)*os+blockIdx.x*128,lane);
+    if(warp<job.tokens)rotate_output(out+warp*128,sv+blockIdx.x*128,reinterpret_cast<OutT*>(job.output)+size_t(warp)*os+blockIdx.x*128,lane);
 }
 template<int K,int BITS,int ROWS=8>
 __global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const GemmJob* jobs,int projection,int N) {DS41_PDL_WAIT();
     decode_body<K,BITS,ROWS>(table,jobs[blockIdx.y],projection,N);
 }
 // s0ma change 34 (N1): one job passed by value (a dense tensor: no device job array, and a captured graph keeps it)
-template<int K,int BITS,int ROWS=8>
+template<int K,int BITS,int ROWS=8,typename OutT=__nv_bfloat16>
 // blockIdx.y = g of a set of tensors at consecutive table entries, reading x + g*gx and writing output + g*go
 __global__ __launch_bounds__(512,1) void decode_one(const DeviceExpert* table,const GemmJob job,int N,int xs,int os,int gx,int go) {DS41_PDL_WAIT();
     GemmJob mine=job;
     mine.expert=job.expert+blockIdx.y;
     mine.x=job.x+size_t(blockIdx.y)*gx*2;
-    mine.output=job.output+size_t(blockIdx.y)*go;
-    decode_body<K,BITS,ROWS>(table,mine,0,N,xs,os);
+    mine.output=reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<OutT*>(job.output)+size_t(blockIdx.y)*go);
+    decode_body<K,BITS,ROWS,OutT>(table,mine,0,N,xs,os);
 }
 // s0ma change 15: one launch for jobs of several widths. Each CTA reads its job's expert's width from `bits` and
 // runs that width's decode, so the work per CTA is exactly decode<K,BITS>'s (block-uniform branch, same shared memory).
@@ -514,24 +515,24 @@ cudaError_t grouped_exl3_prefill_bits(const DeviceExpert* t,const GemmJob* j,int
 }
 // s0ma change 34 (N1): a dense tensor (table[job.expert]'s gate views) on one job passed by value. Decode: 1..8 rows
 // (1..4 for k=8192); prefill: 1..256 rows.
-template<int K,int BITS> cudaError_t launch_one(const DeviceExpert* t,const GemmJob& j,int n,int xs,int os,int groups,int gx,int go,cudaStream_t s){
+template<int K,int BITS,typename OutT=__nv_bfloat16> cudaError_t launch_one(const DeviceExpert* t,const GemmJob& j,int n,int xs,int os,int groups,int gx,int go,cudaStream_t s){
     constexpr int ROWS=K>5120?4:8;
     constexpr int bytes=(ROWS*K*2<4096?4096:ROWS*K*2)+4*8*128*4;
     if(j.tokens<1||j.tokens>ROWS)return cudaErrorInvalidValue;
-    auto err=cudaFuncSetAttribute(exl3_detail::decode_one<K,BITS,ROWS>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
+    auto err=cudaFuncSetAttribute(exl3_detail::decode_one<K,BITS,ROWS,OutT>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
     if(err!=cudaSuccess)return err;
-    exl3_detail::decode_one<K,BITS,ROWS><<<dim3(n/128,groups),512,bytes,s>>>(t,j,n,xs,os,gx,go);
+    exl3_detail::decode_one<K,BITS,ROWS,OutT><<<dim3(n/128,groups),512,bytes,s>>>(t,j,n,xs,os,gx,go);
     return cudaGetLastError();
 }
-template<int BITS> cudaError_t launch_one_k(const DeviceExpert* t,const GemmJob& j,int n,int k,int xs,int os,int groups,int gx,int go,cudaStream_t s){
+template<int BITS,typename OutT=__nv_bfloat16> cudaError_t launch_one_k(const DeviceExpert* t,const GemmJob& j,int n,int k,int xs,int os,int groups,int gx,int go,cudaStream_t s){
     switch(k){
-        case 128: return launch_one<128,BITS>(t,j,n,xs,os,groups,gx,go,s);
-        case 256: return launch_one<256,BITS>(t,j,n,xs,os,groups,gx,go,s);
-        case 1280: return launch_one<1280,BITS>(t,j,n,xs,os,groups,gx,go,s);
-        case 2304: return launch_one<2304,BITS>(t,j,n,xs,os,groups,gx,go,s);
-        case 4096: return launch_one<4096,BITS>(t,j,n,xs,os,groups,gx,go,s);
-        case 5120: return launch_one<5120,BITS>(t,j,n,xs,os,groups,gx,go,s);
-        case 8192: return launch_one<8192,BITS>(t,j,n,xs,os,groups,gx,go,s);
+        case 128: return launch_one<128,BITS,OutT>(t,j,n,xs,os,groups,gx,go,s);
+        case 256: return launch_one<256,BITS,OutT>(t,j,n,xs,os,groups,gx,go,s);
+        case 1280: return launch_one<1280,BITS,OutT>(t,j,n,xs,os,groups,gx,go,s);
+        case 2304: return launch_one<2304,BITS,OutT>(t,j,n,xs,os,groups,gx,go,s);
+        case 4096: return launch_one<4096,BITS,OutT>(t,j,n,xs,os,groups,gx,go,s);
+        case 5120: return launch_one<5120,BITS,OutT>(t,j,n,xs,os,groups,gx,go,s);
+        case 8192: return launch_one<8192,BITS,OutT>(t,j,n,xs,os,groups,gx,go,s);
         default: return cudaErrorNotSupported;
     }
 }
@@ -594,6 +595,18 @@ cudaError_t exl3_dense_prefill(const DeviceExpert* t,GemmJob j,int n,int k,int b
         default: return cudaErrorInvalidValue;
     }
     return cudaGetLastError();
+}
+// s0ma change 43: decode of one dense tensor into FP32 rows (Sero's K4 head: the logits), the unsplit kernel
+cudaError_t exl3_dense_f32(const DeviceExpert* t,GemmJob j,int n,int k,int bits,cudaStream_t s,int x_stride,int out_stride){
+    const int xs=x_stride?x_stride:k,os=out_stride?out_stride:n;
+    if(!t||n<=0||n%128||k<=0||k%128||k>8192||xs<k||os<n||j.tokens<1)return cudaErrorInvalidValue;
+    switch(bits){
+        case 2: return launch_one_k<2,float>(t,j,n,k,xs,os,1,0,0,s);
+        case 3: return launch_one_k<3,float>(t,j,n,k,xs,os,1,0,0,s);
+        case 4: return launch_one_k<4,float>(t,j,n,k,xs,os,1,0,0,s);
+        case 5: return launch_one_k<5,float>(t,j,n,k,xs,os,1,0,0,s);
+        default: return cudaErrorInvalidValue;
+    }
 }
 // s0ma change 37: prefill pieces for the caller's FP16 GEMM
 cudaError_t exl3_dense_reconstruct(const DeviceExpert* t,int index,int n,int k,int bits,half* w,cudaStream_t s){

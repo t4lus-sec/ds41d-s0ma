@@ -63,7 +63,32 @@ static void hadamard128(float* v) {           // Sylvester order, scaled by 1/sq
     for (int i = 0; i < 128; ++i) v[i] *= 0.088388347648f;
 }
 
-struct Case { int bits, K, N, tokens; bool prefill; ds41::Projection p; bool var = false; bool dense = false; int stride = 1; };
+// s0ma change 37: the prefill route's GEMM, done plainly here (the engine uses cuBLAS): C[m][n] = sum_k A[m][k] W[k][n]
+__global__ void plain_gemm(const half* A, const half* W, float* C, int M, int N, int K) {DS41_PDL_WAIT();
+    const int n = blockIdx.x * blockDim.x + threadIdx.x, m = blockIdx.y;
+    if (n >= N) return;
+    float acc = 0;
+    for (int k = 0; k < K; ++k) acc += __half2float(A[size_t(m) * K + k]) * __half2float(W[size_t(k) * N + n]);
+    C[size_t(m) * N + n] = acc;
+}
+// a split launch with its own scratch (partials, zeroed counts), twice: the counts must come back to zero
+static void dense_split(const ds41::DeviceExpert* t, ds41::GemmJob j, int N, int K, int bits, int xs, int os, int groups,
+                        int gx, int go, bool* invariant) {
+    const size_t pf = ds41::exl3_dense_splitk_floats(N, K, groups), slots = size_t(groups) * (N / 128);
+    float* partial = nullptr; unsigned* counts = nullptr;
+    if (pf) { CK(cudaMalloc(&partial, pf * 4)); CK(cudaMalloc(&counts, slots * 4)); CK(cudaMemset(counts, 0, slots * 4)); }
+    for (int rep = 0; rep < 2; ++rep) {
+        CK(ds41::exl3_dense(t, j, N, K, bits, 0, xs, os, groups, gx, go, partial, pf, counts, slots));
+        CK(cudaDeviceSynchronize());
+    }
+    if (counts) {
+        std::vector<unsigned> h(slots);
+        CK(cudaMemcpy(h.data(), counts, slots * 4, cudaMemcpyDeviceToHost));
+        for (unsigned v : h) if (v) { *invariant = false; break; }
+        cudaFree(partial); cudaFree(counts);
+    }
+}
+struct Case { int bits, K, N, tokens; bool prefill; ds41::Projection p; bool var = false; bool dense = false; int stride = 1; bool dq = false; };
 
 static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
     const int K = c.K, N = c.N, M = c.tokens, bits = c.bits;
@@ -106,17 +131,28 @@ static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
             ds41::DeviceExpert two[2] = {e, e}, *dt2;
             CK(cudaMalloc(&dt2, sizeof two)); CK(cudaMemcpy(dt2, two, sizeof two, cudaMemcpyHostToDevice));
             ds41::GemmJob gj{0, M, reinterpret_cast<const uint8_t*>(wx), nullptr, wout};
-            CK(ds41::exl3_dense(dt2, gj, N, K, bits, 0, K * S, N * S, 2, K, N));
+            dense_split(dt2, gj, N, K, bits, K * S, N * S, 2, K, N, invariant);   // s0ma change 37: split when narrow
             CK(cudaDeviceSynchronize()); cudaFree(dt2);
         }
         CK(cudaDeviceSynchronize());
         CK(cudaMemcpy2D(dout, size_t(N) * 2, wout + N, size_t(N) * S * 2, size_t(N) * 2, M, cudaMemcpyDeviceToDevice));
         cudaFree(wx); cudaFree(wout);
     }
+    else if (c.dq) {   // s0ma change 37: prefill as decoded weights, rotated rows, a GEMM, rotated output
+        half *W, *A; float* C;
+        CK(cudaMalloc(&W, size_t(K) * N * 2)); CK(cudaMalloc(&A, size_t(M) * K * 2)); CK(cudaMalloc(&C, size_t(M) * N * 4));
+        CK(ds41::exl3_dense_reconstruct(dt, 0, N, K, bits, W, 0));
+        CK(ds41::exl3_dense_rotate_in(dt, 0, dx, M, K, 0, A, 0));
+        plain_gemm<<<dim3((N + 127) / 128, M), 128>>>(A, W, C, M, N, K);
+        CK(cudaGetLastError());
+        CK(ds41::exl3_dense_rotate_out(dt, 0, C, M, N, K, dout, 0, 0));
+        CK(cudaDeviceSynchronize());
+        cudaFree(W); cudaFree(A); cudaFree(C);
+    }
     else if (c.dense) {   // s0ma change 34: the by-value dense launches (gate views), at an explicit width
         CK(ds41::exl3_set_bits(bits == 2 ? 3 : 2));   // the global width must not matter
         if (c.prefill) CK(ds41::exl3_dense_prefill(dt, job, N, K, bits, 0));
-        else CK(ds41::exl3_dense(dt, job, N, K, bits, 0));
+        else dense_split(dt, job, N, K, bits, 0, 0, 1, 0, 0, invariant);   // s0ma change 37: split when narrow
         CK(ds41::exl3_set_bits(bits));
     }
     else if (c.prefill) CK(ds41::grouped_exl3_prefill(dt, dj, 1, c.p, N, K, M, 0));
@@ -201,6 +237,12 @@ int main() {
         {5, 8192, 5120, 97, true, ds41::Projection::Gate, false, true},
         {5, 4096, 1024, 6, false, ds41::Projection::Gate, false, true, 8}, {5, 4096, 1024, 200, true, ds41::Projection::Gate, false, true, 8},
         {5, 4096, 1024, 1, false, ds41::Projection::Gate, false, true},
+        // s0ma change 37: 0xSero's narrow tensors split over K (wkv, wq_a, shared w1 and w2), and the prefill route
+        {4, 5120, 512, 6, false, ds41::Projection::Gate, false, true}, {4, 5120, 1280, 1, false, ds41::Projection::Gate, false, true},
+        {4, 5120, 2304, 8, false, ds41::Projection::Gate, false, true}, {4, 2304, 5120, 3, false, ds41::Projection::Gate, false, true},
+        {3, 5120, 512, 2, false, ds41::Projection::Gate, false, true},
+        {4, 5120, 1280, 256, true, ds41::Projection::Gate, false, false, 1, true}, {5, 4096, 1024, 100, true, ds41::Projection::Gate, false, false, 1, true},
+        {4, 8192, 5120, 33, true, ds41::Projection::Gate, false, false, 1, true}, {2, 2304, 5120, 9, true, ds41::Projection::Gate, false, false, 1, true},
     };
     int fail = 0;
     for (const auto& c : cases) {
@@ -209,7 +251,7 @@ int main() {
         bool ok = e < 1e-2 && inv;
         fail += !ok;
         std::printf("%s K%d %s k=%d n=%d rows=%d: relative error %.2e%s\n", ok ? "ok  " : "FAIL", c.bits,
-                    c.dense ? (c.prefill ? "dense prefill" : "dense decode ") : c.prefill ? "prefill" : c.var ? "mixed  " : "decode ", c.K, c.N, c.tokens, e, inv ? "" : "; row 0 differs by row count");
+                    c.dq ? "dense dequant+gemm" : c.dense ? (c.prefill ? "dense prefill" : "dense decode ") : c.prefill ? "prefill" : c.var ? "mixed  " : "decode ", c.K, c.N, c.tokens, e, inv ? "" : "; row 0 differs by row count");
     }
     std::printf(fail ? "%d FAILED\n" : "all passed\n", fail);
     return fail ? 1 : 0;

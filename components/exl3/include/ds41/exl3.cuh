@@ -32,8 +32,21 @@ cudaError_t grouped_exl3_prefill_bits(const DeviceExpert* table, const GemmJob* 
 // elements, 0 for k and n (a slice of wider rows otherwise; decode also takes k=4096, 0xSero's wo_a groups).
 // Decode also runs `groups` tensors at consecutive table entries in one launch: group g is entry job.expert + g, reads
 // job.x + g*group_x and writes job.output + g*group_out (elements); 0xSero's wo_a slices.
+// s0ma change 37: with scratch (partial: exl3_dense_splitk_floats() floats; counts: groups*n/128 zeroed slots, left
+// zeroed), a tensor of few column tiles runs with its K split across CTAs, partials added in a fixed order.
 cudaError_t exl3_dense(const DeviceExpert* table, GemmJob job, int n, int k, int bits, cudaStream_t stream,
-                       int x_stride = 0, int out_stride = 0, int groups = 1, int group_x = 0, int group_out = 0);
+                       int x_stride = 0, int out_stride = 0, int groups = 1, int group_x = 0, int group_out = 0,
+                       float* partial = nullptr, size_t partial_floats = 0, unsigned* counts = nullptr,
+                       size_t count_slots = 0);
+size_t exl3_dense_splitk_floats(int n, int k, int groups);
+// s0ma change 37: prefill as exllamav3 does it for many rows: W [k, n] FP16 decoded from table[index] (row = input
+// feature), the rows rotated into FP16 [rows, k], the caller's FP16 GEMM into FP32 [rows, n], then rotated and scaled
+// into BF16 (out_stride 0: n).
+cudaError_t exl3_dense_reconstruct(const DeviceExpert* table, int index, int n, int k, int bits, half* w, cudaStream_t stream);
+cudaError_t exl3_dense_rotate_in(const DeviceExpert* table, int index, const __nv_bfloat16* x, int rows, int k,
+                                 int x_stride, half* a, cudaStream_t stream);
+cudaError_t exl3_dense_rotate_out(const DeviceExpert* table, int index, const float* c, int rows, int n, int k,
+                                  __nv_bfloat16* out, int out_stride, cudaStream_t stream);
 cudaError_t exl3_dense_prefill(const DeviceExpert* table, GemmJob job, int n, int k, int bits, cudaStream_t stream,
                                int x_stride = 0, int out_stride = 0);
 cudaError_t grouped_exl3_var(const DeviceExpert* table, const GemmJob* jobs, int count,

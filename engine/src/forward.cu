@@ -237,6 +237,16 @@ class Native final : public Forward, public hotpath::GateEvidence {
   Device dense_table;
   double dense_extra_gib = 0;                         // VRAM the swap gave back, for expert slots
   std::set<std::string> dense_woa;                    // "layers.L.attn" whose wo_a runs as Sero's eight slices
+  // s0ma change 37: decode's split-K scratch, one set a verify lane (partial sums; counts, zeroed and left zeroed),
+  // and prefill's: one layer's tensors decoded to FP16 (filled on a layer's first use, reused by its other chunks),
+  // the rows rotated into FP16 and the GEMM's FP32 result, 256 rows at a time
+  Device dense_split_partial[2], dense_split_counts[2];
+  size_t dense_split_floats = 0;
+  static constexpr size_t dense_split_slots = 4096;
+  Device dense_cache, dense_rows_a, dense_rows_c;
+  std::string dense_cache_layer;
+  size_t dense_cache_used = 0;
+  std::map<std::string, size_t> dense_cache_at;
   bool dense_since_quant = false;                     // an EXL3 projection ran since the last FP8 activation quant
   std::unique_ptr<ds41::OffloadStore> experts;
   // --exl3-experts: `experts` holds EXL3 K3 target experts (layers 0..39) and this store the native
@@ -1724,6 +1734,26 @@ private:
     }
     dense_table.resize(table.size() * sizeof(ds41::DeviceExpert));
     CK(cudaMemcpy(dense_table.p, table.data(), table.size() * sizeof(ds41::DeviceExpert), cudaMemcpyHostToDevice));
+    // s0ma change 37: the split-K and prefill scratch, sized from the tensors taken
+    std::map<std::string, size_t> layer_bytes;
+    size_t widest_k = 0, widest_n = 0;
+    for (const auto &[name, d] : dense_exl3) {
+      const bool slice = name.find(".wo_a.slice.") != std::string::npos;
+      dense_split_floats = std::max(dense_split_floats, ds41::exl3_dense_splitk_floats(d.n, d.k, slice ? 8 : 1));
+      layer_bytes[name.substr(0, name.find('.', 7))] += (size_t(d.k) * d.n * 2 + 255) / 256 * 256;
+      widest_k = std::max<size_t>(widest_k, d.k);
+      widest_n = std::max<size_t>(widest_n, d.n);
+    }
+    size_t cache = 0;
+    for (const auto &[layer, b] : layer_bytes) cache = std::max(cache, b);
+    dense_split_partial[0].resize(std::max<size_t>(dense_split_floats, 1) * 4);
+    dense_split_counts[0].resize(dense_split_slots * 4);
+    CK(cudaMemset(dense_split_counts[0].p, 0, dense_split_slots * 4));
+    dense_cache.resize(cache);
+    dense_rows_a.resize(256 * widest_k * 2);
+    dense_rows_c.resize(256 * widest_n * 4);
+    used += dense_split_partial[0].bytes + dense_split_counts[0].bytes + dense_cache.bytes + dense_rows_a.bytes +
+            dense_rows_c.bytes;
     dense_extra_gib = freed > used ? double(freed - used) / double(size_t(1) << 30) : 0;
     std::cerr << "Sero dense EXL3 (" << meta.at("source").get<std::string>() << "): " << table.size() << " tensors, "
               << used / 1e9 << " GB in place of " << freed / 1e9 << " GB of FP8 (" << skipped << " left native):";
@@ -1743,16 +1773,50 @@ private:
     if (!xs) xs = d->k;
     if (!os) os = d->n;
     const auto *table = static_cast<const ds41::DeviceExpert *>(dense_table.p);
-    const int cap = m <= 8 ? (d->k > 5120 ? 4 : 8) : 256;
+    dense_since_quant = true;
+    if (m > 8) { dense_prefill(prefix, *d, in, out, m, xs, os); return true; }
+    // s0ma change 37: K split across CTAs for the narrow tensors (8 rows a launch then, whatever k)
+    const bool split = ds41::exl3_dense_splitk_floats(d->n, d->k, 1) > 0;
+    const int cap = split || d->k <= 5120 ? 8 : 4, lane = lane_b_active ? 1 : 0;
     for (int r = 0; r < m; r += cap) {
       ds41::GemmJob job{ds41::ExpertId(d->index), std::min(cap, m - r),
                         static_cast<const uint8_t *>(in) + size_t(r) * xs * 2, nullptr,
                         static_cast<__nv_bfloat16 *>(out) + size_t(r) * os};
-      if (m <= 8) CK(ds41::exl3_dense(table, job, d->n, d->k, d->bits, stream, xs, os));
-      else CK(ds41::exl3_dense_prefill(table, job, d->n, d->k, d->bits, stream, xs, os));
+      CK(ds41::exl3_dense(table, job, d->n, d->k, d->bits, stream, xs, os, 1, 0, 0,
+                          dense_split_partial[lane].as<float>(), dense_split_partial[lane].bytes / 4,
+                          dense_split_counts[lane].as<unsigned>(), dense_split_counts[lane].bytes / 4));
     }
-    dense_since_quant = true;
     return true;
+  }
+  // s0ma change 37: prefill rows through Sero's tensor as exllamav3 runs many rows: its weights decoded to FP16 once
+  // a layer, each 256 rows rotated into FP16, one cuBLAS FP16 GEMM with FP32 sums, the result rotated into BF16
+  void dense_prefill(const std::string &prefix, const DenseExl3 &d, const void *in, void *out, int m, int xs, int os) {
+    const auto *table = static_cast<const ds41::DeviceExpert *>(dense_table.p);
+    const std::string layer = prefix.substr(0, prefix.find('.', 7));
+    if (layer != dense_cache_layer) { dense_cache_layer = layer; dense_cache_at.clear(); dense_cache_used = 0; }
+    auto at = dense_cache_at.find(prefix);
+    if (at == dense_cache_at.end()) {
+      const size_t bytes = (size_t(d.k) * d.n * 2 + 255) / 256 * 256;
+      if (dense_cache_used + bytes > dense_cache.bytes) { dense_cache_at.clear(); dense_cache_used = 0; }
+      CK(ds41::exl3_dense_reconstruct(table, d.index, d.n, d.k, d.bits,
+                                      reinterpret_cast<half *>(dense_cache.as<char>(dense_cache_used)), stream));
+      at = dense_cache_at.emplace(prefix, dense_cache_used).first;
+      dense_cache_used += bytes;
+    }
+    const half *W = reinterpret_cast<const half *>(dense_cache.as<char>(at->second));
+    if (cublasSetStream(blas, stream) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasSetStream");
+    const float one = 1, zero = 0;
+    for (int r = 0; r < m; r += 256) {
+      const int rows = std::min(256, m - r);
+      CK(ds41::exl3_dense_rotate_in(table, d.index, static_cast<const __nv_bfloat16 *>(in) + size_t(r) * xs, rows, d.k,
+                                    xs, dense_rows_a.as<half>(), stream));
+      if (cublasGemmEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, d.n, rows, d.k, &one, W, CUDA_R_16F, d.n,
+                       dense_rows_a.p, CUDA_R_16F, d.k, &zero, dense_rows_c.p, CUDA_R_32F, d.n,
+                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error("cublasGemmEx (Sero dense prefill): " + prefix);
+      CK(ds41::exl3_dense_rotate_out(table, d.index, dense_rows_c.as<float>(), rows, d.n, d.k,
+                                     static_cast<__nv_bfloat16 *>(out) + size_t(r) * os, os, stream));
+    }
   }
   // wo[m, 8192] = wo_a(o[m, 32768]) through Sero's eight slices: false when this layer keeps the native wo_a
   bool dense_wo_a(const std::string &attn, const void *o, void *wo, int m) {
@@ -1761,8 +1825,11 @@ private:
       const DenseExl3 *d = dense_of(attn + ".wo_a.slice.0");
       ds41::GemmJob job{ds41::ExpertId(d->index), m, static_cast<const uint8_t *>(o), nullptr,
                         static_cast<__nv_bfloat16 *>(wo)};
+      const int lane = lane_b_active ? 1 : 0;
       CK(ds41::exl3_dense(static_cast<const ds41::DeviceExpert *>(dense_table.p), job, 1024, 4096, d->bits, stream,
-                          32768, 8192, 8, 4096, 1024));
+                          32768, 8192, 8, 4096, 1024, dense_split_partial[lane].as<float>(),
+                          dense_split_partial[lane].bytes / 4, dense_split_counts[lane].as<unsigned>(),
+                          dense_split_counts[lane].bytes / 4));
       dense_since_quant = true;
       return true;
     }

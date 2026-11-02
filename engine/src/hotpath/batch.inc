@@ -637,6 +637,11 @@ void ensure_lanes() {
   CK(cudaStreamCreateWithFlags(&lane_stream,cudaStreamNonBlocking));
   if(cublasCreate(&lane_blas)!=CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate (lane B)");
   pdl_workspace(lane_blas,pdl_lane_workspace);   // s0ma change 36
+  if(dense_split_partial[0].bytes) {   // s0ma change 37: lane B's own split-K scratch
+    dense_split_partial[1].resize(dense_split_partial[0].bytes);
+    dense_split_counts[1].resize(dense_split_counts[0].bytes);
+    CK(cudaMemset(dense_split_counts[1].p,0,dense_split_counts[1].bytes));
+  }
   for(auto &e:lane_att_events) CK(cudaEventCreateWithFlags(&e,cudaEventDisableTiming));
   CK(cudaEventCreateWithFlags(&lane_entry,cudaEventDisableTiming));
   CK(cudaEventCreateWithFlags(&lane_exit,cudaEventDisableTiming));

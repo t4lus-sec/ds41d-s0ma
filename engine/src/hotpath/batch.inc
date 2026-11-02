@@ -481,6 +481,11 @@ StepMarks step_marks(int64_t pos) {
   audit_pos=pos;
   for(auto &layer:audit_pred) for(auto &v:layer) v.clear();
   StepMarks k;
+  // s0ma change 63: the profiler range opens before the A-th verify step's first launch
+  if(profile_from>0 && ++verify_count==profile_from && !profiler_open) {
+    CK(cudaStreamSynchronize(stream)); CK(cudaProfilerStart()); profiler_open=true;
+    std::cerr<<"profiler range: open at verify step "<<verify_count<<"\n";
+  }
   k.start=clock_ms(); k.io=io_ms; k.route=route_ms; k.engram=engram_ms;
   k.plan=host_plan_ms; k.enqueue=callback_enqueue_ms;
   if(config.hotpath_profile) {
@@ -662,8 +667,14 @@ std::vector<std::vector<float>> batch_finish(int64_t pos,int m,const StepMarks &
       step["consumer_readiness"]=consumer_readiness->collect();
     step["cpu_only_experts"]=0;
     step["moe_demand_grouping"]="sorted unique logical-ID union per layer/verify";
+    if(profile_from>0) step["profiler_range"]=profiler_open;   // s0ma change 63
     if(profile_steps.size()==4096) profile_steps.erase(profile_steps.begin());
     profile_steps.push_back(std::move(step));
+  }
+  // s0ma change 63: and closes after the B-th (every launch of this step has completed: the stream was synchronized)
+  if(profiler_open && verify_count>=profile_to) {
+    CK(cudaDeviceSynchronize()); CK(cudaProfilerStop()); profiler_open=false; profile_from=-1;
+    std::cerr<<"profiler range: closed after verify step "<<verify_count<<"\n";
   }
   std::vector<std::vector<float>> result;
   for(int r=0;r<m;++r) result.emplace_back(output+r*V,output+(r+1)*V);

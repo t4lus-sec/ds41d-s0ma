@@ -56,8 +56,9 @@ SERO_ENV = {'DS41_CLASS_WEIGHTS': 'K3:1.3', 'DS41_SPARK_STOP_Q': '0.35'}
 # prompts' prefill into two segments (+7-12 s each).
 SERO_MAX_CONTEXT = 262144
 SERO_EXTRA_GIB, SERO_EXTRA_GIB_1M = '3.5', '2.4'
-# The measured host RAM tier. More RAM lowers NVMe reads (96 -> 104 GiB: +3.3% decode); larger tiers are untested.
-MAX_HOST_GIB = 104
+# The measured host RAM tier. More RAM lowers NVMe reads (96 -> 104 GiB: +3.3% decode). s0ma change 63: up to 112, so
+# Sero's full residency (every unpinned expert in VRAM or RAM, ~90-100 GiB of tier) fits a 128 GB box with room to spare.
+MAX_HOST_GIB = 112
 # The placement seeds 5,480 experts into the RAM tier (95.99 GiB), so the tier needs at least 96 GiB.
 MIN_HOST_GIB = 96
 # RAM left to the OS, the API and page cache next to the pinned tier.

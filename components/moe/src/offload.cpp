@@ -73,6 +73,7 @@ struct OffloadStore::Impl {
     // s0ma change 12: byte offsets of each VRAM and RAM-tier slot (slot * slot_bytes unless slot classes are set)
     std::vector<size_t> vram_offsets, host_offsets;
     size_t vram_total=0, host_total=0, host_slot_count=0;
+    size_t preloaded=0, preload_evicted=0;   // s0ma change 63
     size_t voff(size_t slot)const{return vram_offsets.empty()?slot*slot_bytes:vram_offsets[slot];}
     // s0ma change 51 (V6): lendable slots [lend_first, lend_first+lend_n) live in lend_base chunks of lend_per slots
     // (lend_cbytes each); a null chunk is lent to prompt processing.
@@ -872,13 +873,23 @@ void OffloadStore::pin_host(std::vector<ExpertId> ids) {
     impl_->submit([this,ids=std::move(ids)]{
         std::set<ExpertId> distinct(ids.begin(),ids.end());
         for(auto id:distinct)impl_->records.at(id);
-        std::vector<ExpertId> pinned;
+        // s0ma change 63: the seeds are read 64 records at a time, each straight into its own RAM slot (as warm_host
+        // reads), not one record at a time. Same records, same slots: each is pinned before its batch is read, so no
+        // slot is reused within a batch.
+        std::vector<const Record*> refs;std::vector<void*> fixed;
+        auto flush=[&]{
+            if(refs.empty())return;
+            try{impl_->reader.stream_mixed(refs,{},fixed,{},{},impl_->cfg.io_chunk_bytes);}catch(...){impl_->fail(std::current_exception());throw;}
+            refs.clear();fixed.clear();
+        };
         for(auto id:distinct){
             bool hit=impl_->host.count(id);int slot=impl_->admit_host(id,false);
             if(slot<0)throw std::runtime_error("pinned host budget exceeded");
-            impl_->host_pool->pin(id);pinned.push_back(id);
-            if(!hit)try{impl_->reader.read({&impl_->records.at(id)},{static_cast<char*>(impl_->host_arena->data())+impl_->hoff(size_t(slot))});}catch(...){impl_->fail(std::current_exception());throw;}
+            impl_->host_pool->pin(id);
+            if(!hit){refs.push_back(&impl_->records.at(id));fixed.push_back(static_cast<char*>(impl_->host_arena->data())+impl_->hoff(size_t(slot)));}
+            if(refs.size()==64)flush();
         }
+        flush();
     }).get();
 }
 OffloadStore::HostLease OffloadStore::borrow_host(std::vector<ExpertId> ids) {
@@ -940,6 +951,31 @@ void OffloadStore::place(const Placement& input) {
     pin_host(p.host_residents);
     if(impl_->cfg.dynamic_host)impl_->submit([this,p]{for(auto id:p.host_residents)impl_->host_pool->unpin(id);}).get();
     pin_vram(p.vram_pins);
+    // s0ma change 63: experts loaded into the empty dynamic VRAM slots, 64 at a time, as pin_vram loads (from the drive,
+    // no RAM admission) but left unpinned. Before the lendable slots join, so none lands in a slot a prompt frees.
+    // A load that had to evict (no empty slot of its class left) stops the preload there.
+    if(!p.vram_preload.empty()){
+        std::set<ExpertId> taken(p.vram_pins.begin(),p.vram_pins.end());
+        taken.insert(p.host_residents.begin(),p.host_residents.end());
+        std::set<ExpertId> seen;
+        for(auto id:p.vram_preload)
+            if(taken.count(id) || !seen.insert(id).second || !impl_->records.count(id))
+                throw std::invalid_argument("vram_preload: an id pinned, seeded, repeated or without a record");
+        size_t loaded=0,evicted=0;
+        for(size_t i=0;i<p.vram_preload.size() && !evicted;i+=64){
+            std::vector<ExpertId> chunk(p.vram_preload.begin()+i,p.vram_preload.begin()+std::min(i+64,p.vram_preload.size()));
+            evicted=impl_->submit([this,chunk]{
+                auto lease=impl_->load(chunk,nullptr,false,{},{},false);
+                ck(cudaStreamSynchronize(impl_->copy));ck(cudaStreamSynchronize(impl_->mapping));
+                size_t ev=0;
+                for(auto a:lease.allocations){impl_->known_ready[a.slot]=true;if(!a.hit && a.evicted>=0)++ev;}
+                impl_->pool.release(lease.allocations);impl_->live.erase(lease.serial);
+                return ev;
+            }).get();
+            loaded+=chunk.size();
+        }
+        impl_->preloaded=loaded;impl_->preload_evicted=evicted;
+    }
     // s0ma change 51: the lendable slots join the pool once the pins are placed
     impl_->submit([this]{for(size_t j=0;j<impl_->lend_n;++j)impl_->pool.set_lent(impl_->lend_first+j,false);}).get();
 }
@@ -1026,6 +1062,7 @@ void OffloadStore::admit_end(Admission a){
     }).get();
 }
 void OffloadStore::log_nvme_misses(bool on){impl_->miss_on.store(on);}
+std::pair<size_t,size_t> OffloadStore::preload_result() const{return {impl_->preloaded,impl_->preload_evicted};}
 std::pair<uint64_t,uint64_t> OffloadStore::demand_totals() const{
     return {impl_->demand_host_hits.load(std::memory_order_relaxed),impl_->demand_nvme.load(std::memory_order_relaxed)};
 }

@@ -36,6 +36,12 @@
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <cublas_v2.h>
+#if __has_include(<cuda_profiler_api.h>)
+#include <cuda_profiler_api.h>
+#else   // s0ma change 63: the runtime's profiler range, declared as the toolkit's header does (libcudart has them)
+extern "C" cudaError_t cudaProfilerStart(void);
+extern "C" cudaError_t cudaProfilerStop(void);
+#endif
 #include <filesystem>
 #include <sstream>
 #include <fstream>
@@ -45,6 +51,7 @@
 #include <iostream>
 #include <map>
 #include <numeric>
+#include <unordered_set>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -648,6 +655,15 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::unique_ptr<hotpath::ConsumerReadiness> consumer_readiness;
   double host_plan_ms=0, callback_enqueue_ms=0;
   Json profile_steps=Json::array(), step_demands=Json::array();
+  // s0ma change 63: DS41_PROFILE_STEPS=A:B opens the CUDA profiler range (cudaProfilerStart) before the engine's A-th
+  // verify step and closes it after its B-th (counted from 1 over the process). Under nsys --capture-range=
+  // cudaProfilerApi only that window is traced, and the trace is complete when the range closes, while the engine
+  // still runs. Steps inside the window say "profiler_range": true in the hot-path profile.
+  long profile_from = -1, profile_to = -1, verify_count = 0;
+  bool profiler_open = false;
+  // s0ma change 63: full residency's plan (mixed_store_classes), applied to the placement
+  bool full_residency = false;
+  std::vector<ds41::ExpertId> full_preload, full_seeds;
   Device gate_slab;
   std::vector<uint8_t> gate_host;
   std::vector<std::vector<uint8_t>> gate_rows;
@@ -768,6 +784,15 @@ public:
     if (keep_device_logits) vlogits.resize(size_t(6) * V * 4);
     host = std::make_unique<ds41::HostBuffer>(16 << 20, true);
     pages = std::make_unique<ds41::HostBuffer>(1 << 20, true);
+    if (const char *r = std::getenv("DS41_PROFILE_STEPS"); r && *r) {   // s0ma change 63
+      char *end = nullptr;
+      profile_from = std::strtol(r, &end, 10);
+      if (*end != ':') throw std::invalid_argument("DS41_PROFILE_STEPS must be A:B (verify steps, 1 <= A <= B)");
+      profile_to = std::strtol(end + 1, &end, 10);
+      if (*end || profile_from < 1 || profile_to < profile_from)
+        throw std::invalid_argument("DS41_PROFILE_STEPS must be A:B (verify steps, 1 <= A <= B)");
+      std::cerr << "profiler range: verify steps " << profile_from << " to " << profile_to << "\n";
+    }
     if (!c.fused_head_library.empty()) {
       // Spark drafts with its compact BF16 head over this same native matrix (head_kind 1).
       fused_head_handle = dlopen(c.fused_head_library.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -910,7 +935,21 @@ public:
           std::cerr << "mixed EXL3 store: placement budgets grown by " << grown << " slots to the store's " << ec.slots << "\n";
         }
       }
+      if (full_residency) {
+        // s0ma change 63: every unpinned target expert placed: the plan's seeds (the drafter's own, if any, kept)
+        auto &hr = placement.host_residents;
+        hr.erase(std::remove_if(hr.begin(), hr.end(), [](ds41::ExpertId id) { return id < 15360; }), hr.end());
+        hr.insert(hr.end(), full_seeds.begin(), full_seeds.end());
+        placement.vram_preload = full_preload;
+      }
+      const double load_t0 = clock_ms();
       experts->place(placement);
+      if (full_residency) {
+        const auto [loaded, evicted] = experts->preload_result();
+        std::cerr << "full residency: " << full_seeds.size() << " experts seeded into RAM, " << loaded << " of "
+                  << full_preload.size() << " loaded into VRAM" << (evicted ? " (stopped: a load had to evict)" : "")
+                  << ", placement " << (clock_ms() - load_t0) / 1000 << " s\n";
+      }
     }
 #if DS41_MOE_SOURCE_API>=4
     if(c.reset_cache_history) experts->reset_history();
@@ -2700,12 +2739,92 @@ private:
     ec.class_bytes = bytes;
     ec.class_slots = vram;
     ec.class_host_slots.assign(n, 0);
+    // s0ma change 63: full residency. When the RAM tier can hold every unpinned target expert that the dynamic VRAM
+    // slots cannot, place them all at load: the dynamic VRAM slots of each width class (less the lendable ones and a
+    // reserve of 16 for demotions) filled with that class's unpinned experts, taken round-robin over the layers, each
+    // layer's RAM seeds first; every other unpinned expert seeded into the RAM tier, whose per-class slots are sized
+    // to hold them plus the reserve, the bytes left over split in proportion. With the exclusive RAM tier (demotion)
+    // nothing is then left only on the drive. Placement only, so exact. DS41_FULL_RESIDENCY=auto (default: on when it
+    // fits), 1 (required: refuse to start otherwise) or 0 (off).
+    std::vector<size_t> full_need;
+    {
+      full_preload.clear(); full_seeds.clear(); full_residency = false;
+      std::string mode = "auto";
+      if (const char *x = std::getenv("DS41_FULL_RESIDENCY"); x && *x) mode = x;
+      if (mode != "0" && mode != "1" && mode != "auto") throw std::invalid_argument("DS41_FULL_RESIDENCY must be 0, 1 or auto");
+      const char *dm = std::getenv("DS41_MOE_DEMOTE");
+      const bool demote_on = dm && std::string(dm) == "1";
+      std::string why;
+      if (mode == "0") why = "off (DS41_FULL_RESIDENCY=0)";
+      else if (!c.dynamic_host) why = "off: needs --dynamic-host";
+      else if (!demote_on) why = "off: needs the exclusive RAM tier (DS41_MOE_DEMOTE=1)";
+      else if (pl.hard_layer_budgets) why = "off: the placement has hard layer budgets";
+      if (why.empty()) {
+        std::unordered_set<ds41::ExpertId> seeded;
+        for (auto id : pl.host_residents) if (id < 15360) seeded.insert(id);
+        std::vector<std::vector<ds41::ExpertId>> cand(n);
+        std::vector<std::vector<std::vector<ds41::ExpertId>>> per(n, std::vector<std::vector<ds41::ExpertId>>(40));
+        for (int l = 0; l < 40; ++l)
+          for (int pass = 0; pass < 2; ++pass)
+            for (int e = 0; e < 384; ++e) {
+              const ds41::ExpertId id = ds41::ExpertId(l * 384 + e);
+              if (pinned[id] || (seeded.count(id) != 0) != (pass == 0)) continue;
+              per[ec.expert_class[id]][size_t(l)].push_back(id);
+            }
+        for (size_t k = 0; k < n; ++k)
+          for (size_t i = 0;; ++i) {
+            bool any = false;
+            for (int l = 0; l < 40; ++l) if (i < per[k][size_t(l)].size()) { cand[k].push_back(per[k][size_t(l)][i]); any = true; }
+            if (!any) break;
+          }
+        constexpr size_t reserve = 16;
+        std::vector<size_t> pre(n, 0);
+        full_need.assign(n, 0);
+        double need_bytes = 0, all_bytes = 0, pre_bytes = 0;
+        for (size_t k = 0; k < n; ++k) {
+          const size_t lent = ec.lend_class == int(k) ? ec.lend_slots : 0;
+          const size_t dyn = vram[k] > pins[k] + lent ? vram[k] - pins[k] - lent : 0;
+          pre[k] = std::min(cand[k].size(), dyn > reserve ? dyn - reserve : 0);
+          full_need[k] = cand[k].size() - pre[k] + reserve;
+          need_bytes += double(full_need[k]) * double(bytes[k]);
+          all_bytes += double(cand[k].size()) * double(bytes[k]);
+          pre_bytes += double(pre[k]) * double(bytes[k]);
+        }
+        const double gib = double(1ull << 30);
+        std::ostringstream fr;
+        fr << std::fixed << std::setprecision(1) << "full residency: the " << std::accumulate(cand.begin(), cand.end(), size_t(0),
+              [](size_t s, const auto &v) { return s + v.size(); })
+           << " unpinned target experts (" << all_bytes / gib << " GiB): " << pre_bytes / gib
+           << " GiB into dynamic VRAM at load, so the RAM tier needs " << need_bytes / gib << " GiB; it has "
+           << double(c.host_bytes) / gib << " GiB";
+        if (need_bytes <= double(c.host_bytes)) {
+          full_residency = true;
+          const double spare = double(c.host_bytes) - need_bytes;
+          for (size_t k = 0; k < n; ++k) {
+            ec.class_host_slots[k] = full_need[k] + size_t(spare * double(full_need[k]) * double(bytes[k]) / need_bytes) / bytes[k];
+            full_preload.insert(full_preload.end(), cand[k].begin(), cand[k].begin() + long(pre[k]));
+            full_seeds.insert(full_seeds.end(), cand[k].begin() + long(pre[k]), cand[k].end());
+          }
+          fr << ": on";
+        } else {
+          fr << ": off (" << (need_bytes - double(c.host_bytes)) / gib << " GiB short)";
+          full_need.clear();
+        }
+        std::cerr << fr.str() << std::defaultfloat << "\n";
+        if (!full_residency && mode == "1")
+          throw std::invalid_argument("DS41_FULL_RESIDENCY=1: the RAM tier is too small (" + fr.str() + ")");
+      } else {
+        std::cerr << "full residency: " << why << "\n";
+        if (mode == "1") throw std::invalid_argument("DS41_FULL_RESIDENCY=1: " + why);
+      }
+    }
     expert_payload_bytes = 0;
     std::ostringstream log;
     log << "mixed EXL3 store (" << mixed_k3_layers << "): VRAM";
     for (size_t k = 0; k < n; ++k) {
+      if (!full_residency)
       ec.class_host_slots[k] = size_t(double(c.host_bytes) * host_w[k] / hw) / bytes[k];
-      if (ec.class_host_slots[k] < seeds[k])
+      if (!full_residency && ec.class_host_slots[k] < seeds[k])
         throw std::invalid_argument("the RAM tier's K" + std::to_string(widths[k]) + " slots (" +
                                     std::to_string(ec.class_host_slots[k]) + ") cannot hold the placement's " +
                                     std::to_string(seeds[k]) + " seeds");

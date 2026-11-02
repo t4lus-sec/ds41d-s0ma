@@ -42,6 +42,9 @@ struct Placement {
     bool distinct_lfu=true;
     bool hard_layer_budgets=false;
     std::array<size_t,43> host_slots_per_layer{}; // total host capacity, including seeds
+    // s0ma change 63: experts loaded into empty dynamic VRAM slots at placement (not pinned; the cache's to evict).
+    // Not read from placement files; a caller fills it. Disjoint from vram_pins and host_residents.
+    std::vector<ExpertId> vram_preload;
 };
 Placement load_placement(const std::string& path);
 std::vector<Record> load_records(const std::string& manifest_tsv);

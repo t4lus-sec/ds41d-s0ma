@@ -124,6 +124,8 @@ public:
     void log_nvme_misses(bool on);
     // s0ma change 62: decode's RAM hits and NVMe misses so far (demand loads), read without a store round trip
     std::pair<uint64_t, uint64_t> demand_totals() const;
+    // s0ma change 63: how many of the placement's vram_preload were loaded, and how many loads had to evict (it stops there)
+    std::pair<size_t, size_t> preload_result() const;
     // s0ma change 57: RAM-tier slots for experts a prompt is streaming from the drive anyway. admit_begin takes ids in
     // priority order (each with an LFU credit), skips those already in VRAM or RAM, and reserves slots (the least
     // valued RAM residents are evicted) until byte_budget or a blocked admission; dst[i] is where ids[i]'s record

@@ -292,8 +292,11 @@ class Native final : public Forward, public hotpath::GateEvidence {
   // card). Without one, cuBLAS allocates its workspace stream-ordered while a graph is captured: the graph then holds
   // memory allocation nodes, and such a graph can be neither cloned nor have edges removed (the two refusals seen).
   Device pdl_blas_workspace, pdl_lane_workspace;
-  void pdl_workspace(cublasHandle_t handle, Device &ws) {
+  void pdl_workspace(cublasHandle_t handle, cudaStream_t on, Device &ws) {
     if (ds41_pdl_mode() <= 0) return;
+    // s0ma change 39: the handle's stream first: setting a stream resets the workspace (the wrappers now set it only
+    // when it changes, and the handle stays on this stream)
+    if (cublasSetStream(handle, on) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasSetStream (DS41_PDL)");
     ws.resize(size_t(32) << 20);
     if (cublasSetWorkspace(handle, ws.p, ws.bytes) != CUBLAS_STATUS_SUCCESS)
       throw std::runtime_error("cublasSetWorkspace (DS41_PDL)");
@@ -607,7 +610,7 @@ public:
     vram_checkpoint("native_members_before_cublas");
     if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS)
       throw std::runtime_error("cublasCreate");
-    pdl_workspace(blas, pdl_blas_workspace);   // s0ma change 36
+    pdl_workspace(blas, stream, pdl_blas_workspace);   // s0ma change 36
     vram_checkpoint("native_after_cublas");
     if (c.cuda_stack_bytes) {
       if (c.cuda_stack_bytes > 65536) throw std::invalid_argument("CUDA stack request exceeds bounded candidate limit");
@@ -1817,7 +1820,9 @@ private:
       dense_cache_used += bytes;
     }
     const half *W = reinterpret_cast<const half *>(dense_cache.as<char>(at->second));
-    if (cublasSetStream(blas, stream) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasSetStream");
+    cudaStream_t cur = nullptr;   // s0ma change 39: setting the same stream again would drop the workspace
+    if (cublasGetStream(blas, &cur) != CUBLAS_STATUS_SUCCESS || cur != stream)
+      if (cublasSetStream(blas, stream) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasSetStream");
     const float one = 1, zero = 0;
     for (int r = 0; r < m; r += 256) {
       const int rows = std::min(256, m - r);

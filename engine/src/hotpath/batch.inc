@@ -636,7 +636,7 @@ void ensure_lanes() {
     throw std::invalid_argument("--verify-lanes excludes --fuse-library, gate capture, tracing and lookahead");
   CK(cudaStreamCreateWithFlags(&lane_stream,cudaStreamNonBlocking));
   if(cublasCreate(&lane_blas)!=CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate (lane B)");
-  pdl_workspace(lane_blas,pdl_lane_workspace);   // s0ma change 36
+  pdl_workspace(lane_blas,lane_stream,pdl_lane_workspace);   // s0ma change 36
   if(dense_split_partial[0].bytes) {   // s0ma change 37: lane B's own split-K scratch
     dense_split_partial[1].resize(dense_split_partial[0].bytes);
     dense_split_counts[1].resize(dense_split_counts[0].bytes);

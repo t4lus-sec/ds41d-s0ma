@@ -133,7 +133,7 @@ void select_routes_rows(const float* biased,const float* unbiased,int* ids,float
 }
 // Token-major grouped BF16 einsum x[M,G,K] . w[G,N,K]^T -> y[M,G,N] (ds41_dense_wo_a without its M<=8 cap).
 int wo_a_rows(void* blas,const void* x,const void* w,void* y,int M,int N,int K,int G,cudaStream_t s){
-  auto h=(cublasHandle_t)blas;auto status=cublasSetStream(h,s);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;
+  auto h=(cublasHandle_t)blas;cudaStream_t cur=nullptr;auto status=cublasGetStream(h,&cur)==CUBLAS_STATUS_SUCCESS&&cur==s?CUBLAS_STATUS_SUCCESS:cublasSetStream(h,s);   // s0ma change 39: keep the workspaceif(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;
   status=cublasSetMathMode(h,CUBLAS_DEFAULT_MATH);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;
   float alpha=1.f,beta=0.f;
   status=cublasGemmStridedBatchedEx(h,CUBLAS_OP_T,CUBLAS_OP_N,N,M,K,&alpha,w,CUDA_R_16BF,K,(long long)N*K,x,CUDA_R_16BF,G*K,K,

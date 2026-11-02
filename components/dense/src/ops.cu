@@ -116,6 +116,14 @@ __global__ void shared_act(const bf16*g,const bf16*u,bf16*z,uint8_t*a,uint8_t*s,
 __global__ void routerweights(const float*s,const int32_t*ids,float*w,int M,int N,int topk,float scale){DS41_PDL_WAIT();int row=blockIdx.x,lane=threadIdx.x;float v[6]={0,0,0,0,0,0};if(lane>=topk)return;for(int i=0;i<topk;++i)v[i]=s[row*N+ids[row*topk+i]];float sum=topk==6?__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[4]),v[2]),__fadd_rn(__fadd_rn(v[1],v[5]),v[3])):__fadd_rn(__fadd_rn(v[0],v[2]),v[1]);w[row*topk+lane]=__fmul_rn(v[lane]/__fadd_rn(sum,1e-20f),scale);}
 __global__ void hcmean(const bf16*h,bf16*y,int M,int K){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=M*K)return;int row=i/K,k=i%K;float sum=0.f;for(int j=0;j<4;++j)sum=__fadd_rn(sum,__bfloat162float(h[(row*4+j)*K+k]));y[i]=__float2bfloat16_rn(__fmul_rn(sum,.25f));}
 }
+// s0ma change 39: cublasSetStream resets the handle's workspace to cuBLAS's default pool, which allocates with
+// cudaMallocAsync inside a stream capture (memory allocation nodes in the graph). Set the stream only when it changes,
+// so a workspace the engine gave the handle (DS41_PDL) stays in use; with none set, nothing changes.
+static inline cublasStatus_t ds41_same_stream(cublasHandle_t h,cudaStream_t st){
+    cudaStream_t cur=nullptr;
+    if(cublasGetStream(h,&cur)==CUBLAS_STATUS_SUCCESS&&cur==st)return CUBLAS_STATUS_SUCCESS;
+    return cublasSetStream(h,st);
+}
 extern "C" int ds41_dense_rms(const void*x,const void*w,void*y,int M,int K,float eps,cudaStream_t st){if(!x||!w||!y||M<1||M>8||K<128||K%4)return cudaErrorInvalidValue;
  int width,threads=geometry(M,K,width);rms<<<M,threads,0,st>>>((const bf16*)x,(const bf16*)w,(bf16*)y,M,K,eps,width);return cudaGetLastError();}
 extern "C" int ds41_dense_hc_pre(const void*h,const float*p,void*y,int M,int K,cudaStream_t st){if(!h||!p||!y||M<1||K<1)return cudaErrorInvalidValue;hcpre<<<(M*K+255)/256,256,0,st>>>((const bf16*)h,p,(bf16*)y,M,K);return cudaGetLastError();}
@@ -127,7 +135,7 @@ extern "C" int ds41_dense_router_scores(const float*l,const float*bias,float*u,f
 extern "C" int ds41_dense_rope(void*x,const float*f,int R,int H,int D,int RD,int inv,cudaStream_t st){if(!x||!f||R<1||H<1||RD<2||RD%2||D<RD)return cudaErrorInvalidValue;rope<<<(R*H*RD/2+255)/256,256,0,st>>>((bf16*)x,f,R,H,D,RD,inv);return cudaGetLastError();}
 extern "C" int ds41_dense_engram_gate(const void*h,const void*k,const void*v,const void*qw,const void*kw,const uint8_t*mask,void*out,int M,int K,float eps,cudaStream_t st){if(!h||!k||!v||!qw||!kw||!out||M<1||M>8||K<128||K%4)return cudaErrorInvalidValue;int height=1;while(height*2<=M*4&&height*2<=16)height*=2;int width=512/height;engram<<<M*4,width,0,st>>>((const bf16*)h,(const bf16*)k,(const bf16*)v,(const bf16*)qw,(const bf16*)kw,mask,(bf16*)out,M,K,eps);return cudaGetLastError();}
 extern "C" int ds41_dense_cublas(void* raw,const void*x,const void*w,void*y,int M,int N,int K,int f32,int groups,cudaStream_t st){if(!raw||!x||!w||!y||M<1||N<1||K<1||groups<1)return cudaErrorInvalidValue;
- auto h=(cublasHandle_t)raw;cublasStatus_t status=cublasSetStream(h,st);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;
+ auto h=(cublasHandle_t)raw;cublasStatus_t status=ds41_same_stream(h,st);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;
  // Set the math mode explicitly: TF32 is never enabled for these reference exceptions.
  status=cublasSetMathMode(h,CUBLAS_DEFAULT_MATH);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;
  float alpha=1.f,beta=0.f;auto dt=f32?CUDA_R_32F:CUDA_R_16BF;
@@ -141,7 +149,7 @@ extern "C" int ds41_dense_cublas(void* raw,const void*x,const void*w,void*y,int 
 extern "C" int ds41_dense_cublas_rows(void* raw,const void*x,const void*w,void*y,int rows,int N,int K,int f32,cudaStream_t st){
  if(rows==1)return ds41_dense_cublas(raw,x,w,y,1,N,K,f32,1,st);
  if(!raw||!x||!w||!y||rows<1||N<1||K<1)return cudaErrorInvalidValue;
- auto h=(cublasHandle_t)raw;cublasStatus_t status=cublasSetStream(h,st);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;
+ auto h=(cublasHandle_t)raw;cublasStatus_t status=ds41_same_stream(h,st);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;
  status=cublasSetMathMode(h,CUBLAS_DEFAULT_MATH);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;
  float alpha=1.f,beta=0.f;auto dt=f32?CUDA_R_32F:CUDA_R_16BF;
  status=cublasGemmStridedBatchedEx(h,CUBLAS_OP_T,CUBLAS_OP_N,N,1,K,&alpha,w,dt,K,0,x,dt,K,(long long)K,&beta,y,dt,N,(long long)N,rows,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
@@ -163,7 +171,7 @@ extern "C" int ds41_dense_norm_quant(const void*x,const float*pre,const void*w,v
 extern "C" int ds41_dense_hc_mixes(void* handle,const void*h,const float*fn,const float*s,const float*b,float*pre,float*post,float*comb,float*x,float*mixes,float*rstd,int M,int K,float neps,float heps,cudaStream_t st){if(!handle||!h||!fn||!s||!b||!pre||!post||!comb||!x||!mixes||!rstd||M<1||M>8||K<32||K%32)return cudaErrorInvalidValue;int width,threads=geometry(M,K*4,width);promote_stats<<<M,threads,0,st>>>((const bf16*)h,x,rstd,M,K*4,neps,width);int rc=cudaGetLastError();if(rc)return rc;rc=ds41_dense_cublas(handle,x,fn,mixes,M,24,K*4,1,1,st);if(rc)return rc;sinkhorn<<<M,32,0,st>>>(mixes,s,b,pre,post,comb,M,heps,rstd);return cudaGetLastError();}
 extern "C" int ds41_dense_shared_act(const void*g,const void*u,void*z,void*a,void*s,int M,int K,cudaStream_t st){if(!g||!u||!a||!s||M<1||K<32||K%32)return cudaErrorInvalidValue;shared_act<<<(M*K+127)/128,128,0,st>>>((const bf16*)g,(const bf16*)u,(bf16*)z,(uint8_t*)a,(uint8_t*)s,M*K/32);return cudaGetLastError();}
 extern "C" int ds41_dense_promote(const void*x,float*y,int n,cudaStream_t st){if(!x||!y||n<1)return cudaErrorInvalidValue;promote<<<(n+255)/256,256,0,st>>>((const bf16*)x,y,n);return cudaGetLastError();}
-extern "C" int ds41_dense_wo_a(void*raw,const void*x,const void*w,void*y,int M,int N,int K,int G,cudaStream_t st){if(!raw||!x||!w||!y||M<1||M>8||N<1||K<1||G<1)return cudaErrorInvalidValue;auto h=(cublasHandle_t)raw;auto status=cublasSetStream(h,st);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;status=cublasSetMathMode(h,CUBLAS_DEFAULT_MATH);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;float alpha=1.f,beta=0.f;
+extern "C" int ds41_dense_wo_a(void*raw,const void*x,const void*w,void*y,int M,int N,int K,int G,cudaStream_t st){if(!raw||!x||!w||!y||M<1||M>8||N<1||K<1||G<1)return cudaErrorInvalidValue;auto h=(cublasHandle_t)raw;auto status=ds41_same_stream(h,st);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;status=cublasSetMathMode(h,CUBLAS_DEFAULT_MATH);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;float alpha=1.f,beta=0.f;
  status=cublasGemmStridedBatchedEx(h,CUBLAS_OP_T,CUBLAS_OP_N,N,M,K,&alpha,w,CUDA_R_16BF,K,(long long)N*K,x,CUDA_R_16BF,G*K,K,&beta,y,CUDA_R_16BF,G*N,N,G,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);return status==CUBLAS_STATUS_SUCCESS?0:10000+status;}
 extern "C" int ds41_dense_router_weights(const float*s,const int32_t*ids,float*w,int M,int N,int topk,float scale,cudaStream_t st){if(!s||!ids||!w||M<1||N<topk||(topk!=3&&topk!=6))return cudaErrorInvalidValue;routerweights<<<M,32,0,st>>>(s,ids,w,M,N,topk,scale);return cudaGetLastError();}
 extern "C" int ds41_dense_hc_mean(const void*h,void*y,int M,int K,cudaStream_t st){if(!h||!y||M<1||K<1)return cudaErrorInvalidValue;hcmean<<<(M*K+255)/256,256,0,st>>>((const bf16*)h,(bf16*)y,M,K);return cudaGetLastError();}

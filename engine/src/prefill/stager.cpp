@@ -118,8 +118,14 @@ TransferStats Stager::stream(const std::vector<ds41::ExpertId>& ids,cudaStream_t
    p.reader.stream(disk,ring,[&](size_t i,size_t buffer){
     p.upload(disk[i]->id,ring[buffer],ram_slots+buffer,p.disk,consumer,ready,*begins[ram.size()+i],*ends[ram.size()+i]);
     ck(cudaEventRecord(p.dma_done[buffer]->e,p.disk));
-    if(keep)if(void* d=keep(disk[i]->id)){   // s0ma change 57: beside the DMA, before the slot is recycled
-     double t=ms();std::memcpy(d,ring[buffer],disk[i]->bytes);stats.keep_ms+=ms()-t;++stats.kept;}
+    // s0ma change 57: a kept record goes to its RAM-tier slot. Change 58: by a D2H DMA from the VRAM slot it was just
+    // uploaded to, on the same stream (after the upload, before the slot's next upload), instead of a CPU memcpy on
+    // this reading thread (~1 ms a record, 7 s a bench). The stream is synchronized before stream() returns.
+    if(keep)if(void* d=keep(disk[i]->id)){
+     double t=ms();
+     ck(cudaMemcpyAsync(d,static_cast<const uint8_t*>(p.weights)+(ram_slots+buffer)*p.record_bytes,disk[i]->bytes,
+                        cudaMemcpyDeviceToHost,p.disk));
+     stats.keep_ms+=ms()-t;++stats.kept;}
    },[&](size_t buffer){ck(cudaEventSynchronize(p.dma_done[buffer]->e));});
    ck(cudaStreamSynchronize(p.disk));
    stats.nvme_service_host_ms=ms()-io_start;

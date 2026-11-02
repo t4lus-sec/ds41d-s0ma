@@ -509,7 +509,7 @@ void overlap_report() {
   std::cerr<<" ("<<overlap_requests<<" requests)\n";
   if(admit_budget)std::cerr<<std::fixed<<std::setprecision(1)<<"prompt admission: "<<admit_experts<<" experts ("
                            <<admit_bytes/double(1ull<<30)<<" GiB) copied into RAM from the prompts' drive reads, "
-                           <<admit_copy_ms<<" ms of copying on the reader thread ("<<admit_budget/double(1ull<<30)
+                           <<admit_copy_ms<<" ms on the reader thread to queue their copies ("<<admit_budget/double(1ull<<30)
                            <<" GiB a prompt at most)\n"<<std::defaultfloat<<std::setprecision(6);
   req_all=req_first=Overlap{};
 }

@@ -311,6 +311,11 @@ def environment(cfg, render=True):
         # token 5.65 -> 6.13 s mean (all of it inside the engine's prefill; lending itself 3-10 ms). A lab
         # --env DS41_PREFILL_LEND_GIB=0 turns it off
         env.setdefault('DS41_PREFILL_LEND_GIB', '2')
+        # s0ma change 58: up to 8 GiB a prompt of the experts its last 256 rows routed and its sweep read from the drive,
+        # into the RAM tier as they pass (change 57). Seed 22, 48 GiB tier: 41.2-42.8 -> 45.07 tok/s (three runs of
+        # the build before), NVMe misses 7,842-7,879 -> 6,527, verify 54.1 -> 51.0 ms a step, tokens 7/7 identical.
+        # A lab --env DS41_PROMPT_ADMIT_GIB=0 turns it off
+        env.setdefault('DS41_PROMPT_ADMIT_GIB', '8')
         # change 25: a lab --env DS41_EXPERT_EXTRA_GIB=... (in ENGINE_ENV) wins
         env.setdefault('DS41_EXPERT_EXTRA_GIB', SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
     # the pinned cuBLAS pair (dist/blas) before CUDA 13.4's own libraries (cudart, cuFile)

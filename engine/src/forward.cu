@@ -39,6 +39,8 @@
 #include <filesystem>
 #include <sstream>
 #include <fstream>
+#include <fcntl.h>
+#include <unistd.h>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -1873,6 +1875,10 @@ private:
       it->second.dtype = "EXL3";
       if (auto sc = weights.find(woa + ".scale"); sc != weights.end()) { freed += sc->second.data.bytes; sc->second.data.release(); }
       dense_woa.insert(woa.substr(0, woa.size() - 5));   // "layers.L.attn"
+    }
+    {   // s0ma change 54: Sero's dense records are on the GPU now; drop their page cache before the RAM tier is pinned
+      const int fd = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd >= 0) { posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); ::close(fd); }
     }
     if (table.empty()) {
       std::cerr << "DS41_SERO_DENSE: none of the " << meta.at("tensors").size() << " tensors matched; native FP8 kept\n";

@@ -257,6 +257,8 @@ std::vector<uint8_t> Store::read(const Tensor &t) const {
     throw std::runtime_error("shard changed before read");
   std::vector<uint8_t> out(t.bytes);
   pread_all(fd.fd, out.data(), out.size(), t.offset);
+  // s0ma change 54: the bytes are in `out` now; their page cache would only push on the RAM tier pinned next
+  posix_fadvise(fd.fd, off_t(t.offset), off_t(t.bytes), POSIX_FADV_DONTNEED);
   return out;
 }
 Json Store::inventory() const {

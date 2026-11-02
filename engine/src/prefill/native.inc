@@ -418,8 +418,26 @@ void prefill_lend(size_t need) {
   const size_t want=(need-free+lend_chunk_bytes-1)/lend_chunk_bytes;
   lent_chunks+=experts->lend(std::min(want,lend_chunks_total-lent_chunks));
 }
+// s0ma change 54: the RAM tier's contents when a prompt starts, one "tiers:" line a prompt. An expert in both VRAM and
+// RAM is a duplicate: its RAM slot holds nothing the cache does not already have.
+void tier_census() {
+  if(poisoned||!experts)return;
+  const auto bits=experts->residency_snapshot();
+  const auto st=experts->stats();
+  size_t vram=0,ram=0,both=0;double ram_b=0,both_b=0;
+  for(size_t id=0;id<bits.size()&&id<15360;++id){
+    const double b=width_of.empty()?double(expert_slot_bytes):double(exl3_rec_of(width_of[id]));
+    if(bits[id]&1)++vram;
+    if(bits[id]&2){++ram;ram_b+=b;}
+    if((bits[id]&3)==3){++both;both_b+=b;}
+  }
+  std::cerr<<"tiers: VRAM "<<vram<<" experts, RAM "<<ram<<" ("<<ram_b/double(1ull<<30)<<" GiB), in both "<<both<<" ("
+           <<both_b/double(1ull<<30)<<" GiB); demotions "<<st.demotions<<", victims already in RAM "<<st.demote_resident
+           <<", RAM evictions "<<st.ram.evictions<<"\n";
+}
 void begin_prompt(int64_t rows,bool append) override {
   (void)append;
+  tier_census();
   if(!lend_chunks_total||poisoned)return;
   lend_prompt=true;++lend_prompts;lend_retry=0;
   const double t0=clock_ms();

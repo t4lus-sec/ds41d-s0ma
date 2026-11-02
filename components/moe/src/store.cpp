@@ -1,6 +1,8 @@
 #include "ds41/store.hpp"
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
+#include <string>
 #include <cstring>
 #include <limits>
 #include <tuple>
@@ -13,6 +15,20 @@
 
 namespace ds41 {
 static unsigned layer_of(ExpertId e){return e<40*384?e/384:40+(e-40*384)/128;}
+// s0ma change 31: DS41_MOE_LAYER_BUDGETS=0|vram|ram turns off the placement's per-layer soft budgets (an over-budget
+// layer's experts are evicted first) in both pools, the VRAM one or the RAM one: eviction is then the pool's LFU
+// alone, as the probe's replay models it. Only which expert is evicted changes, never what is computed.
+static bool layer_budgets_off(bool host) {
+    static const int mode = [] {
+        const char *v = std::getenv("DS41_MOE_LAYER_BUDGETS");
+        if (!v || !*v || std::string(v) == "1") return 0;
+        if (std::string(v) == "0") return 3;
+        if (std::string(v) == "vram") return 1;
+        if (std::string(v) == "ram") return 2;
+        throw std::invalid_argument("DS41_MOE_LAYER_BUDGETS takes 1, 0, vram or ram");
+    }();
+    return mode & (host ? 2 : 1);
+}
 SlotPool::SlotPool(size_t slots, unsigned recent, unsigned decay, bool distinct)
     : slots_(slots), residency_(expert_count,-1), frequency_(expert_count), last_use_(expert_count), recent_(recent), decay_(decay),distinct_(distinct) {
     retention_epochs_=std::make_shared<RetentionEpochs>();
@@ -140,8 +156,8 @@ int SlotPool::scan_victim(const std::unordered_set<ExpertId>& wanted,const std::
             if (cls >= 0 && classed_ && slot_class_[s] != unsigned(cls)) continue;
             if (c.pinned || c.leases || c.retention.use_count()>1 || wanted.count(c.id) || (layer>=0 && slot_layers_[s]!=unsigned(layer))) continue;
             if (!pass && recent_ && last_use_[c.id] && last_use_[c.id] + recent_ >= layer_clocks_[layer_of(c.id)]) continue;
-            bool over=budgets_ && layer_counts[layer_of(c.id)]>layer_budgets_[layer_of(c.id)];
-            bool prior_over=slot>=0 && budgets_ && layer_counts[layer_of(slots_[slot].id)]>layer_budgets_[layer_of(slots_[slot].id)];
+            bool over=budgets_ && !layer_budgets_off(host_) && layer_counts[layer_of(c.id)]>layer_budgets_[layer_of(c.id)];
+            bool prior_over=slot>=0 && budgets_ && !layer_budgets_off(host_) && layer_counts[layer_of(slots_[slot].id)]>layer_budgets_[layer_of(slots_[slot].id)];
             if (slot<0 || (over && !prior_over) || (over==prior_over &&
                 less_slot(s,size_t(slot))))slot=s;
         }
@@ -234,7 +250,7 @@ int SlotPool::fast_victim(const std::unordered_set<ExpertId>& wanted,const std::
         for(unsigned l=0;l<43;++l) {
             if(cls>=0 && classed_ && layer_class_[l]!=unsigned(cls))continue;   // a layer's residents are all its class
             int j=pass?best_any_[l]:best_old_[l];if(j<0)continue;
-            bool over=budgets_ && counts[l]>layer_budgets_[l];
+            bool over=budgets_ && !layer_budgets_off(host_) && counts[l]>layer_budgets_[l];
             if(best<0 || (over && !best_over) || (over==best_over && less_slot(j,best))){best=j;best_over=over;}
         }
         if(best>=0)return best;

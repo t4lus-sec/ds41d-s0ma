@@ -1387,38 +1387,31 @@ private:
     CK(cudaStreamEndCapture(stream, &recorded->graph));
     if (ds41_pdl_mode() < 0) throw std::invalid_argument("DS41_PDL takes 0, 1 or 2");
     if (const int mode = ds41_pdl_mode(); mode > 0 && !pdl_off) {
-      // s0ma change 32: rewrite a clone; if the driver refuses it, keep the graph as captured (and stop trying)
-      cudaGraph_t clone = nullptr;
+      // s0ma change 32: the captured graph's edges rewritten in place (cudaGraphClone is refused for captured graphs
+      // here: "operation not supported"). A refusal stops the engine (change 35): a bench with DS41_PDL set would
+      // otherwise run to its end measuring nothing new.
       size_t edges = 0;
-      const char *step = "cloning the graph";
+      const char *step = "";
       cudaGraphInstantiateParams ip{};
-      cudaError_t rc = cudaGraphClone(&clone, recorded->graph);
-      if (rc == cudaSuccess) rc = cudaError_t(ds41_pdl_rewrite(clone, mode, &edges, &step));
+      cudaError_t rc = cudaError_t(ds41_pdl_rewrite(recorded->graph, mode, &edges, &step));
       if (rc == cudaSuccess) {
         step = "instantiating";
-        rc = cudaGraphInstantiateWithParams(&recorded->exec, clone, &ip);
+        rc = cudaGraphInstantiateWithParams(&recorded->exec, recorded->graph, &ip);
       }
-      const bool done = rc == cudaSuccess;
-      if (!done) {   // why, for the engine log and the stats (pdl_error)
+      if (rc != cudaSuccess) {
         std::ostringstream why;
         why << step << ": " << cudaGetErrorString(rc);
         if (ip.result_out != cudaGraphInstantiateSuccess) why << " (instantiate result " << int(ip.result_out) << ")";
         if (ip.errNode_out) why << " at kernel " << ds41_pdl_node_name(ip.errNode_out);
         pdl_error = why.str();
-      }
-      if (done) {
-        cudaGraphDestroy(recorded->graph);
-        recorded->graph = clone;
-        pdl_edges += edges;
-        ++pdl_graphs;
-      } else {
-        if (clone) cudaGraphDestroy(clone);
-        recorded->exec = nullptr;
-        cudaGetLastError();
         pdl_off = true;
+        cudaGetLastError();
         std::cerr << "DS41_PDL: graph " << key << " refused programmatic edges (" << pdl_error
-                  << "); graphs stay as captured\n";
+                  << "); stopping (unset DS41_PDL to run without it)\n" << std::flush;
+        throw std::runtime_error("DS41_PDL refused by the driver: " + pdl_error);
       }
+      pdl_edges += edges;
+      ++pdl_graphs;
     }
     if (!recorded->exec) CK(cudaGraphInstantiate(&recorded->exec, recorded->graph, 0));
     CK(cudaGraphLaunch(recorded->exec, stream));

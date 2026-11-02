@@ -147,6 +147,47 @@ struct Device {
     return reinterpret_cast<T *>(static_cast<char *>(p) + offset);
   }
 };
+// s0ma change 61: the drafter's routed experts without a host round trip. All 384 drafter experts are pinned in their
+// own store, so a layer's jobs can be built on the GPU from its top-3 ids: one job per distinct expert holding all of
+// its rows (gathered contiguously), padded to rows*3 jobs with empty ones. An empty id sets *err.
+__global__ void spark_group_jobs(const int32_t *ids, int rows, int stage, const float *rw_in, const uint8_t *gx,
+                                 __nv_bfloat16 *gate, __nv_bfloat16 *up, __nv_bfloat16 *act, __nv_bfloat16 *dout,
+                                 ds41::GemmJob *gj, ds41::GemmJob *uj, ds41::GemmJob *dj, int32_t *perm, float *rw,
+                                 int *err) {
+  if (threadIdx.x || blockIdx.x) return;
+  constexpr int H = 5120, I = 2304;
+  const int count = rows * 3;
+  bool done[24] = {};
+  int p = 0, nj = 0;
+  for (int j = 0; j < count; ++j) {
+    if (done[j]) continue;
+    int e = ids[j];
+    if (e < 0 || e >= 128) { *err = 1; e = 0; }
+    const int start = p;
+    for (int k = j; k < count; ++k)
+      if (!done[k] && ids[k] == ids[j]) { done[k] = true; perm[p] = k; rw[p] = rw_in[k]; ++p; }
+    const ds41::ExpertId id = ds41::ExpertId(15360 + stage * 128 + e);
+    const int m = p - start;
+    gj[nj] = ds41::GemmJob{id, m, gx + size_t(start) * H * 2, nullptr, gate + size_t(start) * I};
+    uj[nj] = ds41::GemmJob{id, m, gx + size_t(start) * H * 2, nullptr, up + size_t(start) * I};
+    dj[nj] = ds41::GemmJob{id, m, reinterpret_cast<const uint8_t *>(act + size_t(start) * I), nullptr,
+                           dout + size_t(start) * H};
+    ++nj;
+  }
+  for (; nj < count; ++nj) {
+    const ds41::GemmJob none{ds41::ExpertId(15360 + stage * 128), 0, gx, nullptr, gate};
+    gj[nj] = uj[nj] = dj[nj] = none;
+  }
+}
+// row p of `out` (H wide) from row perm[p] / 3 of `in` (gather) or to row perm[p] of `out` from row p of `in` (scatter)
+__global__ void spark_rows(const __nv_bfloat16 *in, __nv_bfloat16 *out, const int32_t *perm, int count, bool gather) {
+  constexpr int H = 5120;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count * H) return;
+  const int p = i / H, c = i % H;
+  if (gather) out[size_t(p) * H + c] = in[size_t(perm[p] / 3) * H + c];
+  else out[size_t(perm[p]) * H + c] = in[size_t(p) * H + c];
+}
 struct Weight {
   Device data;
   std::vector<uint64_t> shape;
@@ -436,6 +477,10 @@ class Native final : public Forward, public hotpath::GateEvidence {
       la_promoted{6 * HC * H * 4}, la_x{6 * H * 2}, la_in{6 * H * 4};
   int lookahead_m = 1, lookahead_n = 4;
   std::unique_ptr<ds41::HostBuffer> spark_host;
+  // s0ma change 61: device-built drafter jobs (DS41_SPARK_GPU_JOBS=0 turns them off)
+  Device spark_gx, spark_dout, spark_perm, spark_rw;
+  int *spark_err = nullptr;   // mapped host flag
+  bool spark_gpu_jobs = [] { const char *v = std::getenv("DS41_SPARK_GPU_JOBS"); return !(v && std::string(v) == "0"); }();
   const bool prefill_chunk_fit = [] { const char *v = std::getenv("DS41_PREFILL_CHUNK_FIT"); return v && std::string(v) == "1"; }();
   // s0ma leg 26: a verify step's per-row cuBLAS rows, hyper-connection mixes and route weights in one launch each,
   // every row computed as on its own (DS41_ROWS_BATCHED=1; tokens checked identical by the lab's benchmark).
@@ -1454,6 +1499,43 @@ private:
       spark_jobs.resize(max_jobs * sizeof(ds41::GemmJob));
       spark_up_jobs.resize(max_jobs * sizeof(ds41::GemmJob));
       spark_down_jobs.resize(max_jobs * sizeof(ds41::GemmJob));
+    }
+    // s0ma change 61: the EXL3 drafter's jobs built on the GPU (no route readback, sync or lease: every drafter expert
+    // is pinned), one job a distinct expert with all its rows. The same kernels on the same rows: drafts unchanged.
+    if (mtp_exl3 && mtp_experts && spark_gpu_jobs) {
+      if (!spark_gx.p) {
+        spark_gx.resize(size_t(max_jobs) * H * 2);
+        spark_dout.resize(size_t(max_jobs) * H * 2);
+        spark_perm.resize(size_t(max_jobs) * 4);
+        spark_rw.resize(size_t(max_jobs) * 4);
+        CK(cudaHostAlloc(reinterpret_cast<void **>(&spark_err), sizeof(int), cudaHostAllocMapped));
+        *spark_err = 0;
+      }
+      if (*spark_err) throw std::runtime_error("invalid DSpark route (device-built jobs)");
+      int *err_dev = nullptr;
+      CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&err_dev), spark_err, 0));
+      const int count = rows * 3;
+      spark_group_jobs<<<1, 32, 0, stream>>>(ids, rows, stage, route_weights, spark_gx.as<uint8_t>(), spark_gate.as<Bf16>(),
+                                             spark_up.as<Bf16>(), spark_act.as<Bf16>(), spark_dout.as<Bf16>(),
+                                             spark_jobs.as<ds41::GemmJob>(), spark_up_jobs.as<ds41::GemmJob>(),
+                                             spark_down_jobs.as<ds41::GemmJob>(), spark_perm.as<int32_t>(),
+                                             spark_rw.as<float>(), err_dev);
+      CK(cudaGetLastError());
+      spark_rows<<<(count * H + 255) / 256, 256, 0, stream>>>(static_cast<const Bf16 *>(input), spark_gx.as<Bf16>(),
+                                                               spark_perm.as<int32_t>(), count, true);
+      CK(cudaGetLastError());
+      CK(ds41::grouped_exl3_bits(spark_store().table(), spark_jobs.as<ds41::GemmJob>(), count,
+                                 ds41::Projection::Gate, I, H, mtp_bits, stream));
+      CK(ds41::grouped_exl3_bits(spark_store().table(), spark_up_jobs.as<ds41::GemmJob>(), count,
+                                 ds41::Projection::Up, I, H, mtp_bits, stream));
+      CK(ds41::swiglu(spark_gate.as<Bf16>(), spark_up.as<Bf16>(), spark_rw.as<float>(), spark_act.as<Bf16>(), count, I,
+                      10, stream));
+      CK(ds41::grouped_exl3_bits(spark_store().table(), spark_down_jobs.as<ds41::GemmJob>(), count,
+                                 ds41::Projection::Down, H, I, mtp_bits, stream));
+      spark_rows<<<(count * H + 255) / 256, 256, 0, stream>>>(spark_dout.as<Bf16>(), static_cast<Bf16 *>(output),
+                                                               spark_perm.as<int32_t>(), count, false);
+      CK(cudaGetLastError());
+      return;
     }
     // One deliberate route boundary, then unique logical IDs under one lease.
     auto selected = static_cast<int32_t *>(host->data());

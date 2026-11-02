@@ -89,6 +89,7 @@ __device__ __forceinline__ void decode_body(const DeviceExpert* table,const Gemm
 }
 template<int K,int BITS,int ROWS=8>
 __global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const GemmJob* jobs,int projection,int N) {DS41_PDL_WAIT();
+    if(jobs[blockIdx.y].tokens<=0)return;   // s0ma change 61: an empty job (a padded device-built job list) does nothing
     decode_body<K,BITS,ROWS>(table,jobs[blockIdx.y],projection,N);
 }
 // s0ma change 34 (N1): one job passed by value (a dense tensor: no device job array, and a captured graph keeps it)
@@ -129,6 +130,7 @@ __global__ void __cluster_dims__(1,1,4) __launch_bounds__(128) decode_split(cons
     cg::cluster_group cluster=cg::this_cluster();
     using G=SplitGeom<K>;
     GemmJob job=jobs[blockIdx.y];
+    if(job.tokens==0)return;   // s0ma change 61: an empty job; every CTA of the cluster has the same job
     if(job.tokens<1||job.tokens>8){asm volatile("trap;");return;}
     DeviceExpert e=table[job.expert];wait_ready(e);
     const uint32_t* B=weights(e,projection);

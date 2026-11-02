@@ -424,7 +424,9 @@ void begin_prompt(int64_t rows,bool append) override {
   lend_prompt=true;++lend_prompts;lend_retry=0;
   const double t0=clock_ms();
   const int64_t fresh=std::max<int64_t>(1,std::min<int64_t>(rows-committed,config.max_context-committed));
-  prefill_lend(prefill_lend_need(size_t(fresh)));
+  // s0ma change 53: DS41_PREFILL_LEND_ALL=1 lends every chunk to every prompt (the prompt sees today's free VRAM)
+  static const bool lend_all=[]{const char* v=std::getenv("DS41_PREFILL_LEND_ALL");return v&&std::string(v)=="1";}();
+  prefill_lend(lend_all?~size_t(0)>>1:prefill_lend_need(size_t(fresh)));
   const double t=clock_ms()-t0;lend_begin_ms+=t;lend_begin_max_ms=std::max(lend_begin_max_ms,t);
 }
 void end_prompt(bool) override { lend_prompt=false;lend_retry=0; }
@@ -453,10 +455,14 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
     throw std::invalid_argument("prefill mode/state/context/chunk/tail");
   for(int id:input)if(id<0||id>=V)throw std::invalid_argument("prefill token id");
   double begin_ms=clock_ms();
+  // s0ma change 53: where a prompt's time goes outside its layers (one "prefill phases:" line a prompt)
+  std::vector<std::pair<const char*,double>> phase_marks;
+  auto mark=[&](const char* name){phase_marks.push_back({name,clock_ms()});};
   const void* initial_h=h.p;
   prefill_warm_counts.clear();
   std::vector<uint8_t> residency_before;
   try{residency_before=p_residency(*experts);}catch(...){poisoned=true;throw;}
+  mark("residency");
   auto plan=ds41e::prefill::plan(committed,int64_t(input.size()),int64_t(options.logits_tail));
   // s0ma change 51: an image's encoder and rows need VRAM begin_prompt did not count: every lendable chunk
   if(options.images&&!options.images->empty())prefill_lend(~size_t(0)>>1);
@@ -489,6 +495,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
   }
   // Preflight allocations before any live state mutation. No eviction or cache
   // rebuild is used to make room for scratch. A failed allocation is retryable.
+  mark("images");
   pref=std::make_unique<PrefillData>(input.size(),committed,options.mode==PrefillMode::Cold,
       options.logits_tail,config.prefill_budget_bytes);
   auto &pf=*pref;pf.dense_batch=int(options.dense_batch_rows);pf.warm=options.warm;pf.image=std::move(image_rows);
@@ -503,6 +510,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
       if(need+(size_t(256)<<20)<=free)prefill_chunk=std::make_unique<PrefillChunk>(R,pf.end,pf.candidate_width,fp8);
     }catch(const std::exception&){prefill_chunk.reset();cudaGetLastError();}
   }
+  mark("alloc");
   PrefillResult result;result.begin_position=committed;result.consumed_rows=input.size();
   try {
     in_step=true;graph_ready=false;
@@ -513,6 +521,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
     // Both whole-suffix tickets deduplicate globally. They start before layer0
     // and stay alive through their last H2D. Appends hash/submit only new IDs.
     if(async_engram)for(int j=0;j<2;++j)pf.engram[j]=async_engram->submit(j==0?1:14,pf.rowids[j]);
+    mark("hash");
     // Start I/O before enqueueing prompt-sized embedding work as well.
     for(size_t r=0;r<input.size();++r) {
       expand_embedding(pf.image[r]?image_embed[r]:w("embed.weight").data.as<Bf16>(size_t(input[r])*H*2),h.p,pre.as<float>(),H,stream);
@@ -615,6 +624,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
       std::cerr<<"prefill layer="<<l<<" rows="<<work.query.size()<<" project_ms="<<project_ms
           <<" expert_ms="<<timings["expert_sweep_stream_ms"]<<" epilogue_ms="<<epilogue_ms<<"\n";
     }
+    mark("layers");
     for(size_t r=input.size()-options.logits_tail;r<input.size();++r) {
       pcopy(h.p,pf.hidden.as<char>(r*HC*H*2),HC*H*2);pcopy(pre.p,pf.previous_pre.as<char>(r*4*4),4*4);
       CK(ds41_dense_hc_pre(h.p,pre.as<float>(),x.p,1,H,stream));norm("norm",x.p,x.p,H);
@@ -623,10 +633,12 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
       CK(cudaMemcpyAsync(result.logits.back().data(),logits.p,V*4,cudaMemcpyDeviceToHost,stream));
       CK(cudaStreamSynchronize(stream));
     }
+    mark("head");
     if(!residency_before.empty()&&p_residency(*experts)!=residency_before)
       throw std::runtime_error("prefill changed decode tier membership; quiesce competing admissions");
     prefix.commit(input,input.size());
     committed=pf.end;
+    mark("check");
     size_t capture_count=std::min<size_t>(128,pf.rows);
     for(size_t first=0;first<capture_count;first+=6) {
       capture_rows=int(std::min<size_t>(6,capture_count-first));capture_committed=capture_rows;
@@ -640,7 +652,17 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
     if(h.p!=initial_h)std::swap(h,next_h);
     result.layers=pf.layers;in_step=false;
     const size_t chunk_rows=prefill_chunk?size_t(prefill_chunk->R):0;
+    mark("captures");
     prefill_chunk.reset();pref.reset();result.elapsed_ms=clock_ms()-begin_ms;total_ms+=result.elapsed_ms;
+    mark("free");
+    {
+      size_t free=0,total=0;CK(cudaMemGetInfo(&free,&total));
+      std::cerr<<"prefill phases: rows "<<input.size()<<", free "<<(free>>20)<<" MiB, lent "<<lent_chunks<<" of "
+               <<lend_chunks_total<<" chunks, ms:";
+      double at=begin_ms;
+      for(auto &[name,t]:phase_marks){std::cerr<<" "<<name<<" "<<std::fixed<<std::setprecision(1)<<t-at;at=t;}
+      std::cerr<<std::defaultfloat<<"\n";
+    }
     prefill_summary={{"mode",options.mode==PrefillMode::Cold?"cold-full-N-M1-dense-candidate":"append-decode-layout"},
         {"rows",input.size()},{"chunk_rows",options.chunk_rows},{"dense_batch_rows",options.dense_batch_rows},{"batched_chunk_rows",chunk_rows},{"cache_reused_tokens",result.begin_position},
         {"elapsed_ms",result.elapsed_ms},{"cache_retention_checked",!residency_before.empty()},{"layers",result.layers},

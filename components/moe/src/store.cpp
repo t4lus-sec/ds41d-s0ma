@@ -29,6 +29,16 @@ static bool layer_budgets_off(bool host) {
     }();
     return mode & (host ? 2 : 1);
 }
+// s0ma change 46: DS41_MOE_RAM_DUP_FIRST=1: a RAM copy of an expert that is also in VRAM (a RAM hit keeps its copy)
+// is an eviction candidate even when recently used, so the RAM tier's room goes to experts that live nowhere else
+// (fewer NVMe misses) before those copies. Placement only: which expert is evicted, never what is computed.
+static bool ram_dup_first() {
+    static const bool on = [] { const char *v = std::getenv("DS41_MOE_RAM_DUP_FIRST"); return v && std::string(v) == "1"; }();
+    return on;
+}
+bool SlotPool::dup_first(ExpertId id) const {
+    return ram_dup_first() && exclusive_ && host_ && peer_ && id < expert_count && peer_->residency_[id] >= 0;
+}
 SlotPool::SlotPool(size_t slots, unsigned recent, unsigned decay, bool distinct)
     : slots_(slots), residency_(expert_count,-1), frequency_(expert_count), last_use_(expert_count), recent_(recent), decay_(decay),distinct_(distinct) {
     retention_epochs_=std::make_shared<RetentionEpochs>();
@@ -155,7 +165,8 @@ int SlotPool::scan_victim(const std::unordered_set<ExpertId>& wanted,const std::
             if (c.id < 0) continue;
             if (cls >= 0 && classed_ && slot_class_[s] != unsigned(cls)) continue;
             if (c.pinned || c.leases || c.retention.use_count()>1 || wanted.count(c.id) || (layer>=0 && slot_layers_[s]!=unsigned(layer))) continue;
-            if (!pass && recent_ && last_use_[c.id] && last_use_[c.id] + recent_ >= layer_clocks_[layer_of(c.id)]) continue;
+            if (!pass && recent_ && last_use_[c.id] && last_use_[c.id] + recent_ >= layer_clocks_[layer_of(c.id)] &&
+                !dup_first(ExpertId(c.id))) continue;
             bool over=budgets_ && !layer_budgets_off(host_) && layer_counts[layer_of(c.id)]>layer_budgets_[layer_of(c.id)];
             bool prior_over=slot>=0 && budgets_ && !layer_budgets_off(host_) && layer_counts[layer_of(slots_[slot].id)]>layer_budgets_[layer_of(slots_[slot].id)];
             if (slot<0 || (over && !prior_over) || (over==prior_over &&
@@ -239,7 +250,7 @@ int SlotPool::fast_victim(const std::unordered_set<ExpertId>& wanted,const std::
             int j=residency_[e];if(j<0)continue;const auto& c=slots_[j];
             if(c.pinned || c.leases || c.retention.use_count()>1 || wanted.count(e))continue;
             if(best_any_[l]<0 || less_slot(j,best_any_[l]))best_any_[l]=j;
-            if(recent_ && last_use_[e] && last_use_[e]+recent_>=layer_clocks_[l])continue;
+            if(recent_ && last_use_[e] && last_use_[e]+recent_>=layer_clocks_[l] && !dup_first(e))continue;
             if(best_old_[l]<0 || less_slot(j,best_old_[l]))best_old_[l]=j;
         }
         dirty_[l]=false;seen_retention_epochs_[l]=retention;

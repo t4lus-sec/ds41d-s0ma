@@ -148,6 +148,7 @@ private:
     std::shared_ptr<RetentionEpochs> retention_epochs_;
     uint64_t score(ExpertId id) const;
     bool less_slot(size_t a, size_t b) const;
+    bool dup_first(ExpertId id) const;   // s0ma change 46
     int fast_victim(const std::unordered_set<ExpertId>& wanted,
                     const std::array<size_t,43>& counts, int cls = -1);
 };

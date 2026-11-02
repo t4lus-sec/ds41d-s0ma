@@ -135,8 +135,31 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
     }
     ds41e::prefill::Stager::Keep keep;
     if(!keep_at.empty())keep=[&keep_at](ds41::ExpertId id)->void*{auto it=keep_at.find(id);return it==keep_at.end()?nullptr:it->second;};
-    try{prefill_transfers=prefill_stage->stream(misses,stream,consume,lookup,[&]{p_engram_barrier();},keep);}
+    // s0ma change 60: the same ranking into VRAM, from RAM or the drive, within this layer's share of the VRAM budget
+    ds41::OffloadStore::Admission vadm;
+    std::unordered_map<ds41::ExpertId,void*> vkeep_at;
+    if(vram_admit_budget>vram_admit_used&&pref&&pref->warm&&!prompt_tail_count.empty()&&!ids.empty()&&ids.front()<15360) {
+      std::vector<std::pair<int,ds41::ExpertId>> rank;
+      for(auto id:misses)if(id<15360&&prompt_tail_count[id])rank.push_back({-int(prompt_tail_count[id]),id});
+      if(!rank.empty()) {
+        std::sort(rank.begin(),rank.end());
+        std::vector<ds41::ExpertId> want;std::vector<uint32_t> credit;
+        for(auto [c,id]:rank){want.push_back(id);credit.push_back(uint32_t(-c));}
+        const unsigned l=ds41::expert_layer(ids.front());
+        vadm=experts->admit_vram_begin(want,credit,(vram_admit_budget-vram_admit_used)/std::max(1u,40u-l));
+        for(size_t i=0;i<vadm.ids.size();++i)vkeep_at[vadm.ids[i]]=vadm.dst[i];
+      }
+    }
+    ds41e::prefill::Stager::Keep keep_vram;
+    if(!vkeep_at.empty())keep_vram=[&vkeep_at](ds41::ExpertId id)->void*{auto it=vkeep_at.find(id);return it==vkeep_at.end()?nullptr:it->second;};
+    try{prefill_transfers=prefill_stage->stream(misses,stream,consume,lookup,[&]{p_engram_barrier();},keep,keep_vram);}
     catch(...){join();throw;}
+    if(vadm.token) {
+      if(prefill_transfers.kept_vram_ram+prefill_transfers.kept_vram_disk!=vadm.ids.size())
+        throw std::logic_error("prompt VRAM admission: an admitted expert was not copied");
+      vram_admit_used+=vadm.bytes;
+      experts->admit_vram_end(std::move(vadm));
+    }
     if(adm.token) {
       if(prefill_transfers.kept!=adm.ids.size())
         throw std::logic_error("prompt admission: an admitted expert's bytes were not copied");
@@ -365,7 +388,7 @@ Json pmoe(int l,ds41e::prefill::Span span) {
   float sweep_ms;CK(cudaEventElapsedTime(&sweep_ms,sweep.start,sweep.end));
   double compute_ms=0;for(auto &t:compute){float ms;CK(cudaEventElapsedTime(&ms,t->start,t->end));compute_ms+=ms;}
   auto resident_after=experts->stats();auto stage_after=prefill_transfers;
-  if(resident_after.evictions!=resident_before.evictions)
+  if(resident_after.evictions!=resident_before.evictions&&!vram_admit_budget)   // s0ma change 60: admissions evict
     throw std::runtime_error("decode cache changed during prefill; competing forecasts must be quiesced");
   return {{"tokens_per_expert_histogram",distribution},{"unique_experts",needed.size()},{"expert_chunks",chunks},{"route_boundary_ms",boundary},
       {"expert_schedule_host_ms",schedule},{"expert_sweep_stream_ms",sweep_ms},
@@ -525,6 +548,10 @@ void overlap_report() {
   ram_line("after prompts, all, RAM",ram_all,ram_first);
   std::cerr<<"\n";
   ram_req_all=ram_req_first=Overlap{};
+  if(vram_admit_budget){const auto v=experts->vram_admit_stats();
+    std::cerr<<std::fixed<<std::setprecision(1)<<"prompt VRAM admission: "<<v.experts<<" experts ("<<v.bytes/double(1ull<<30)
+             <<" GiB) copied into VRAM slots from the prompts' staging, "<<v.victims<<" residents evicted ("<<v.victims_dropped
+             <<" of them not in RAM; "<<vram_admit_budget/double(1ull<<30)<<" GiB a prompt at most)\n"<<std::defaultfloat<<std::setprecision(6);}
   if(admit_budget)std::cerr<<std::fixed<<std::setprecision(1)<<"prompt admission: "<<admit_experts<<" experts ("
                            <<admit_bytes/double(1ull<<30)<<" GiB) copied into RAM from the prompts' drive reads, "
                            <<admit_copy_ms<<" ms on the reader thread to queue their copies ("<<admit_budget/double(1ull<<30)
@@ -538,8 +565,8 @@ void begin_prompt(int64_t rows,bool append) override {
     overlap_report();
     if(prompt_bits.empty())experts->log_nvme_misses(true);
     prompt_bits.assign(15360,0);steps_after_prompt=0;
-    if(admit_budget)prompt_tail_count.assign(15360,0);
-    admit_used=0;
+    if(admit_budget||vram_admit_budget)prompt_tail_count.assign(15360,0);
+    admit_used=0;vram_admit_used=0;
   }
   if(!lend_chunks_total||poisoned)return;
   lend_prompt=true;++lend_prompts;lend_retry=0;
@@ -765,7 +792,9 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
     }
     mark("head");
     // s0ma change 57: a prompt that admitted experts into RAM changed RAM membership on purpose; VRAM's must still hold
-    if(!residency_before.empty()&&admit_used) {
+    if(!residency_before.empty()&&vram_admit_used) {
+      // s0ma change 60: a prompt that admitted experts into VRAM changed both tiers on purpose
+    } else if(!residency_before.empty()&&admit_used) {
       const auto after=p_residency(*experts);
       for(size_t i=0;i<after.size()&&i<residency_before.size();++i)
         if((after[i]&1)!=(residency_before[i]&1))throw std::runtime_error("prefill changed decode VRAM membership");

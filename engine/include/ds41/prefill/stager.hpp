@@ -8,6 +8,7 @@ struct TransferStats {
   double h2d_stream_ms=0,host_service_ms=0;
   double ram_service_host_ms=0,nvme_service_host_ms=0;
   uint64_t kept=0; double keep_ms=0;   // s0ma change 57
+  uint64_t kept_vram_ram=0,kept_vram_disk=0;   // s0ma change 60
 };
 // Fixed isolated VRAM and pinned disk ring. It never admits to the decode pool.
 // At most one stream() call at a time. Callbacks only enqueue GPU operations,
@@ -25,6 +26,7 @@ public:
   // there from the pinned ring before the ring slot is reused (the decode store's RAM tier, see admit_begin).
   using Keep=std::function<void*(ds41::ExpertId)>;
   TransferStats stream(const std::vector<ds41::ExpertId>&,cudaStream_t,
-      const Ready&,const HostLookup& = {},const std::function<void()>& before_disk = {},const Keep& keep = {});
+      const Ready&,const HostLookup& = {},const std::function<void()>& before_disk = {},const Keep& keep = {},
+      const Keep& keep_vram = {});   // s0ma change 60: a device destination (the decode store's VRAM slot), copied D2D
 };
 }

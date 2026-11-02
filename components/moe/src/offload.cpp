@@ -83,6 +83,8 @@ struct OffloadStore::Impl {
     std::vector<ExpertId> miss_log, ram_log;
     std::atomic<bool> miss_on{false};
     std::map<uint64_t,std::vector<SlotPool::Allocation>> admitting;   // s0ma change 57: held RAM slots
+    std::map<uint64_t,std::vector<SlotPool::Allocation>> admitting_vram;   // s0ma change 60: held VRAM slots
+    VramAdmitStats vram_admit;
     uint64_t admit_serial=0;
     bool lendable(size_t slot)const{return lend_n && slot>=lend_first && slot<lend_first+lend_n;}
     uint8_t* sptr(size_t slot)const{
@@ -956,6 +958,59 @@ OffloadStore::Admission OffloadStore::admit_begin(const std::vector<ExpertId>& i
         return a;
     }).get();
 }
+OffloadStore::Admission OffloadStore::admit_vram_begin(const std::vector<ExpertId>& ids,const std::vector<uint32_t>& credit,size_t budget){
+    if(credit.size()!=ids.size())throw std::invalid_argument("admit_vram_begin: a credit for each id");
+    check_error();
+    return impl_->submit([this,ids,credit,budget]{
+        auto& I=*impl_;Admission a;
+        auto* views=static_cast<DeviceExpert*>(I.entries->data());
+        auto* gens=static_cast<uint32_t*>(I.generations->data());
+        std::vector<SlotPool::Allocation> held;
+        for(size_t j=0;j<ids.size();++j){
+            const auto id=ids[j];const auto& r=I.records.at(id);
+            if(I.pool.residency(id)>=0)continue;
+            if(a.bytes+r.bytes>budget)break;
+            std::vector<SlotPool::Allocation> got;
+            try{got=I.pool.acquire({id},true);}catch(const std::runtime_error&){break;}   // no unleased slot of its class
+            const auto s=got.front();
+            if(s.evicted>=0){
+                const auto x=ExpertId(s.evicted);
+                ++I.counters.evictions;++I.counters.vram.evictions;++I.vram_admit.victims;
+                if(!I.host.count(x))++I.vram_admit.victims_dropped;
+                if(I.prefetched.erase(x)){++I.counters.prefetch_wasted;I.counters.vram.wasted_bytes+=I.records.at(x).bytes;}
+            }
+            I.pool.boost(id,credit[j]);
+            I.known_ready[s.slot]=false;
+            uint32_t generation=++gens[s.slot];if(!generation)generation=++gens[s.slot];
+            auto* base=I.sptr(s.slot);
+            views[id]={base+r.gate.offset,base+r.gate_scale.offset,base+r.up.offset,base+r.up_scale.offset,base+r.down.offset,base+r.down_scale.offset,
+                       I.cfg.ready_flags?I.ready+s.slot:nullptr,generation,int32_t(s.slot)};
+            ck(cudaMemcpyAsync(I.table+id,views+id,sizeof(DeviceExpert),cudaMemcpyHostToDevice,I.mapping));
+            held.push_back(s);a.ids.push_back(id);a.dst.push_back(base);a.bytes+=r.bytes;
+        }
+        ck(cudaStreamSynchronize(I.mapping));
+        for(auto s:held)ck(cudaEventRecord(I.slot_mapping[s.slot],I.mapping));
+        a.token=++I.admit_serial;I.admitting_vram.emplace(a.token,std::move(held));
+        return a;
+    }).get();
+}
+void OffloadStore::admit_vram_end(Admission a){
+    impl_->submit([this,token=a.token]{
+        auto& I=*impl_;
+        auto it=I.admitting_vram.find(token);
+        if(it==I.admitting_vram.end())throw std::logic_error("admit_vram_end: unknown admission");
+        for(auto s:it->second){
+            if(I.cfg.ready_flags)ck(cudaMemcpyAsync(I.ready+s.slot,static_cast<uint32_t*>(I.generations->data())+s.slot,sizeof(uint32_t),cudaMemcpyHostToDevice,I.copy));
+            ck(cudaEventRecord(I.slot_copy[s.slot],I.copy));
+            ++I.vram_admit.experts;I.vram_admit.bytes+=I.records.at(s.id).bytes;
+        }
+        ck(cudaStreamSynchronize(I.copy));
+        for(auto s:it->second)I.known_ready[s.slot]=true;
+        if(!it->second.empty())I.pool.release(it->second);
+        I.admitting_vram.erase(it);
+    }).get();
+}
+OffloadStore::VramAdmitStats OffloadStore::vram_admit_stats(){return impl_->submit([this]{return impl_->vram_admit;}).get();}
 void OffloadStore::admit_end(Admission a){
     impl_->submit([this,token=a.token]{
         auto it=impl_->admitting.find(token);

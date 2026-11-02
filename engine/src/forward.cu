@@ -284,6 +284,17 @@ class Native final : public Forward, public hotpath::GateEvidence {
     return size_t(g * double(1ull << 30));
   }();
   size_t admit_used = 0;
+  // s0ma change 60: DS41_PROMPT_VRAM_GIB=N: up to N GiB a prompt of the experts its last 256 rows routed (from RAM or the
+  // drive) copied on the GPU from the stager's slot into decode VRAM slots as they pass
+  size_t vram_admit_budget = [] {
+    const char *v = std::getenv("DS41_PROMPT_VRAM_GIB");
+    if (!v || !*v) return size_t(0);
+    char *end = nullptr;
+    const double g = std::strtod(v, &end);
+    if (*end || !(g >= 0) || g > 64) throw std::invalid_argument("DS41_PROMPT_VRAM_GIB: 0..64");
+    return size_t(g * double(1ull << 30));
+  }();
+  size_t vram_admit_used = 0;
   uint64_t admit_experts = 0, admit_bytes = 0;
   double admit_copy_ms = 0;
   std::set<std::string> dense_woa;                    // "layers.L.attn" whose wo_a runs as Sero's eight slices

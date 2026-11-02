@@ -77,7 +77,7 @@ Stager::Stager(std::vector<ds41::Record> records,size_t slots):impl(new Impl(std
 Stager::~Stager()=default;
 size_t Stager::device_bytes() const noexcept{return impl->slots*impl->record_bytes;}
 TransferStats Stager::stream(const std::vector<ds41::ExpertId>& ids,cudaStream_t consumer,
-    const Ready& ready,const HostLookup& host,const std::function<void()>& before_disk,const Keep& keep) {
+    const Ready& ready,const HostLookup& host,const std::function<void()>& before_disk,const Keep& keep,const Keep& keep_vram) {
  auto &p=*impl;if(p.poison)std::rethrow_exception(p.poison);
  if(!consumer||!ready)throw std::invalid_argument("stager consumer/callback");
  // A later sweep may reuse a logical table entry in a different slot.
@@ -106,7 +106,13 @@ TransferStats Stager::stream(const std::vector<ds41::ExpertId>& ids,cudaStream_t
  try {
   if(!ram.empty())ram_job=std::async(std::launch::async,[&]{
    double ram_start=ms();ck(cudaSetDevice(p.device));
-   for(size_t i=0;i<ram.size();++i)p.upload(ram[i].first,ram[i].second.data,i%ram_slots,p.ram,consumer,ready,*begins[i],*ends[i]);
+   for(size_t i=0;i<ram.size();++i){
+    p.upload(ram[i].first,ram[i].second.data,i%ram_slots,p.ram,consumer,ready,*begins[i],*ends[i]);
+    // s0ma change 60: into the decode store's VRAM slot too, D2D on the same stream, before the slot's next upload
+    if(keep_vram)if(void* d=keep_vram(ram[i].first)){
+     ck(cudaMemcpyAsync(d,static_cast<const uint8_t*>(p.weights)+(i%ram_slots)*p.record_bytes,p.records.at(ram[i].first).bytes,
+                        cudaMemcpyDeviceToDevice,p.ram));++stats.kept_vram_ram;}
+   }
    ck(cudaStreamSynchronize(p.ram)); // borrowed host leases end only after DMA
    stats.ram_service_host_ms=ms()-ram_start;
   });
@@ -126,6 +132,9 @@ TransferStats Stager::stream(const std::vector<ds41::ExpertId>& ids,cudaStream_t
      ck(cudaMemcpyAsync(d,static_cast<const uint8_t*>(p.weights)+(ram_slots+buffer)*p.record_bytes,disk[i]->bytes,
                         cudaMemcpyDeviceToHost,p.disk));
      stats.keep_ms+=ms()-t;++stats.kept;}
+    if(keep_vram)if(void* d=keep_vram(disk[i]->id)){   // s0ma change 60
+     ck(cudaMemcpyAsync(d,static_cast<const uint8_t*>(p.weights)+(ram_slots+buffer)*p.record_bytes,disk[i]->bytes,
+                        cudaMemcpyDeviceToDevice,p.disk));++stats.kept_vram_disk;}
    },[&](size_t buffer){ck(cudaEventSynchronize(p.dma_done[buffer]->e));});
    ck(cudaStreamSynchronize(p.disk));
    stats.nvme_service_host_ms=ms()-io_start;

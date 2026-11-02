@@ -129,6 +129,14 @@ public:
     struct Admission { uint64_t token = 0; std::vector<ExpertId> ids; std::vector<void*> dst; size_t bytes = 0; };
     Admission admit_begin(const std::vector<ExpertId>& ids, const std::vector<uint32_t>& credit, size_t byte_budget);
     void admit_end(Admission admission);
+    // s0ma change 60: the same into VRAM. admit_vram_begin takes slots for ids not in VRAM (the least valued unleased
+    // residents of each one's class are evicted; one without a RAM copy is dropped), publishes their table entries
+    // and holds them; dst[i] is ids[i]'s slot, to be filled on the GPU. admit_vram_end, once those copies have
+    // completed, marks the slots ready and releases them.
+    Admission admit_vram_begin(const std::vector<ExpertId>& ids, const std::vector<uint32_t>& credit, size_t byte_budget);
+    void admit_vram_end(Admission admission);
+    struct VramAdmitStats { uint64_t experts = 0, bytes = 0, victims = 0, victims_dropped = 0; };
+    VramAdmitStats vram_admit_stats();
     std::vector<ExpertId> take_nvme_misses();
     // s0ma change 59: and of decode's VRAM misses served from the RAM tier (same switch)
     std::vector<ExpertId> take_ram_hits();

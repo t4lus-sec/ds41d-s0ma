@@ -19,6 +19,11 @@ static int prefill_wave_rows() {
   }();
   return n;
 }
+// s0ma change 77: DS41_PREFILL_COPIES_FIRST=0 enqueues the residents before the staged copies start (as before)
+static bool prefill_copies_first() {
+  static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_COPIES_FIRST"); return !v || std::string(v) != "0"; }();
+  return on;
+}
 static bool prefill_exl3_rotated() {
   static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_EXL3_ROTATED"); return !v || std::string(v) != "0"; }();
   return on;
@@ -97,10 +102,177 @@ template<class Store> std::vector<uint8_t> p_residency(Store& store) {
 }
 // s0ma change 76: group, when given, takes a lane's whole share of the resident experts at once (grouped launches)
 using PGroup=std::function<void(const std::vector<ds41::ExpertId>&,const ds41::DeviceExpert*,cudaStream_t)>;
+// s0ma change 77: a layer's RAM experts copied while its attention runs. After each chunk's routing (cproject), the
+// chunk's route ids come back to pinned memory under an event; a worker thread waits for them in order and copies
+// each newly routed expert that is in the RAM tier and was not in VRAM at the layer's start into a per-prompt VRAM
+// arena (DS41_PREFILL_PREFETCH_MIB, default 768; 0 turns it off), on its own copy stream, while the GPU works on
+// the next chunks. pstream then serves those experts from the arena (the consumer waits on the copy's event)
+// instead of the stager. The bytes are the RAM tier's own: what is computed does not change.
+struct PrefillPrefetch {
+  struct Job { int layer; cudaEvent_t ready; const int32_t *ids; int rows; };
+  ds41::HostBuffer *table = nullptr, *ids = nullptr;   // pinned buffers the engine keeps between prompts
+  Device arena;
+  size_t used = 0, cap = 0;
+  cudaStream_t copy = nullptr;
+  // two pools, one a thread: chunk events (the main thread) and copy events (the worker), reused a layer later
+  std::vector<cudaEvent_t> chunk_events, copy_events;
+  size_t next_chunk = 0, next_copy = 0;
+  std::thread worker;
+  std::mutex m;
+  std::condition_variable cv, idle;
+  std::deque<Job> q;
+  bool stop = false, busy = false;
+  int layer = -1;
+  std::vector<uint8_t> resident;            // VRAM membership at the layer's start
+  std::unordered_map<ds41::ExpertId, cudaEvent_t> landed;
+  std::unordered_set<ds41::ExpertId> seen;
+  std::deque<ds41::OffloadStore::HostLease> leases;   // (a deque: a chunk keeps a pointer to its own)
+  int device = 0;
+  uint64_t copied = 0, bytes = 0, served = 0;
+  static cudaEvent_t take(std::vector<cudaEvent_t> &pool, size_t &next) {
+    if (next == pool.size()) { cudaEvent_t e; CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); pool.push_back(e); }
+    return pool[next++];
+  }
+  ~PrefillPrefetch() {
+    { std::lock_guard<std::mutex> g(m); stop = true; }
+    cv.notify_all();
+    if (worker.joinable()) worker.join();
+    if (copy) { cudaStreamSynchronize(copy); cudaStreamDestroy(copy); }
+    for (auto e : chunk_events) cudaEventDestroy(e);
+    for (auto e : copy_events) cudaEventDestroy(e);
+  }
+};
+std::unique_ptr<ds41::HostBuffer> prefill_prefetch_table, prefill_prefetch_ids;
+std::unique_ptr<PrefillPrefetch> prefetch;
+int prefetch_layer=-1;   // the layer pmoe is sweeping (pstream reads it)
+bool prefill_waves_ready=false;   // s0ma change 77: every lane's wave scratch allocated for this sweep
+Json prefill_summary_prefetch;
+std::unordered_map<ds41::ExpertId, const ds41::Record *> prefetch_records;
+static size_t prefill_prefetch_bytes() {
+  static const size_t b = [] {
+    const char *v = std::getenv("DS41_PREFILL_PREFETCH_MIB");
+    const long x = v && *v ? std::atol(v) : 768;
+    if (x < 0 || x > 16384) throw std::invalid_argument("DS41_PREFILL_PREFETCH_MIB must be 0..16384");
+    return size_t(x) << 20;
+  }();
+  return b;
+}
+// at a prompt's start: the arena (smaller if VRAM is short; none if it cannot be had) and the worker
+void prefetch_begin(size_t rows) {
+  prefetch.reset();
+  size_t want = prefill_prefetch_bytes();
+  if (!want || !exl3 || prefill_records.empty()) return;
+  if (prefetch_records.empty()) for (const auto &r : prefill_records) prefetch_records[r.id] = &r;
+  auto P = std::make_unique<PrefillPrefetch>();
+  // leave room for what the prompt still allocates (the stager's ring on a first prompt, the lanes' wave scratch)
+  size_t free_b = 0, total_b = 0;
+  CK(cudaMemGetInfo(&free_b, &total_b));
+  const size_t margin = size_t(1) << 30;
+  want = std::min(want, free_b > margin ? free_b - margin : 0);
+  for (; want >= (size_t(128) << 20); want /= 2) {
+    try { P->arena.resize(want); P->cap = want; break; }
+    catch (const std::exception &) { (void)cudaGetLastError(); }   // a failed cudaMalloc leaves its error behind
+  }
+  if (!P->cap) { std::cerr << "prefill prefetch off for this prompt (no VRAM for its arena)\n"; return; }
+  P->table = prefill_pinned(prefill_prefetch_table, ds41::expert_count * sizeof(ds41::DeviceExpert));
+  P->ids = prefill_pinned(prefill_prefetch_ids, rows * 6 * 4);
+  CK(cudaStreamCreateWithFlags(&P->copy, cudaStreamNonBlocking));
+  CK(cudaGetDevice(&P->device));
+  auto *self = P.get();
+  P->worker = std::thread([this, self] { prefetch_loop(*self); });
+  prefetch = std::move(P);
+}
+void prefetch_loop(PrefillPrefetch &P) {
+  try { CK(cudaSetDevice(P.device)); } catch (...) { return; }
+  for (;;) {
+    PrefillPrefetch::Job j;
+    {
+      std::unique_lock<std::mutex> g(P.m);
+      P.cv.wait(g, [&] { return P.stop || !P.q.empty(); });
+      if (P.stop) return;
+      j = P.q.front(); P.q.pop_front(); P.busy = true;
+    }
+    try {
+      CK(cudaEventSynchronize(j.ready));
+      std::vector<ds41::ExpertId> want;   // this chunk's newly routed experts, not in VRAM at the layer's start
+      for (int k = 0; k < j.rows * 6; ++k) {
+        const auto id = ds41::expert_id(unsigned(j.layer), uint32_t(j.ids[k]));
+        if (!P.seen.insert(id).second) continue;
+        if (id < P.resident.size() && (P.resident[id] & 1)) continue;
+        if (id < P.resident.size() && !(P.resident[id] & 2)) continue;   // not in the RAM tier: the stager reads it
+        if (prefetch_records.count(id)) want.push_back(id);
+      }
+      if (want.empty()) goto next;
+      {
+        // one store round trip a chunk; kept before any copy reads it (released after the layer's sweep)
+        const ds41::OffloadStore::HostLease *lease = nullptr;
+        { std::lock_guard<std::mutex> g(P.m); P.leases.push_back(experts->borrow_host(want)); lease = &P.leases.back(); }
+        for (const auto &v : lease->views) {
+          if (!v.data) continue;
+          const auto &r = *prefetch_records.at(v.id);
+          const size_t need = (r.bytes + 4095) & ~size_t(4095);
+          if (P.used + need > P.cap) break;   // the arena is full for this layer
+          auto *base = P.arena.as<uint8_t>(P.used);
+          P.used += need;
+          static_cast<ds41::DeviceExpert *>(P.table->data())[v.id] = {base + r.gate.offset, base + r.gate_scale.offset,
+              base + r.up.offset, base + r.up_scale.offset, base + r.down.offset, base + r.down_scale.offset, nullptr, 0, -1};
+          CK(cudaMemcpyAsync(base, v.data, r.bytes, cudaMemcpyHostToDevice, P.copy));
+          cudaEvent_t done = PrefillPrefetch::take(P.copy_events, P.next_copy);
+          CK(cudaEventRecord(done, P.copy));
+          std::lock_guard<std::mutex> g(P.m);
+          P.landed[v.id] = done;
+          ++P.copied; P.bytes += r.bytes;
+        }
+      }
+      next:;
+    } catch (const std::exception &e) {
+      std::cerr << "prefill prefetch: " << e.what() << "\n";
+    }
+    { std::lock_guard<std::mutex> g(P.m); P.busy = false; }
+    P.idle.notify_all();
+  }
+}
+// cproject, after a chunk's routes: hand its ids to the worker (layers that pmoe will sweep)
+void prefetch_chunk(int layer, size_t slot, int rows) {
+  if (!prefetch || rows < 1) return;
+  auto &P = *prefetch;
+  if (P.layer != layer) {   // a new layer: the previous one's arena was released by pmoe
+    P.layer = layer;
+    P.resident = experts->residency_snapshot();
+  }
+  auto *host = static_cast<int32_t *>(P.ids->data()) + slot * 6;
+  CK(cudaMemcpyAsync(host, pref->ids.as<char>(slot * 6 * 4), size_t(rows) * 6 * 4, cudaMemcpyDeviceToHost, stream));
+  cudaEvent_t e = PrefillPrefetch::take(P.chunk_events, P.next_chunk);
+  CK(cudaEventRecord(e, stream));
+  { std::lock_guard<std::mutex> g(P.m); P.q.push_back({layer, e, host, rows}); }
+  P.cv.notify_one();
+}
+// pmoe, before its sweep: what the worker has copied for this layer (it finishes the chunks already handed over)
+std::unordered_map<ds41::ExpertId, cudaEvent_t> prefetch_take(int layer) {
+  if (!prefetch || prefetch->layer != layer) return {};
+  auto &P = *prefetch;
+  std::unique_lock<std::mutex> g(P.m);
+  P.idle.wait(g, [&] { return P.q.empty() && !P.busy; });
+  return P.landed;
+}
+// pmoe, after its sweep (the stream and the lanes synchronized): the arena is free for the next layer
+void prefetch_release() {
+  if (!prefetch) return;
+  auto &P = *prefetch;
+  std::unique_lock<std::mutex> g(P.m);
+  P.idle.wait(g, [&] { return P.q.empty() && !P.busy; });
+  CK(cudaStreamSynchronize(P.copy));
+  P.landed.clear(); P.seen.clear(); P.leases.clear(); P.used = 0; P.next_chunk = P.next_copy = 0; P.layer = -1;
+}
 template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume,const PGroup &group={}) {
   prefill_transfers={};prefill_vram_hits=0;
   int side_pending=0;bool spread=false;
   std::vector<size_t> lane_load;   // s0ma change 69: experts given to each lane this layer (0: the main stream)
+  std::vector<std::vector<ds41::ExpertId>> share;   // s0ma change 77: each side lane's residents
+  std::function<void()> residents;
+  std::vector<std::pair<ds41::ExpertId,cudaEvent_t>> early;   // s0ma change 77: misses already in the arena
+  std::function<void(cudaStream_t)> early_serve;
+  std::mutex lane_mutex;
   auto lease=pborrow(*experts,ids);
   std::set<ds41::ExpertId> hits;std::vector<ds41::ExpertId> misses;
   try {
@@ -110,10 +282,32 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume,const P
     }
     prefill_vram_hits=hits.size();
     for(auto id:ids)if(!hits.count(id))misses.push_back(id);
+    // s0ma change 77: misses copied while the layer's attention ran come from the arena
+    if(prefetch && !misses.empty() && prefetch_layer>=0 && !(vram_admit_budget>vram_admit_used)) {
+      auto landed=prefetch_take(prefetch_layer);
+      std::vector<ds41::ExpertId> rest;
+      for(auto id:misses){auto it=landed.find(id);if(it==landed.end())rest.push_back(id);else early.push_back({id,it->second});}
+      misses.swap(rest);
+    }
     const int sides=exl3?prefill_lanes()-1:0;
     // s0ma change 69: staged experts on every lane too (with the side lanes in use, any expert of the layer)
     spread=sides>0 && prefill_miss_lanes() && !misses.empty();
-    if(sides>0 && (!hits.empty() || spread)) {
+    if(!early.empty()) {   // s0ma change 77: each waits for its copy, then runs as a miss would (least loaded lane)
+      const auto *ptable=static_cast<const ds41::DeviceExpert*>(prefetch->table->device_data());
+      prefetch->served+=early.size();
+      auto serve_early=[&,ptable](cudaStream_t fallback){
+        for(auto &[id,ev]:early){
+          cudaStream_t s=fallback;
+          if(!lane_load.empty()){size_t best=0;for(size_t i=1;i<lane_load.size();++i)if(lane_load[i]<lane_load[best])best=i;
+            ++lane_load[best];s=best?prefill_lane(best-1).s:stream;}
+          CK(cudaStreamWaitEvent(s,ev,0));
+          consume(id,ptable,s);
+        }
+      };
+      early_serve=serve_early;
+    }
+    // s0ma change 77: the residents' work is enqueued by `residents` (below, after the staged copies have started)
+    if(sides>0 && (!hits.empty() || spread || !early.empty())) {
       // s0ma change 27: resident experts on the side lanes, round robin, beside the staged sweep below; joined (and
       // their lease retired) before this layer's epilogue reads `routed`
       cudaEvent_t start=prefill_lane(size_t(sides-1)).done;   // any lane's event: recorded, then waited at once
@@ -121,26 +315,37 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume,const P
       for(int i=0;i<sides;++i)CK(cudaStreamWaitEvent(prefill_lane(size_t(i)).s,start,0));
       size_t k=0;
       lane_load.assign(size_t(sides)+1,0);
-      if(group) {   // s0ma change 76: each side lane's residents in grouped launches
-        std::vector<std::vector<ds41::ExpertId>> share(static_cast<size_t>(sides));
-        for(auto id:hits){const size_t at=k%size_t(sides);share[at].push_back(id);++k;}
+      share.assign(static_cast<size_t>(sides),{});
+      for(auto id:hits){const size_t at=k%size_t(sides);share[at].push_back(id);++lane_load[at+1];++k;}
+      residents=[&,sides]{
         for(int i=0;i<sides;++i){
           const std::vector<ds41::ExpertId> &mine=share[size_t(i)];
           if(mine.empty())continue;
-          lane_load[size_t(i)+1]+=mine.size();
-          group(mine,experts->table(),prefill_lane(size_t(i)).s);
+          if(group)group(mine,experts->table(),prefill_lane(size_t(i)).s);   // s0ma change 76
+          else for(auto id:mine)consume(id,experts->table(),prefill_lane(size_t(i)).s);
         }
-      } else
-      for(auto id:hits){++lane_load[1+k%size_t(sides)];consume(id,experts->table(),prefill_lane(k++%size_t(sides)).s);}
-      for(int i=0;i<sides;++i){auto &L=prefill_lane(size_t(i));CK(cudaEventRecord(L.done,L.s));}
+        for(int i=0;i<sides;++i){auto &L=prefill_lane(size_t(i));CK(cudaEventRecord(L.done,L.s));}
+      };
       side_pending=sides;
-    } else if(group && !hits.empty()) {
-      std::vector<ds41::ExpertId> all(hits.begin(),hits.end());
-      group(all,experts->table(),stream);
-    } else for(auto id:hits)consume(id,experts->table(),stream);
-    if(!side_pending && lease.serial)experts->retire(std::move(lease),stream);
+    } else residents=[&]{
+      if(group && !hits.empty()) {
+        std::vector<ds41::ExpertId> all(hits.begin(),hits.end());
+        group(all,experts->table(),stream);
+      } else for(auto id:hits)consume(id,experts->table(),stream);
+
+      if(lease.serial)experts->retire(std::move(lease),stream);
+    };
   }catch(...){cudaStreamSynchronize(stream);for(auto &L:prefill_side)cudaStreamSynchronize(L->s);side_pending=0;
     if(lease.serial&&lease.owner)experts->retire(std::move(lease),stream);throw;}
+  auto run_residents=[&]{
+    try{
+      // s0ma change 77: the arena's experts first, on this thread, before the staged copies' thread can enqueue on
+      // the same lanes (their per-expert scratch is the lane's)
+      if(early_serve){auto f=std::move(early_serve);early_serve=nullptr;f(stream);}
+      residents();}
+    catch(...){cudaStreamSynchronize(stream);for(auto &L:prefill_side)cudaStreamSynchronize(L->s);side_pending=0;
+      if(lease.serial&&lease.owner)experts->retire(std::move(lease),stream);throw;}
+  };
   auto join=[&]{   // s0ma change 27: the main stream waits for the side lanes, then the resident lease ends
     if(!side_pending)return;
     for(int i=0;i<side_pending;++i)CK(cudaStreamWaitEvent(stream,prefill_side[size_t(i)]->done,0));
@@ -152,6 +357,7 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume,const P
   // rows of `routed`, so which lane runs it changes nothing in the result.
   std::function<cudaStream_t(ds41::ExpertId)> pick;
   if(spread)pick=[&](ds41::ExpertId)->cudaStream_t{
+    std::lock_guard<std::mutex> g(lane_mutex);   // s0ma change 77: the arena's experts take lanes too
     size_t best=0;for(size_t i=1;i<lane_load.size();++i)if(lane_load[i]<lane_load[best])best=i;
     ++lane_load[best];return best?prefill_lane(best-1).s:stream;
   };
@@ -208,8 +414,24 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume,const P
     }
     ds41e::prefill::Stager::Keep keep_vram;
     if(!vkeep_at.empty())keep_vram=[&vkeep_at](ds41::ExpertId id)->void*{auto it=vkeep_at.find(id);return it==vkeep_at.end()?nullptr:it->second;};
-    try{prefill_transfers=prefill_stage->stream(misses,stream,consume,lookup,[&]{p_engram_barrier();},keep,keep_vram,pick);}
-    catch(...){for(auto &L:prefill_side)cudaStreamSynchronize(L->s);join();throw;}
+    // s0ma change 77: the staged copies start first (on their own thread) and the residents are enqueued meanwhile:
+    // a layer's first RAM copy no longer waits for ~1,000 resident launches. Only when staged experts go to the
+    // lanes too (the residents and the staged experts then share no scratch: waves have their own).
+    auto staged=[&]{return prefill_stage->stream(misses,stream,consume,lookup,[&]{p_engram_barrier();},keep,keep_vram,pick);};
+    // only with every lane's wave scratch in hand: then the residents never use a lane's per-expert scratch, which
+    // the staged experts' thread uses meanwhile
+    if(spread && prefill_copies_first() && group && prefill_waves_ready) {
+      int device=0;CK(cudaGetDevice(&device));
+      if(early_serve){auto f=std::move(early_serve);early_serve=nullptr;f(stream);}   // before the copies' thread
+      auto copies=std::async(std::launch::async,[&,device]{CK(cudaSetDevice(device));return staged();});
+      try{run_residents();}catch(...){try{copies.get();}catch(...){}throw;}
+      try{prefill_transfers=copies.get();}
+      catch(...){for(auto &L:prefill_side)cudaStreamSynchronize(L->s);join();throw;}
+    } else {
+      run_residents();
+      try{prefill_transfers=staged();}
+      catch(...){for(auto &L:prefill_side)cudaStreamSynchronize(L->s);join();throw;}
+    }
     if(spread)for(auto &L:prefill_side)CK(cudaEventRecord(L->done,L->s));   // change 69: after the staged work too
     if(vadm.token) {
       if(prefill_transfers.kept_vram_ram+prefill_transfers.kept_vram_disk!=vadm.ids.size())
@@ -224,6 +446,7 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume,const P
       experts->admit_end(std::move(adm));
     }
   }
+  else run_residents();
   join();
 }
 void p_engram_barrier() {
@@ -405,7 +628,7 @@ Json pmoe(int l,ds41e::prefill::Span span) {
 
   std::vector<std::unique_ptr<Phase>> compute;
   for(size_t i=0;i<needed.size();++i)compute.push_back(std::make_unique<Phase>());
-  size_t timers_used=0;   // s0ma change 76: a wave records one timer for several experts
+  std::atomic<size_t> timers_used{0};   // s0ma change 76: a wave records one timer for several experts
   // s0ma change 76: the residents' waves. Descriptors (jobs and slots) in a pinned arena the device reads, written
   // once a layer (the previous layer's sweep has finished: pmoe synchronizes the stream before it returns)
   const int wave_rows=exl3?prefill_wave_rows():0;
@@ -413,8 +636,23 @@ Json pmoe(int l,ds41e::prefill::Span span) {
   ds41::HostBuffer *wave_desc=wave_rows?prefill_pinned(prefill_wave_buf,wave_desc_jobs+count*6*4+64):nullptr;
   size_t wave_jobs_used=0,wave_slots_used=0;
   if(wave_rows&&pf.waves.size()<variants)pf.waves.resize(variants);
+  // s0ma change 77: every lane's wave scratch before the sweep (change 77's copies-first needs all of it)
+  prefill_waves_ready=false;
+  if(wave_rows&&!pf.waves_off) {
+    for(auto &W:pf.waves) if(!W.rows) {
+      try {
+        const size_t r=size_t(wave_rows);
+        W.x.resize(r*H*2);W.bw.resize(r*4);W.gate.resize(r*I*2);W.up.resize(r*I*2);W.act.resize(r*I*2);
+        W.down.resize(r*H*2);W.rg.resize(r*H*2);W.ru.resize(r*H*2);W.rd.resize(r*I*2);W.rows=wave_rows;
+      } catch(const std::exception &e) {
+        std::cerr<<"prefill waves off for this prompt (scratch: "<<e.what()<<")\n";
+        pf.waves_off=true;for(auto &X:pf.waves)X=PrefillData::Wave{};break;
+      }
+    }
+    prefill_waves_ready=!pf.waves_off;
+  }
   Phase sweep;CK(cudaEventRecord(sweep.start,stream));
-  host_start=clock_ms();size_t dispatched=0;
+  host_start=clock_ms();std::atomic<size_t> dispatched{0};   // (atomic: change 77's two enqueuing threads)
   // the per-expert path below, for one expert; the wave path for several (falls back to the per-expert path)
   std::function<void(ds41::ExpertId,const ds41::DeviceExpert*,cudaStream_t)> one;
   PGroup group;
@@ -521,12 +759,16 @@ Json pmoe(int l,ds41e::prefill::Span span) {
     }
     CK(cudaEventRecord(timer.end,s));
   };
-  pstream(needed,[&](auto id,const ds41::DeviceExpert* table,auto s){one(id,table,s);},group);
+  prefetch_layer=l;   // s0ma change 77
+  try{pstream(needed,[&](auto id,const ds41::DeviceExpert* table,auto s){one(id,table,s);},group);}
+  catch(...){prefetch_layer=-1;throw;}
+  prefetch_layer=-1;
   if(dispatched!=needed.size())throw std::runtime_error("prefill expert dispatch coverage");
   double schedule=clock_ms()-host_start;
   CK(cudaEventRecord(sweep.end,stream));CK(cudaStreamSynchronize(stream));
+  prefetch_release();   // s0ma change 77: every consumer of the arena has finished (the lanes joined the stream)
   float sweep_ms;CK(cudaEventElapsedTime(&sweep_ms,sweep.start,sweep.end));
-  double compute_ms=0;for(size_t i=0;i<timers_used;++i){float ms;CK(cudaEventElapsedTime(&ms,compute[i]->start,compute[i]->end));compute_ms+=ms;}
+  double compute_ms=0;for(size_t i=0,n=timers_used.load();i<n;++i){float ms;CK(cudaEventElapsedTime(&ms,compute[i]->start,compute[i]->end));compute_ms+=ms;}
   auto resident_after=experts->stats();auto stage_after=prefill_transfers;
   if(resident_after.evictions!=resident_before.evictions&&!vram_admit_budget)   // s0ma change 60: admissions evict
     throw std::runtime_error("decode cache changed during prefill; competing forecasts must be quiesced");
@@ -835,6 +1077,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
   // Preflight allocations before any live state mutation. No eviction or cache
   // rebuild is used to make room for scratch. A failed allocation is retryable.
   mark("images");
+  prefetch.reset();   // s0ma change 77 (a new prompt: a new arena, below)
   pref=std::make_unique<PrefillData>(input.size(),committed,options.mode==PrefillMode::Cold,
       options.logits_tail,config.prefill_budget_bytes);
   auto &pf=*pref;pf.dense_batch=int(options.dense_batch_rows);pf.warm=options.warm;pf.image=std::move(image_rows);
@@ -849,6 +1092,10 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
       size_t free,total;CK(cudaMemGetInfo(&free,&total));
       if(need+(size_t(256)<<20)<=free)prefill_chunk=std::make_unique<PrefillChunk>(R,pf.end,pf.candidate_width,fp8);
     }catch(const std::exception&){prefill_chunk.reset();cudaGetLastError();}
+  }
+  if(prefill_chunk) {   // s0ma change 77: after the prompt's own scratch; a failure only turns it off
+    try{prefetch_begin(input.size());}
+    catch(const std::exception &e){(void)cudaGetLastError();prefetch.reset();std::cerr<<"prefill prefetch off: "<<e.what()<<"\n";}
   }
   mark("alloc");
   PrefillResult result;result.begin_position=committed;result.consumed_rows=input.size();
@@ -1000,6 +1247,10 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
     result.layers=pf.layers;in_step=false;
     const size_t chunk_rows=prefill_chunk?size_t(prefill_chunk->R):0;
     mark("captures");
+    if(prefetch){prefill_summary_prefetch={{"copied",prefetch->copied},{"bytes",prefetch->bytes},{"served",prefetch->served},
+        {"arena_bytes",prefetch->cap}};std::cerr<<"prefill prefetch: "<<prefetch->served<<" of "<<prefetch->copied
+        <<" experts copied during attention served ("<<prefetch->bytes/1048576<<" MiB, arena "<<(prefetch->cap>>20)<<" MiB)\n";}
+    prefetch.reset();   // s0ma change 77: the arena and its worker belong to the prompt
     prefill_chunk.reset();pref.reset();result.elapsed_ms=clock_ms()-begin_ms;total_ms+=result.elapsed_ms;
     mark("free");
     {

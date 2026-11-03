@@ -50,6 +50,10 @@ extern "C" cudaError_t cudaProfilerStop(void);
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <future>
+#include <thread>
+#include <condition_variable>
+#include <deque>
 #include <numeric>
 #include <unordered_set>
 #include <set>

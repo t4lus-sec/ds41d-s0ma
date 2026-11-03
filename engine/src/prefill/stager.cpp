@@ -1,5 +1,6 @@
 #include "ds41/prefill/stager.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <exception>
@@ -26,7 +27,7 @@ struct Stager::Impl {
  ds41::DirectReader reader{64};
  std::unique_ptr<ds41::HostBuffer> staging,table;
  void* weights=nullptr;
- cudaStream_t ram=nullptr,disk=nullptr;
+ cudaStream_t ram=nullptr,disk=nullptr,ram2=nullptr;   // ram2: s0ma change 77, a second copy stream
  std::vector<std::unique_ptr<Event>> consumed,dma_done;
  std::vector<unsigned char> used;
  std::mutex enqueue;
@@ -39,6 +40,7 @@ struct Stager::Impl {
   try {
    ck(cudaGetDevice(&device));ck(cudaMalloc(&weights,slots*record_bytes));
    ck(cudaStreamCreateWithFlags(&ram,cudaStreamNonBlocking));ck(cudaStreamCreateWithFlags(&disk,cudaStreamNonBlocking));
+   ck(cudaStreamCreateWithFlags(&ram2,cudaStreamNonBlocking));
    staging=std::make_unique<ds41::HostBuffer>(slots*record_bytes,true);
    table=std::make_unique<ds41::HostBuffer>(ds41::expert_count*sizeof(ds41::DeviceExpert),true);
    std::fill_n(static_cast<ds41::DeviceExpert*>(table->data()),ds41::expert_count,ds41::DeviceExpert{});
@@ -46,12 +48,12 @@ struct Stager::Impl {
   }catch(...){clear();throw;}
  }
  void clear()noexcept {
-  if(ram)cudaStreamSynchronize(ram);if(disk)cudaStreamSynchronize(disk);
+  if(ram)cudaStreamSynchronize(ram);if(ram2)cudaStreamSynchronize(ram2);if(disk)cudaStreamSynchronize(disk);
   // Last consumers must finish before weight slots and mapped descriptors die.
   for(size_t i=0;i<consumed.size();++i)if(used[i])cudaEventSynchronize(consumed[i]->e);
   consumed.clear();dma_done.clear();table.reset();staging.reset();
   if(weights)cudaFree(weights);weights=nullptr;
-  if(ram)cudaStreamDestroy(ram);if(disk)cudaStreamDestroy(disk);ram=disk=nullptr;
+  if(ram)cudaStreamDestroy(ram);if(ram2)cudaStreamDestroy(ram2);if(disk)cudaStreamDestroy(disk);ram=disk=ram2=nullptr;
  }
  ~Impl(){clear();}
  void upload(ds41::ExpertId id,const void* data,size_t slot,cudaStream_t copy,
@@ -109,14 +111,21 @@ TransferStats Stager::stream(const std::vector<ds41::ExpertId>& ids,cudaStream_t
  try {
   if(!ram.empty())ram_job=std::async(std::launch::async,[&]{
    double ram_start=ms();ck(cudaSetDevice(p.device));
+   // s0ma change 77: RAM uploads on two copy streams (the card has more than one copy engine), by slot parity, so a
+   // slot's uploads and its keep copies stay on one stream in order; one stream if the slots are odd or with
+   // DS41_PREFILL_COPY_STREAMS=1
+   static const int streams=[]{const char*v=std::getenv("DS41_PREFILL_COPY_STREAMS");return v&&v[0]=='1'?1:2;}();
+   const bool two=streams==2&&ram_slots%2==0;
    for(size_t i=0;i<ram.size();++i){
-    p.upload(ram[i].first,ram[i].second.data,i%ram_slots,p.ram,consumer,ready,*begins[i],*ends[i],pick);
+    cudaStream_t cs=two&&((i%ram_slots)&1)?p.ram2:p.ram;
+    p.upload(ram[i].first,ram[i].second.data,i%ram_slots,cs,consumer,ready,*begins[i],*ends[i],pick);
     // s0ma change 60: into the decode store's VRAM slot too, D2D on the same stream, before the slot's next upload
     if(keep_vram)if(void* d=keep_vram(ram[i].first)){
      ck(cudaMemcpyAsync(d,static_cast<const uint8_t*>(p.weights)+(i%ram_slots)*p.record_bytes,p.records.at(ram[i].first).bytes,
-                        cudaMemcpyDeviceToDevice,p.ram));++stats.kept_vram_ram;}
+                        cudaMemcpyDeviceToDevice,cs));++stats.kept_vram_ram;}
    }
    ck(cudaStreamSynchronize(p.ram)); // borrowed host leases end only after DMA
+   ck(cudaStreamSynchronize(p.ram2));
    stats.ram_service_host_ms=ms()-ram_start;
   });
   if(!disk.empty()) {
@@ -149,7 +158,7 @@ TransferStats Stager::stream(const std::vector<ds41::ExpertId>& ids,cudaStream_t
  }catch(...){
   p.poison=std::current_exception();
   if(ram_job.valid())try{ram_job.get();}catch(...){}
-  cudaStreamSynchronize(p.ram);cudaStreamSynchronize(p.disk);cudaStreamSynchronize(consumer);
+  cudaStreamSynchronize(p.ram);cudaStreamSynchronize(p.ram2);cudaStreamSynchronize(p.disk);cudaStreamSynchronize(consumer);
   std::rethrow_exception(p.poison);
  }
 }

@@ -214,6 +214,7 @@ void cproject(const ds41e::prefill::Layer& work,int64_t first,int rows,const cha
   pimage_router(l,qb,qn,c.router.as<float>(),c.unbiased.as<float>(),c.biased.as<float>());
   const size_t slot=size_t(qb-pf.begin);
   ds41e::prefill::select_routes_rows(c.biased.as<float>(),c.unbiased.as<float>(),pf.ids.as<int>(slot*6*4),pf.weights.as<float>(slot*6*4),qn,stream);
+  prefetch_chunk(l,slot,qn);   // s0ma change 77: this chunk's routed RAM experts start copying now
   pcopy(pf.hidden.as<char>(slot*HC*H*2),hq,size_t(qn)*HC*H*2);
   pcopy(pf.ffn_input.as<char>(slot*H*2),c.x.p,size_t(qn)*H*2);
   pcopy(pf.ffn_post.as<char>(slot*4*4),c.post.p,size_t(qn)*4*4);pcopy(pf.ffn_comb.as<char>(slot*16*4),c.comb.p,size_t(qn)*16*4);

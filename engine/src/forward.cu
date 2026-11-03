@@ -730,7 +730,11 @@ class Native final : public Forward, public hotpath::GateEvidence {
     cudaEvent_t done = nullptr;
   };
   std::vector<std::unique_ptr<PrefillLane>> prefill_side;
-  int prefill_lanes() {
+  // s0ma change 82: a cuBLAS handle per prefill variant (0 the main stream, v side lane v-1), bound to its stream,
+  // for the routed experts' prefill through FP16 GEMMs; its mutex guards the handle across the enqueuing threads
+  std::vector<cublasHandle_t> prefill_blas;
+  std::vector<std::unique_ptr<std::mutex>> prefill_blas_m;
+  int prefill_lanes() const {
     static const int n = [] {
       const char *v = std::getenv("DS41_PREFILL_LANES");
       const int x = v && *v ? std::atoi(v) : 1;
@@ -1044,6 +1048,8 @@ public:
       cublasDestroy(blas);
     if (lane_blas)
       cublasDestroy(lane_blas);
+    for (auto h : prefill_blas) if (h) cublasDestroy(h);   // s0ma change 82
+    prefill_blas.clear();
     lane_slots.clear();
     for (auto e : lane_att_events) if (e) cudaEventDestroy(e);
     for (auto e : route_events) if (e) cudaEventDestroy(e);

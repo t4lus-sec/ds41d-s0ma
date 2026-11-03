@@ -509,10 +509,11 @@ __global__ __launch_bounds__(512,1) void decode_var_splitk(const DeviceExpert* t
 // s0ma change 42: a block decodes one 16-row strip of 8 tiles (128 columns) into shared memory and writes it out in
 // 16-byte rows, coalesced (change 37 wrote each weight on its own: 2-byte stores 16 rows apart)
 template<int BITS>
-__global__ __launch_bounds__(256) void reconstruct(const DeviceExpert* table,int index,int N,int K,half* W) {DS41_PDL_WAIT();
+__global__ __launch_bounds__(256) void reconstruct(const DeviceExpert* table,int index,int N,int K,half* W,
+                                                  int projection=0) {DS41_PDL_WAIT();   // s0ma change 82: any projection
     __shared__ __align__(16) half strip[16][136];
     const int lane=threadIdx.x%32, warp=threadIdx.x/32, kt=blockIdx.y, nt=blockIdx.x*8+warp;
-    const uint32_t* B=weights(table[index],0)+(size_t(kt)*(N/16)+nt)*(8*BITS);
+    const uint32_t* B=weights(table[index],projection)+(size_t(kt)*(N/16)+nt)*(8*BITS);
     TileW<BITS> w=load_tile<BITS>(B,lane);
     Pair f[2];
     dqk<BITS>(w,f[0],f[1],lane);
@@ -535,11 +536,11 @@ __global__ __launch_bounds__(256) void rotate_rows_in(const DeviceExpert* table,
     rotate_input(x+size_t(r)*xs+c,scales(table[index],0)+c,A+size_t(r)*K+c,lane);
 }
 __global__ __launch_bounds__(256) void rotate_rows_out(const DeviceExpert* table,int index,const float* C,int rows,int N,
-                                                       int K,__nv_bfloat16* out,int os) {DS41_PDL_WAIT();
+                                                       int K,__nv_bfloat16* out,int os,int projection=0) {DS41_PDL_WAIT();
     const int lane=threadIdx.x%32, item=blockIdx.x*8+threadIdx.x/32, blocks=N/128;
     if(item>=rows*blocks)return;
     const int r=item/blocks, c=(item%blocks)*128;
-    rotate_output(C+size_t(r)*N+c,scales(table[index],0)+K+c,out+size_t(r)*os+c,lane);
+    rotate_output(C+size_t(r)*N+c,scales(table[index],projection)+K+c,out+size_t(r)*os+c,lane);
 }
 
 }
@@ -768,6 +769,26 @@ cudaError_t exl3_dense_reconstruct(const DeviceExpert* t,int index,int n,int k,i
         case 5: exl3_detail::reconstruct<5><<<blocks,256,0,s>>>(t,index,n,k,w); break;
         default: return cudaErrorInvalidValue;
     }
+    return cudaGetLastError();
+}
+// s0ma change 82: the same two for one projection of a routed expert (its prefill through a cuBLAS FP16 GEMM)
+cudaError_t exl3_expert_reconstruct(const DeviceExpert* t,ExpertId id,Projection p,int n,int k,int bits,half* w,cudaStream_t s){
+    if(!t||!w||n<=0||n%128||k<=0||k%128||int(p)<0||int(p)>2)return cudaErrorInvalidValue;
+    const dim3 blocks(n/128,k/16);
+    const int index=int(id),pr=int(p);
+    switch(bits){
+        case 2: exl3_detail::reconstruct<2><<<blocks,256,0,s>>>(t,index,n,k,w,pr); break;
+        case 3: exl3_detail::reconstruct<3><<<blocks,256,0,s>>>(t,index,n,k,w,pr); break;
+        case 4: exl3_detail::reconstruct<4><<<blocks,256,0,s>>>(t,index,n,k,w,pr); break;
+        case 5: exl3_detail::reconstruct<5><<<blocks,256,0,s>>>(t,index,n,k,w,pr); break;
+        default: return cudaErrorInvalidValue;
+    }
+    return cudaGetLastError();
+}
+cudaError_t exl3_expert_rotate_out(const DeviceExpert* t,ExpertId id,Projection p,const float* c,int rows,int n,int k,
+                                   __nv_bfloat16* out,int out_stride,cudaStream_t s){
+    if(!t||!c||!out||rows<1||n<=0||n%128||int(p)<0||int(p)>2)return cudaErrorInvalidValue;
+    exl3_detail::rotate_rows_out<<<(rows*(n/128)+7)/8,256,0,s>>>(t,int(id),c,rows,n,k,out,out_stride?out_stride:n,int(p));
     return cudaGetLastError();
 }
 cudaError_t exl3_dense_rotate_in(const DeviceExpert* t,int index,const __nv_bfloat16* x,int rows,int k,int x_stride,

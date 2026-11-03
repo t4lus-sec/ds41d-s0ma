@@ -54,6 +54,14 @@ cudaError_t exl3_dense_rotate_in(const DeviceExpert* table, int index, const __n
                                  int x_stride, half* a, cudaStream_t stream);
 cudaError_t exl3_dense_rotate_out(const DeviceExpert* table, int index, const float* c, int rows, int n, int k,
                                   __nv_bfloat16* out, int out_stride, cudaStream_t stream);
+// s0ma change 82: the same for one projection of a routed expert: its weights decoded once into FP16 [k, n] (as
+// prefill_rot reads them tile by tile), and the caller's FP32 GEMM result rotated and scaled into BF16 as prefill_rot
+// ends. With exl3_prefill_rotate's rows as A, a cuBLAS FP16 GEMM with FP32 sums between them gives prefill_rot's
+// products summed in another order.
+cudaError_t exl3_expert_reconstruct(const DeviceExpert* table, ExpertId id, Projection p, int n, int k, int bits,
+                                    half* w, cudaStream_t stream);
+cudaError_t exl3_expert_rotate_out(const DeviceExpert* table, ExpertId id, Projection p, const float* c, int rows,
+                                   int n, int k, __nv_bfloat16* out, int out_stride, cudaStream_t stream);
 // s0ma change 68: an expert's prefill with its rows rotated once. exl3_prefill_rotate writes job[0]'s rows (BF16,
 // row stride k) rotated with projection p0's input scales into a0 and, if a1, with p1's into a1: FP16 [rows, k], as
 // grouped_exl3_prefill rotates them. exl3_prefill_rotated is grouped_exl3_prefill_bits for count 1 and max_tokens rows

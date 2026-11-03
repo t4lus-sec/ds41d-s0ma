@@ -24,6 +24,23 @@ static bool prefill_copies_first() {
   static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_COPIES_FIRST"); return v && std::string(v) == "1"; }();   // change 78: off unless =1
   return on;
 }
+// s0ma change 82: a routed expert's prefill as three cuBLAS FP16 GEMMs (FP32 sums) on its weights decoded once into
+// FP16, for an expert with at least DS41_PREFILL_EXL3_GEMM_MIN rows (32) in the segment; fewer rows keep prefill_rot,
+// which decodes the weights again for every 64 rows inside the MMA loop. The same products as prefill_rot, summed in
+// cuBLAS's order: a rounding-order change. DS41_PREFILL_EXL3_GEMM=1 turns it on.
+static bool prefill_exl3_gemm() {
+  static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_EXL3_GEMM"); return v && std::string(v) == "1"; }();
+  return on;
+}
+static int prefill_exl3_gemm_min() {
+  static const int n = [] {
+    const char *v = std::getenv("DS41_PREFILL_EXL3_GEMM_MIN");
+    const int x = v && *v ? std::atoi(v) : 32;
+    if (x < 1 || x > 1000000) throw std::invalid_argument("DS41_PREFILL_EXL3_GEMM_MIN must be 1..1000000");
+    return x;
+  }();
+  return n;
+}
 static bool prefill_exl3_rotated() {
   static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_EXL3_ROTATED"); return !v || std::string(v) != "0"; }();
   return on;
@@ -46,6 +63,12 @@ struct PrefillData {
   struct Wave { Device x, bw, gate, up, act, down, rg, ru, rd; int rows = 0; };
   std::vector<Wave> waves;
   bool waves_off = false;
+  // s0ma change 82: per variant, an expert's three projections decoded to FP16 [k, n], the GEMM's FP32 rows, and
+  // cuBLAS's workspace; freed with the prompt
+  struct Gemm { Device wg, wu, wd, c, ws, entry; };   // entry: the expert's table entry, copied to the device
+  std::vector<Gemm> gemm;
+  bool gemm_ready = false, gemm_tried = false;
+  std::atomic<size_t> gemm_experts{0}, gemm_rows{0};   // (two enqueuing threads)
   Device gate{256*I*2}, up{256*I*2}, act{256*I*2},
       eq{256*I}, es{256*I/32}, down{256*H*2};
   std::array<std::vector<int64_t>,2> rowids;
@@ -599,7 +622,7 @@ Json pmoe(int l,ds41e::prefill::Span span) {
   std::vector<ds41::ExpertId> needed;
   size_t job=0,offset=0;
   if(exl3 && !pf.bxh.p) pf.bxh.resize(size_t(256)*H*2);
-  if(exl3 && prefill_exl3_rotated() && !pf.rg.p){   // s0ma change 68
+  if(exl3 && (prefill_exl3_rotated()||prefill_exl3_gemm()) && !pf.rg.p){   // s0ma change 68 (82: the GEMM path too)
     pf.rg.resize(size_t(256)*H*2);pf.ru.resize(size_t(256)*H*2);pf.rd.resize(size_t(256)*I*2);
   }
   for(auto &g:groups) {
@@ -651,6 +674,34 @@ Json pmoe(int l,ds41e::prefill::Span span) {
     }
     prefill_waves_ready=!pf.waves_off;
   }
+  // s0ma change 82: the GEMM path's scratch and handles, once a prompt (off for this prompt if they do not fit)
+  if(exl3&&prefill_exl3_gemm()&&!pf.gemm_tried) {
+    pf.gemm_tried=true;
+    try {
+      for(size_t v=0;v<variants;++v) {
+        cudaStream_t sv=v?prefill_lane(v-1).s:stream;
+        if(prefill_blas.size()<=v) {
+          cublasHandle_t h=nullptr;
+          if(cublasCreate(&h)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("cublasCreate");
+          if(cublasSetStream(h,sv)!=CUBLAS_STATUS_SUCCESS){cublasDestroy(h);throw std::runtime_error("cublasSetStream");}
+          prefill_blas.push_back(h);prefill_blas_m.push_back(std::make_unique<std::mutex>());
+        }
+      }
+      pf.gemm.resize(variants);
+      for(size_t v=0;v<variants;++v) {
+        auto &G=pf.gemm[v];
+        G.wg.resize(size_t(H)*I*2);G.wu.resize(size_t(H)*I*2);G.wd.resize(size_t(I)*H*2);
+        G.c.resize(size_t(256)*H*4);G.ws.resize(size_t(16)<<20);G.entry.resize(sizeof(ds41::DeviceExpert));
+        if(cublasSetWorkspace(prefill_blas[v],G.ws.p,G.ws.bytes)!=CUBLAS_STATUS_SUCCESS)
+          throw std::runtime_error("cublasSetWorkspace");
+      }
+      pf.gemm_ready=true;
+    } catch(const std::exception &e) {
+      (void)cudaGetLastError();pf.gemm.clear();pf.gemm_ready=false;
+      std::cerr<<"prefill expert GEMMs off for this prompt ("<<e.what()<<")\n";
+    }
+  }
+  auto gemm_rows_of=[&](ds41::ExpertId id){int n=0;for(const auto &b:batches.at(id))n+=b.rows;return n;};
   Phase sweep;CK(cudaEventRecord(sweep.start,stream));
   host_start=clock_ms();std::atomic<size_t> dispatched{0};   // (atomic: change 77's two enqueuing threads)
   // the per-expert path below, for one expert; the wave path for several (falls back to the per-expert path)
@@ -670,10 +721,19 @@ Json pmoe(int l,ds41e::prefill::Span span) {
       }
     }
     if(pf.waves_off) { for(auto id:list)one(id,table,s); return; }
+    std::vector<ds41::ExpertId> rest;   // s0ma change 82: the GEMM path's experts one by one, the rest in waves
+    // (not with change 77's copies-first: the Stager's thread then enqueues on the same lanes, whose per-expert
+    // scratch only the waves keep apart from it)
+    const bool split=pf.gemm_ready&&!prefill_copies_first();
+    if(split) {
+      for(auto id:list) if(gemm_rows_of(id)>=prefill_exl3_gemm_min()) one(id,table,s); else rest.push_back(id);
+      if(rest.empty()) return;
+    }
+    const auto &todo=split?rest:list;
     // every batch of these experts, by width (a width's jobs contiguous within a wave)
     struct Item {int bits;ds41::ExpertId id;const Batch *b;};
     std::vector<Item> items;
-    for(auto id:list){const int bits=width_of.empty()?expert_bits(int(id/384)):width_of[id];
+    for(auto id:todo){const int bits=width_of.empty()?expert_bits(int(id/384)):width_of[id];
       for(const auto &b:batches.at(id))items.push_back({bits,id,&b});}
     std::stable_sort(items.begin(),items.end(),[](const Item &a,const Item &b){return a.bits<b.bits;});
     auto &timer=*compute.at(timers_used++);CK(cudaEventRecord(timer.start,s));
@@ -711,10 +771,36 @@ Json pmoe(int l,ds41e::prefill::Span span) {
       i=e;
     }
     CK(cudaEventRecord(timer.end,s));
-    dispatched+=list.size();
+    dispatched+=todo.size();
   };
   one=[&](ds41::ExpertId id,const ds41::DeviceExpert* table,cudaStream_t s){
     auto &timer=*compute.at(timers_used++);++dispatched;CK(cudaEventRecord(timer.start,s));
+    // s0ma change 82: this expert through FP16 GEMMs on its weights decoded once (enough rows, scratch ready)
+    const bool via_gemm=exl3&&pf.gemm_ready&&gemm_rows_of(id)>=prefill_exl3_gemm_min();
+    std::unique_lock<std::mutex> blas_lock;
+    PrefillData::Gemm *G=nullptr;cublasHandle_t gh=nullptr;
+    if(via_gemm) {
+      const int v=prefill_variant(s);
+      blas_lock=std::unique_lock<std::mutex>(*prefill_blas_m.at(size_t(v)));
+      G=&pf.gemm.at(size_t(v));gh=prefill_blas.at(size_t(v));
+      cudaStream_t hs=nullptr;
+      if(cublasGetStream(gh,&hs)!=CUBLAS_STATUS_SUCCESS||hs!=s)throw std::logic_error("prefill GEMM handle on another stream");
+      const int bits=width_of.empty()?expert_bits(int(id/384)):width_of[id];
+      // the entry into device memory first: a staged expert's table is host-mapped, and these kernels read the
+      // entry in every block (prefill_rot reads it once a block too, but has far fewer blocks)
+      CK(cudaMemcpyAsync(G->entry.p,table+id,sizeof(ds41::DeviceExpert),cudaMemcpyDefault,s));
+      const auto *one_entry=G->entry.as<ds41::DeviceExpert>();
+      CK(ds41::exl3_expert_reconstruct(one_entry,ds41::ExpertId(0),ds41::Projection::Gate,I,H,bits,G->wg.as<half>(),s));
+      CK(ds41::exl3_expert_reconstruct(one_entry,ds41::ExpertId(0),ds41::Projection::Up,I,H,bits,G->wu.as<half>(),s));
+      CK(ds41::exl3_expert_reconstruct(one_entry,ds41::ExpertId(0),ds41::Projection::Down,H,I,bits,G->wd.as<half>(),s));
+      ++pf.gemm_experts;
+    }
+    auto gemm=[&](const Device &W,const void *A,int n,int k,int rows){   // C [rows, n] = A [rows, k] W [k, n]
+      const float one_=1,zero_=0;
+      if(cublasGemmEx(gh,CUBLAS_OP_N,CUBLAS_OP_N,n,rows,k,&one_,W.p,CUDA_R_16F,n,A,CUDA_R_16F,k,&zero_,G->c.p,
+                      CUDA_R_32F,n,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT)!=CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error("cublasGemmEx (prefill expert)");
+    };
     for(const auto &b:batches.at(id)) {
       if(exl3) {
         const int v=prefill_variant(s);   // s0ma change 27: 0 = the main stream's scratch, else side lane v-1's
@@ -727,7 +813,22 @@ Json pmoe(int l,ds41e::prefill::Span span) {
         ds41e::prefill::gather_routes_bf16(pf.ffn_input.as<char>(base*H*2),pf.weights.as<float>(base*6*4),
             gpu_slots+b.offset,bxh,bw,b.rows,s);
         const int bits=width_of.empty()?expert_bits(int(id/384)):width_of[id];   // s0ma changes 12, 15: this expert's width
-        if(prefill_exl3_rotated()) {   // s0ma change 68: each projection's rows rotated once, the same bits out
+        if(via_gemm) {   // s0ma change 82
+          half *rg=L?L->rg.as<half>():pf.rg.as<half>(),*ru=L?L->ru.as<half>():pf.ru.as<half>(),
+              *rd=L?L->rd.as<half>():pf.rd.as<half>();
+          CK(ds41::exl3_prefill_rotate(table,J,ds41::Projection::Gate,ds41::Projection::Up,H,b.rows,rg,ru,s));
+          gemm(G->wg,rg,I,H,b.rows);
+          const auto *one_entry=G->entry.as<ds41::DeviceExpert>();
+          CK(ds41::exl3_expert_rotate_out(one_entry,ds41::ExpertId(0),ds41::Projection::Gate,G->c.as<float>(),b.rows,I,H,gate,I,s));
+          gemm(G->wu,ru,I,H,b.rows);
+          CK(ds41::exl3_expert_rotate_out(one_entry,ds41::ExpertId(0),ds41::Projection::Up,G->c.as<float>(),b.rows,I,H,up,I,s));
+          CK(ds41::swiglu(gate,up,bw,act,b.rows,I,10,s));
+          CK(ds41::exl3_prefill_rotate(table,J+2,ds41::Projection::Down,ds41::Projection::Down,I,b.rows,rd,nullptr,s));
+          gemm(G->wd,rd,H,I,b.rows);
+          CK(ds41::exl3_expert_rotate_out(one_entry,ds41::ExpertId(0),ds41::Projection::Down,G->c.as<float>(),b.rows,H,I,
+                                          static_cast<Bf16*>(down),H,s));
+          pf.gemm_rows+=size_t(b.rows);
+        } else if(prefill_exl3_rotated()) {   // s0ma change 68: each projection's rows rotated once, the same bits out
           half *rg=L?L->rg.as<half>():pf.rg.as<half>(),*ru=L?L->ru.as<half>():pf.ru.as<half>(),
               *rd=L?L->rd.as<half>():pf.rd.as<half>();
           CK(ds41::exl3_prefill_rotate(table,J,ds41::Projection::Gate,ds41::Projection::Up,H,b.rows,rg,ru,s));
@@ -783,7 +884,8 @@ Json pmoe(int l,ds41e::prefill::Span span) {
       {"h2d_stream_ms",stage_after.h2d_stream_ms},
       {"ram_service_including_backpressure_ms",stage_after.ram_service_host_ms},
       {"nvme_service_including_backpressure_ms",stage_after.nvme_service_host_ms},
-      {"staging_mode","isolated-vram-ram-nvme-v0.3"}};
+      {"staging_mode","isolated-vram-ram-nvme-v0.3"},
+      {"gemm_experts_cumulative",pf.gemm_experts.load()},{"gemm_rows_cumulative",pf.gemm_rows.load()}};   // s0ma change 82
 }
 #include "batch.inc"
 #include "chunk.inc"
@@ -862,6 +964,11 @@ std::map<std::string,std::vector<uint8_t>> live_state() override {
   tokens.resize(ids.size()*sizeof(int));if(!tokens.empty())std::memcpy(tokens.data(),ids.data(),tokens.size());
   return out;
 }
+// s0ma change 82: the GEMM path's scratch, every variant: three projections in FP16, 256 rows of FP32, a workspace
+size_t prefill_gemm_bytes() const {
+  if(!exl3||!prefill_exl3_gemm())return 0;
+  return size_t(prefill_lanes())*(size_t(3)*H*I*2+size_t(256)*H*4+(size_t(16)<<20)+(size_t(4)<<20));
+}
 bool supports_prefill(PrefillMode mode,size_t rows) const override {
   if(!config.prefill||config.prefetch_routes||!prefetch_tickets.empty()||
       poisoned||pending||!rows||rows>size_t(config.max_context-committed)||
@@ -869,6 +976,7 @@ bool supports_prefill(PrefillMode mode,size_t rows) const override {
       (mode==PrefillMode::Cold?committed!=0:committed==0))return false;
   size_t need=PrefillData::required_bytes(rows,committed,1);
   if(need>config.prefill_budget_bytes)return false;
+  need+=prefill_gemm_bytes();   // s0ma change 82: its scratch beside the segment's (free VRAM, not the budget)
   // Opt-in (DS41_PREFILL_CHUNK_FIT=1): a segment must also fit the chunked prefill scratch, so long
   // prompts split into fast chunked segments instead of one oversized M1-path prefill. 256 MiB slack
   // plus a 128 MiB margin keep the later allocations (taken in the same order) from racing.
@@ -885,7 +993,7 @@ bool supports_prefill(PrefillMode mode,size_t rows) const override {
 // supports_prefill counts it, with the chunk scratch and 256 MiB for the buffers a first prompt keeps), or all of
 // them when that cannot fit; the first verify after the prompt takes them back for experts, keeping lend_margin free.
 size_t prefill_lend_need(size_t rows) const {
-  size_t need=PrefillData::required_bytes(rows,committed,1);
+  size_t need=PrefillData::required_bytes(rows,committed,1)+prefill_gemm_bytes();
   if(config.prefill_chunk_rows) {
     const int64_t end=committed+int64_t(rows);
     const int width=int(std::min<int64_t>(2048,(end+7)/8)*8);

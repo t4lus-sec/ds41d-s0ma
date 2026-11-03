@@ -247,6 +247,44 @@ static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
                 std::printf("  grouped rotate-once prefill differs\n"); if (invariant) *invariant = false; }
             cudaFree(g0); cudaFree(g1); cudaFree(o0); cudaFree(o1); cudaFree(dg);
         }
+        // s0ma change 82: the expert's projection decoded once into FP16, a GEMM on the rotated rows, the rotated output:
+        // the same products as prefill_rot summed in another order (relative error against it, not bits)
+        {
+            half* W; float* C; __nv_bfloat16* eo;
+            CK(cudaMalloc(&W, size_t(K) * N * 2)); CK(cudaMalloc(&C, size_t(M) * N * 4)); CK(cudaMalloc(&eo, size_t(M) * N * 2));
+            // only projection c.p holds this case's weights and scales: a wrong projection index reads noise
+            uint32_t* jw; half* js;
+            CK(cudaMalloc(&jw, words * 4)); CK(cudaMalloc(&js, (K + N) * 2));
+            std::vector<uint32_t> jt(words); for (auto& v : jt) v = rng();
+            std::vector<half> jsc(K + N); for (auto& v : jsc) v = __float2half(0.3f);
+            CK(cudaMemcpy(jw, jt.data(), words * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(js, jsc.data(), (K + N) * 2, cudaMemcpyHostToDevice));
+            ds41::DeviceExpert ej{};
+            const uint8_t *jwb = reinterpret_cast<const uint8_t*>(jw), *jsb = reinterpret_cast<const uint8_t*>(js);
+            ej.gate = c.p == ds41::Projection::Gate ? w : jwb; ej.gate_scale = c.p == ds41::Projection::Gate ? s : jsb;
+            ej.up = c.p == ds41::Projection::Up ? w : jwb; ej.up_scale = c.p == ds41::Projection::Up ? s : jsb;
+            ej.down = c.p == ds41::Projection::Down ? w : jwb; ej.down_scale = c.p == ds41::Projection::Down ? s : jsb;
+            ds41::DeviceExpert* dt2;
+            CK(cudaMalloc(&dt2, sizeof ej)); CK(cudaMemcpy(dt2, &ej, sizeof ej, cudaMemcpyHostToDevice));
+            CK(ds41::exl3_expert_reconstruct(dt2, ds41::ExpertId(0), c.p, N, K, bits, W, 0));
+            plain_gemm<<<dim3((N + 127) / 128, M), 128>>>(ra1, W, C, M, N, K);
+            CK(cudaGetLastError());
+            CK(ds41::exl3_expert_rotate_out(dt2, ds41::ExpertId(0), c.p, C, M, N, K, eo, 0, 0));
+            CK(cudaDeviceSynchronize());
+            cudaFree(jw); cudaFree(js); cudaFree(dt2);
+            CK(cudaDeviceSynchronize());
+            std::vector<__nv_bfloat16> g(size_t(M) * N), r(size_t(M) * N);
+            CK(cudaMemcpy(g.data(), eo, g.size() * 2, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(r.data(), ro, r.size() * 2, cudaMemcpyDeviceToHost));
+            double e2 = 0, r2 = 0;
+            for (size_t i = 0; i < g.size(); ++i) {
+                const double a_ = __bfloat162float(g[i]), b_ = __bfloat162float(r[i]);
+                e2 += (a_ - b_) * (a_ - b_); r2 += b_ * b_;
+            }
+            const double rel = std::sqrt(e2 / (r2 > 0 ? r2 : 1));
+            if (!(rel < 2e-3)) { std::printf("  expert GEMM prefill differs from prefill_rot: %.2e\n", rel); if (invariant) *invariant = false; }
+            cudaFree(W); cudaFree(C); cudaFree(eo);
+        }
         cudaFree(ra0); cudaFree(ra1); cudaFree(ro); cudaFree(drj);
     }
     else if (c.var) {   // s0ma change 15: the mixed-width launch, its expert's width from a device table

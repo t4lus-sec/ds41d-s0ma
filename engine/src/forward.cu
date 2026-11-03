@@ -764,12 +764,29 @@ class Native final : public Forward, public hotpath::GateEvidence {
     }();
     return n;
   }
+  // s0ma change 84: DS41_PREFILL_STAGED_LANES=K (0..7; 0, the default, off): a prompt sweep's staged (RAM or drive)
+  // experts on side lanes 0..K-1 only, created at the device's greatest stream priority; the residents on the main
+  // stream and the other side lanes (see pstream)
+  int prefill_staged_lanes() const {
+    static const int n = [] {
+      const char *v = std::getenv("DS41_PREFILL_STAGED_LANES");
+      const int x = v && *v ? std::atoi(v) : 0;
+      if (x < 0 || x > 7) throw std::invalid_argument("DS41_PREFILL_STAGED_LANES must be 0..7");
+      return x;
+    }();
+    return n;
+  }
   PrefillLane &prefill_lane(size_t i) {   // side lane i (0-based), created on first use
     while (prefill_side.size() <= i) {
       auto L = std::make_unique<PrefillLane>();
       L->bxh.resize(size_t(256) * H * 2); L->bw.resize(256 * 4); L->gate.resize(size_t(256) * I * 2);
       L->up.resize(size_t(256) * I * 2); L->act.resize(size_t(256) * I * 2); L->down.resize(size_t(256) * H * 2);
       L->rg.resize(size_t(256) * H * 2); L->ru.resize(size_t(256) * H * 2); L->rd.resize(size_t(256) * I * 2);
+      if (prefill_side.size() < size_t(prefill_staged_lanes())) {   // s0ma change 84
+        int least = 0, greatest = 0;
+        CK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        CK(cudaStreamCreateWithPriority(&L->s, cudaStreamNonBlocking, greatest));
+      } else
       CK(cudaStreamCreateWithFlags(&L->s, cudaStreamNonBlocking));
       CK(cudaEventCreateWithFlags(&L->done, cudaEventDisableTiming));
       prefill_side.push_back(std::move(L));

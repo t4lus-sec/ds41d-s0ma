@@ -62,6 +62,13 @@ cudaError_t exl3_prefill_rotate(const DeviceExpert* table, const GemmJob* job, P
                                 int rows, half* a0, half* a1, cudaStream_t stream);
 cudaError_t exl3_prefill_rotated(const DeviceExpert* table, const GemmJob* job, Projection p, int n, int k, int rows,
                                  int bits, const half* a, cudaStream_t stream);
+// s0ma change 76: the two above for `count` jobs in one launch: job y's rows (j0[y].tokens <= max_rows <= 256, from
+// j0[y].x) rotated into j0[y].x_scale (and j1[y].x_scale with p1's scales), FP16 [tokens, k]; then each job's
+// projection read from its x_scale. Per job the same bits as exl3_prefill_rotate / exl3_prefill_rotated.
+cudaError_t exl3_prefill_rotate_group(const DeviceExpert* table, const GemmJob* j0, const GemmJob* j1, int count,
+                                      Projection p0, Projection p1, int k, int max_rows, cudaStream_t stream);
+cudaError_t exl3_prefill_rotated_group(const DeviceExpert* table, const GemmJob* jobs, int count, Projection p, int n,
+                                       int k, int max_rows, int bits, cudaStream_t stream);
 cudaError_t exl3_dense_prefill(const DeviceExpert* table, GemmJob job, int n, int k, int bits, cudaStream_t stream,
                                int x_stride = 0, int out_stride = 0);
 // s0ma change 43: exl3_dense's decode (no split, no groups) writing FP32 rows: job.output points to floats and

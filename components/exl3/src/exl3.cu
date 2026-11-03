@@ -279,6 +279,20 @@ __global__ __launch_bounds__(256) void rotate_job(const DeviceExpert* table,cons
     rotate_input(x,scales(e,p0)+c,a0+size_t(r)*K+c,lane);
     if(a1)rotate_input(x,scales(e,p1)+c,a1+size_t(r)*K+c,lane);
 }
+// s0ma change 76: rotate_job for many jobs at once (blockIdx.y the job): job j0[y]'s rows rotated with p0's scales into
+// j0[y].x_scale and, with j1, with p1's into j1[y].x_scale (the same x). Each row as rotate_job does it.
+__global__ __launch_bounds__(256) void rotate_group(const DeviceExpert* table,const GemmJob* j0,const GemmJob* j1,int p0,
+                                                    int p1,int K) {DS41_PDL_WAIT();
+    const GemmJob a=j0[blockIdx.y];
+    const int kb=K/128,warp=(blockIdx.x*blockDim.x+threadIdx.x)/32,lane=threadIdx.x%32;
+    if(warp>=a.tokens*kb)return;
+    DeviceExpert e=table[a.expert];wait_ready(e);
+    const int r=warp/kb,c=(warp%kb)*128;
+    const auto* x=reinterpret_cast<const __nv_bfloat16*>(a.x)+size_t(r)*K+c;
+    rotate_input(x,scales(e,p0)+c,const_cast<half*>(reinterpret_cast<const half*>(a.x_scale))+size_t(r)*K+c,lane);
+    if(j1){const GemmJob b=j1[blockIdx.y];
+        rotate_input(x,scales(e,p1)+c,const_cast<half*>(reinterpret_cast<const half*>(b.x_scale))+size_t(r)*K+c,lane);}
+}
 __device__ __forceinline__ void cp_async16(void* dst,const void* src) {
     const unsigned addr=static_cast<unsigned>(__cvta_generic_to_shared(dst));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"::"r"(addr),"l"(src));
@@ -288,6 +302,8 @@ __global__ __launch_bounds__(256,1) void prefill_rot(const DeviceExpert* table,c
                                                                int N,int K,const half* rotated) {DS41_PDL_WAIT();
     const GemmJob job=jobs[blockIdx.y];
     const int m0=blockIdx.z*64;if(m0>=job.tokens)return;
+    // s0ma change 76: a grouped launch (many jobs) passes no `rotated`: each job's rows were rotated into job.x_scale
+    if(!rotated)rotated=reinterpret_cast<const half*>(job.x_scale);
     DeviceExpert e=table[job.expert];wait_ready(e);
     const uint32_t* B=weights(e,projection);
     const half* sv=scales(e,projection)+K;
@@ -717,6 +733,26 @@ cudaError_t exl3_prefill_rotated(const DeviceExpert* t,const GemmJob* job,Projec
         case 3: exl3_detail::prefill_rot<3><<<grid,256,0,s>>>(t,job,int(p),n,k,a); break;
         case 4: exl3_detail::prefill_rot<4><<<grid,256,0,s>>>(t,job,int(p),n,k,a); break;
         case 5: exl3_detail::prefill_rot<5><<<grid,256,0,s>>>(t,job,int(p),n,k,a); break;
+        default: return cudaErrorInvalidValue;
+    }
+    return cudaGetLastError();
+}
+// s0ma change 76: the same for `count` jobs in one launch each (exl3.cuh)
+cudaError_t exl3_prefill_rotate_group(const DeviceExpert* t,const GemmJob* j0,const GemmJob* j1,int count,Projection p0,
+                                      Projection p1,int k,int max_rows,cudaStream_t s){
+    if(!t||!j0||count<1||count>65535||max_rows<1||max_rows>256||k<=0||k%128)return cudaErrorInvalidValue;
+    exl3_detail::rotate_group<<<dim3((max_rows*(k/128)+7)/8,count),256,0,s>>>(t,j0,j1,int(p0),int(p1),k);
+    return cudaGetLastError();
+}
+cudaError_t exl3_prefill_rotated_group(const DeviceExpert* t,const GemmJob* jobs,int count,Projection p,int n,int k,
+                                       int max_rows,int bits,cudaStream_t s){
+    if(!t||!jobs||count<1||count>65535||max_rows<1||max_rows>256||n<=0||n%128||k<=0||k%128)return cudaErrorInvalidValue;
+    const dim3 grid(n/128,count,(max_rows+63)/64);
+    switch(bits){
+        case 2: exl3_detail::prefill_rot<2><<<grid,256,0,s>>>(t,jobs,int(p),n,k,nullptr); break;
+        case 3: exl3_detail::prefill_rot<3><<<grid,256,0,s>>>(t,jobs,int(p),n,k,nullptr); break;
+        case 4: exl3_detail::prefill_rot<4><<<grid,256,0,s>>>(t,jobs,int(p),n,k,nullptr); break;
+        case 5: exl3_detail::prefill_rot<5><<<grid,256,0,s>>>(t,jobs,int(p),n,k,nullptr); break;
         default: return cudaErrorInvalidValue;
     }
     return cudaGetLastError();

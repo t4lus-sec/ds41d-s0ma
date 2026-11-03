@@ -228,6 +228,25 @@ static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
         CK(cudaMemcpy(a.data(), dout, a.size() * 2, cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(b.data(), ro, b.size() * 2, cudaMemcpyDeviceToHost));
         if (a != b) { std::printf("  rotate-once prefill differs from grouped_exl3_prefill\n"); if (invariant) *invariant = false; }
+        // s0ma change 76: two jobs in one grouped launch (all M rows, and the first half), each against the above
+        {
+            const int M2 = M > 1 ? M / 2 : 1;
+            half *g0, *g1; __nv_bfloat16 *o0, *o1; ds41::GemmJob* dg;
+            CK(cudaMalloc(&g0, size_t(M) * K * 2)); CK(cudaMalloc(&g1, size_t(M2) * K * 2));
+            CK(cudaMalloc(&o0, size_t(M) * N * 2)); CK(cudaMalloc(&o1, size_t(M2) * N * 2));
+            ds41::GemmJob gj[2] = {{0, M, reinterpret_cast<const uint8_t*>(dx), reinterpret_cast<const uint8_t*>(g0), o0},
+                                   {0, M2, reinterpret_cast<const uint8_t*>(dx), reinterpret_cast<const uint8_t*>(g1), o1}};
+            CK(cudaMalloc(&dg, sizeof gj)); CK(cudaMemcpy(dg, gj, sizeof gj, cudaMemcpyHostToDevice));
+            CK(ds41::exl3_prefill_rotate_group(dt, dg, nullptr, 2, c.p, c.p, K, M, 0));
+            CK(ds41::exl3_prefill_rotated_group(dt, dg, 2, c.p, N, K, M, bits, 0));
+            CK(cudaDeviceSynchronize());
+            std::vector<uint16_t> g(size_t(M) * N), h(size_t(M2) * N);
+            CK(cudaMemcpy(g.data(), o0, g.size() * 2, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(h.data(), o1, h.size() * 2, cudaMemcpyDeviceToHost));
+            if (g != a || !std::equal(h.begin(), h.end(), a.begin())) {
+                std::printf("  grouped rotate-once prefill differs\n"); if (invariant) *invariant = false; }
+            cudaFree(g0); cudaFree(g1); cudaFree(o0); cudaFree(o1); cudaFree(dg);
+        }
         cudaFree(ra0); cudaFree(ra1); cudaFree(ro); cudaFree(drj);
     }
     else if (c.var) {   // s0ma change 15: the mixed-width launch, its expert's width from a device table

@@ -36,7 +36,7 @@
         "third_party/include/ds41/dense.h"
       ],
       "files": 78,
-      "tree_sha256": "1703f8b6cfdc027e8fdc7caf4c50bd37a694e302c6bc035d2527a63fda9b6ae4"
+      "tree_sha256": "a729d771bdfb71a93616847e50b60f2510e9677fdcb317fb3dc676288b85dc63"
     },
     {
       "path": "components/moe",
@@ -125,7 +125,7 @@
         "CMakeLists.txt"
       ],
       "files": 6,
-      "tree_sha256": "604033eb8f3f509bfe11628522cb6a707e09bdc8056d08610096f9a90ee694ad",
+      "tree_sha256": "064622330c3aaf181e219ea664cc7cd7218065cc9156d9a4e837238f3920ea6a",
       "release_source_changes": [
         "include/ds41/exl3.cuh",
         "src/device.cuh",

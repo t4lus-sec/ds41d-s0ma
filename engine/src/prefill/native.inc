@@ -7,6 +7,18 @@ static bool prefill_miss_lanes() {
   static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_MISS_LANES"); return !v || std::string(v) != "0"; }();
   return on;
 }
+// s0ma change 76: residents' expert batches grouped into waves of up to DS41_PREFILL_WAVE_ROWS rows (default 1024;
+// 0: one expert at a time as before): one gather, one rotation, one launch per projection and width, one SwiGLU and
+// one scatter a wave instead of eight launches an expert batch. Each batch's math is the per-expert path's.
+static int prefill_wave_rows() {
+  static const int n = [] {
+    const char *v = std::getenv("DS41_PREFILL_WAVE_ROWS");
+    const int x = v && *v ? std::atoi(v) : 1024;
+    if (x != 0 && (x < 256 || x > 8192)) throw std::invalid_argument("DS41_PREFILL_WAVE_ROWS must be 0 or 256..8192");
+    return x;
+  }();
+  return n;
+}
 static bool prefill_exl3_rotated() {
   static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_EXL3_ROTATED"); return !v || std::string(v) != "0"; }();
   return on;
@@ -25,6 +37,10 @@ struct PrefillData {
   Device bx{256*H}, bs{256*H/32}, bw{256*4};
   Device bxh; // EXL3: 256 gathered BF16 rows
   Device rg, ru, rd; // s0ma change 68: the rows rotated once for gate, up (256 x H FP16) and down (256 x I)
+  // s0ma change 76: a lane's wave scratch (variant v: 0 the main stream, else side lane v-1), freed with the prompt
+  struct Wave { Device x, bw, gate, up, act, down, rg, ru, rd; int rows = 0; };
+  std::vector<Wave> waves;
+  bool waves_off = false;
   Device gate{256*I*2}, up{256*I*2}, act{256*I*2},
       eq{256*I}, es{256*I/32}, down{256*H*2};
   std::array<std::vector<int64_t>,2> rowids;
@@ -79,7 +95,9 @@ template<class Store> std::vector<uint8_t> p_residency(Store& store) {
   if constexpr(Store::api_version>=4)return store.residency_snapshot();
   else return {};
 }
-template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
+// s0ma change 76: group, when given, takes a lane's whole share of the resident experts at once (grouped launches)
+using PGroup=std::function<void(const std::vector<ds41::ExpertId>&,const ds41::DeviceExpert*,cudaStream_t)>;
+template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume,const PGroup &group={}) {
   prefill_transfers={};prefill_vram_hits=0;
   int side_pending=0;bool spread=false;
   std::vector<size_t> lane_load;   // s0ma change 69: experts given to each lane this layer (0: the main stream)
@@ -103,9 +121,22 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
       for(int i=0;i<sides;++i)CK(cudaStreamWaitEvent(prefill_lane(size_t(i)).s,start,0));
       size_t k=0;
       lane_load.assign(size_t(sides)+1,0);
+      if(group) {   // s0ma change 76: each side lane's residents in grouped launches
+        std::vector<std::vector<ds41::ExpertId>> share(static_cast<size_t>(sides));
+        for(auto id:hits){const size_t at=k%size_t(sides);share[at].push_back(id);++k;}
+        for(int i=0;i<sides;++i){
+          const std::vector<ds41::ExpertId> &mine=share[size_t(i)];
+          if(mine.empty())continue;
+          lane_load[size_t(i)+1]+=mine.size();
+          group(mine,experts->table(),prefill_lane(size_t(i)).s);
+        }
+      } else
       for(auto id:hits){++lane_load[1+k%size_t(sides)];consume(id,experts->table(),prefill_lane(k++%size_t(sides)).s);}
       for(int i=0;i<sides;++i){auto &L=prefill_lane(size_t(i));CK(cudaEventRecord(L.done,L.s));}
       side_pending=sides;
+    } else if(group && !hits.empty()) {
+      std::vector<ds41::ExpertId> all(hits.begin(),hits.end());
+      group(all,experts->table(),stream);
     } else for(auto id:hits)consume(id,experts->table(),stream);
     if(!side_pending && lease.serial)experts->retire(std::move(lease),stream);
   }catch(...){cudaStreamSynchronize(stream);for(auto &L:prefill_side)cudaStreamSynchronize(L->s);side_pending=0;
@@ -305,7 +336,7 @@ void pattention(int l,int64_t pos,bool output_projection=true) {
 // HostBuffer is a 2 MiB-aligned MADV_HUGEPAGE mapping, faulted in and cudaHostRegister'ed: 41 of them a prompt,
 // each a huge-page fault that compacts memory under pressure (a 48 GiB tier: 5,906 compaction stalls, 99% failed).
 // Callers reach these only after the stream has finished with the previous contents.
-std::unique_ptr<ds41::HostBuffer> prefill_route_buf,prefill_desc_buf;
+std::unique_ptr<ds41::HostBuffer> prefill_route_buf,prefill_desc_buf,prefill_wave_buf;   // (wave: change 76)
 ds41::HostBuffer* prefill_pinned(std::unique_ptr<ds41::HostBuffer>& b,size_t n) {
   if(!b||b->size()<n)b=std::make_unique<ds41::HostBuffer>(std::max(n+n/2,size_t(2)<<20),true);
   return b.get();
@@ -374,10 +405,78 @@ Json pmoe(int l,ds41e::prefill::Span span) {
 
   std::vector<std::unique_ptr<Phase>> compute;
   for(size_t i=0;i<needed.size();++i)compute.push_back(std::make_unique<Phase>());
+  size_t timers_used=0;   // s0ma change 76: a wave records one timer for several experts
+  // s0ma change 76: the residents' waves. Descriptors (jobs and slots) in a pinned arena the device reads, written
+  // once a layer (the previous layer's sweep has finished: pmoe synchronizes the stream before it returns)
+  const int wave_rows=exl3?prefill_wave_rows():0;
+  const size_t wave_desc_jobs=(chunks*3*sizeof(ds41::GemmJob)+63)&~size_t(63);
+  ds41::HostBuffer *wave_desc=wave_rows?prefill_pinned(prefill_wave_buf,wave_desc_jobs+count*6*4+64):nullptr;
+  size_t wave_jobs_used=0,wave_slots_used=0;
+  if(wave_rows&&pf.waves.size()<variants)pf.waves.resize(variants);
   Phase sweep;CK(cudaEventRecord(sweep.start,stream));
   host_start=clock_ms();size_t dispatched=0;
-  pstream(needed,[&](auto id,const ds41::DeviceExpert* table,auto s){
-    auto &timer=*compute.at(dispatched++);CK(cudaEventRecord(timer.start,s));
+  // the per-expert path below, for one expert; the wave path for several (falls back to the per-expert path)
+  std::function<void(ds41::ExpertId,const ds41::DeviceExpert*,cudaStream_t)> one;
+  PGroup group;
+  if(wave_rows) group=[&](const std::vector<ds41::ExpertId> &list,const ds41::DeviceExpert* table,cudaStream_t s){
+    const int v=prefill_variant(s);
+    auto &W=pf.waves.at(size_t(v));
+    if(!pf.waves_off && !W.rows) {
+      try {
+        const size_t r=size_t(wave_rows);
+        W.x.resize(r*H*2);W.bw.resize(r*4);W.gate.resize(r*I*2);W.up.resize(r*I*2);W.act.resize(r*I*2);
+        W.down.resize(r*H*2);W.rg.resize(r*H*2);W.ru.resize(r*H*2);W.rd.resize(r*I*2);W.rows=wave_rows;
+      } catch(const std::exception &e) {
+        std::cerr<<"prefill waves off for this prompt (scratch: "<<e.what()<<")\n";
+        pf.waves_off=true;W=PrefillData::Wave{};
+      }
+    }
+    if(pf.waves_off) { for(auto id:list)one(id,table,s); return; }
+    // every batch of these experts, by width (a width's jobs contiguous within a wave)
+    struct Item {int bits;ds41::ExpertId id;const Batch *b;};
+    std::vector<Item> items;
+    for(auto id:list){const int bits=width_of.empty()?expert_bits(int(id/384)):width_of[id];
+      for(const auto &b:batches.at(id))items.push_back({bits,id,&b});}
+    std::stable_sort(items.begin(),items.end(),[](const Item &a,const Item &b){return a.bits<b.bits;});
+    auto &timer=*compute.at(timers_used++);CK(cudaEventRecord(timer.start,s));
+    auto *cpu_j=static_cast<ds41::GemmJob*>(wave_desc->data());
+    auto *gpu_j=static_cast<ds41::GemmJob*>(wave_desc->device_data());
+    auto *cpu_sl=reinterpret_cast<int32_t*>(static_cast<char*>(wave_desc->data())+wave_desc_jobs);
+    auto *gpu_sl=reinterpret_cast<int32_t*>(static_cast<char*>(wave_desc->device_data())+wave_desc_jobs);
+    for(size_t i=0;i<items.size();) {
+      // a wave: consecutive items while their rows fit
+      size_t e=i;int rows=0;
+      while(e<items.size()&&rows+items[e].b->rows<=W.rows){rows+=items[e].b->rows;++e;}
+      const size_t n=e-i,j0=wave_jobs_used,sl=wave_slots_used;
+      if(j0+3*n>chunks*3||sl+size_t(rows)>count*6)throw std::logic_error("prefill wave arena");
+      ds41::GemmJob *G=cpu_j+j0,*U=G+n,*D=U+n;
+      int r0=0,maxr=0;
+      for(size_t k=0;k<n;++k){const auto &it=items[i+k];const int m=it.b->rows;maxr=std::max(maxr,m);
+        G[k]={it.id,m,W.x.as<uint8_t>(size_t(r0)*H*2),W.rg.as<uint8_t>(size_t(r0)*H*2),W.gate.as<Bf16>(size_t(r0)*I*2)};
+        U[k]={it.id,m,W.x.as<uint8_t>(size_t(r0)*H*2),W.ru.as<uint8_t>(size_t(r0)*H*2),W.up.as<Bf16>(size_t(r0)*I*2)};
+        D[k]={it.id,m,W.act.as<uint8_t>(size_t(r0)*I*2),W.rd.as<uint8_t>(size_t(r0)*I*2),W.down.as<Bf16>(size_t(r0)*H*2)};
+        std::copy_n(cpu_slots+it.b->offset,m,cpu_sl+sl+size_t(r0));r0+=m;}
+      wave_jobs_used+=3*n;wave_slots_used+=size_t(rows);
+      const ds41::GemmJob *g=gpu_j+j0,*u=g+n,*d=u+n;
+      ds41e::prefill::gather_routes_bf16(pf.ffn_input.as<char>(base*H*2),pf.weights.as<float>(base*6*4),gpu_sl+sl,
+          W.x.p,W.bw.as<float>(),rows,s);
+      CK(ds41::exl3_prefill_rotate_group(table,g,u,int(n),ds41::Projection::Gate,ds41::Projection::Up,H,maxr,s));
+      for(size_t a=0;a<n;){size_t b=a;int mr=0;while(b<n&&items[i+b].bits==items[i+a].bits){mr=std::max(mr,items[i+b].b->rows);++b;}
+        CK(ds41::exl3_prefill_rotated_group(table,g+a,int(b-a),ds41::Projection::Gate,I,H,mr,items[i+a].bits,s));
+        CK(ds41::exl3_prefill_rotated_group(table,u+a,int(b-a),ds41::Projection::Up,I,H,mr,items[i+a].bits,s));a=b;}
+      CK(ds41::swiglu(W.gate.as<Bf16>(),W.up.as<Bf16>(),W.bw.as<float>(),W.act.as<Bf16>(),rows,I,10,s));
+      CK(ds41::exl3_prefill_rotate_group(table,d,nullptr,int(n),ds41::Projection::Down,ds41::Projection::Down,I,maxr,s));
+      for(size_t a=0;a<n;){size_t b=a;int mr=0;while(b<n&&items[i+b].bits==items[i+a].bits){mr=std::max(mr,items[i+b].b->rows);++b;}
+        CK(ds41::exl3_prefill_rotated_group(table,d+a,int(b-a),ds41::Projection::Down,H,I,mr,items[i+a].bits,s));a=b;}
+      ds41e::prefill::scatter_routes(W.down.p,gpu_sl+sl,pf.routed.as<char>(base*6*H*2),rows,s);
+      CK(cudaGetLastError());
+      i=e;
+    }
+    CK(cudaEventRecord(timer.end,s));
+    dispatched+=list.size();
+  };
+  one=[&](ds41::ExpertId id,const ds41::DeviceExpert* table,cudaStream_t s){
+    auto &timer=*compute.at(timers_used++);++dispatched;CK(cudaEventRecord(timer.start,s));
     for(const auto &b:batches.at(id)) {
       if(exl3) {
         const int v=prefill_variant(s);   // s0ma change 27: 0 = the main stream's scratch, else side lane v-1's
@@ -421,12 +520,13 @@ Json pmoe(int l,ds41e::prefill::Span span) {
       CK(cudaGetLastError());
     }
     CK(cudaEventRecord(timer.end,s));
-  });
+  };
+  pstream(needed,[&](auto id,const ds41::DeviceExpert* table,auto s){one(id,table,s);},group);
   if(dispatched!=needed.size())throw std::runtime_error("prefill expert dispatch coverage");
   double schedule=clock_ms()-host_start;
   CK(cudaEventRecord(sweep.end,stream));CK(cudaStreamSynchronize(stream));
   float sweep_ms;CK(cudaEventElapsedTime(&sweep_ms,sweep.start,sweep.end));
-  double compute_ms=0;for(auto &t:compute){float ms;CK(cudaEventElapsedTime(&ms,t->start,t->end));compute_ms+=ms;}
+  double compute_ms=0;for(size_t i=0;i<timers_used;++i){float ms;CK(cudaEventElapsedTime(&ms,compute[i]->start,compute[i]->end));compute_ms+=ms;}
   auto resident_after=experts->stats();auto stage_after=prefill_transfers;
   if(resident_after.evictions!=resident_before.evictions&&!vram_admit_budget)   // s0ma change 60: admissions evict
     throw std::runtime_error("decode cache changed during prefill; competing forecasts must be quiesced");

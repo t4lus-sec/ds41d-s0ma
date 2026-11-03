@@ -424,6 +424,7 @@ struct OffloadStore::Impl {
         std::unique_ptr<Stats> audit_before;
         if(policy_audit.is_open()){audit_ram.clear();audit_before=std::make_unique<Stats>(counters);}
         std::vector<SlotPool::Allocation> allocations;
+        const auto acquire_t0=Clock::now();   // s0ma change 65
         for(;;)try {allocations=pool.acquire(ids,is_prefetch);break;}
         catch(const std::runtime_error&) {
             // s0ma: slots draining into RAM (demotion copies) come back too: wait for the oldest one if nothing
@@ -432,6 +433,7 @@ struct OffloadStore::Impl {
             if(retired.empty())ck(cudaEventSynchronize(draining.front().event));
             collect(true);
         }
+        counters.acquire_ns+=ns(Clock::now()-acquire_t0);++counters.loads;   // s0ma change 65
         if(drift && policy_demand && drift_demand)drift->after(ids);
         std::vector<SlotPool::Allocation> disk;
         std::vector<std::shared_ptr<const void>> host_holds;
@@ -482,7 +484,7 @@ struct OffloadStore::Impl {
                     if(host.count(x))continue;
                     std::vector<SlotPool::Allocation> held;
                     const int hs=admit_host(x,false,&held);
-                    if(hs<0)continue;
+                    if(hs<0){++counters.lost_direct;continue;}
                     auto rc=cudaEventQuery(slot_copy[a.slot]);   // the victim's own upload has landed
                     if(rc==cudaErrorNotReady)ck(cudaStreamWaitEvent(cs,slot_copy[a.slot],0));else ck(rc);
                     ck(cudaMemcpyAsync(static_cast<char*>(host_arena->data())+hoff(size_t(hs)),sptr(a.slot),
@@ -641,6 +643,8 @@ struct OffloadStore::Impl {
         return refs.size();
     }
     void top_up(const std::vector<ExpertId>& ids) {
+        const auto topup_t0=Clock::now();   // s0ma change 65
+        struct Timed{Stats& c;Clock::time_point t;~Timed(){c.topup_ns+=ns(Clock::now()-t);}} timed{counters,topup_t0};
         std::unordered_set<ExpertId> wanted(ids.begin(),ids.end());
         // Copy-backs share host DRAM bandwidth with H2D demand: start them only after this
         // demand's uploads, i.e. in the compute window that follows (DS41_MOE_DEMOTE_EAGER=1 skips).
@@ -663,7 +667,7 @@ struct OffloadStore::Impl {
             if(host.count(x)){++counters.demote_resident;pool.drained(v.slot);continue;}
             std::vector<SlotPool::Allocation> held;
             int hs=admit_host(x,false,&held);
-            if(hs<0){pool.drained(v.slot);continue;}
+            if(hs<0){pool.drained(v.slot);++counters.lost_topup;continue;}
             // The slot's last upload must land before its bytes are copied back.
             auto rc=cudaEventQuery(slot_copy[v.slot]);
             if(rc==cudaErrorNotReady)ck(cudaStreamWaitEvent(demote_stream,slot_copy[v.slot],0));else ck(rc);
@@ -698,12 +702,12 @@ struct OffloadStore::Impl {
             ck(cudaStreamSynchronize(mapping));if(demote_stream)ck(cudaStreamSynchronize(demote_stream));
             lend_counters.sync_ms+=ms(t0);t0=Clock::now();
             std::vector<ExpertId> dropped;
-            // s0ma change 64: which expert each lent slot held, for those lend() drops
-            std::unordered_map<ExpertId,size_t> held_in;
-            if(demote && host_pool){
-                const std::set<size_t> chunk(slots.begin(),slots.end());
-                for(ExpertId e=0;e<expert_count;++e){const int r=pool.residency(e);if(r>=0 && chunk.count(size_t(r)))held_in[e]=size_t(r);}
-            }
+            // s0ma change 65: where every expert was before lend() (change 64 read an evicted expert from its slot as
+            // lend() left it: when a later move took the slot of an expert an earlier move had just placed there, the
+            // copy back read the slot's previous bytes under the moved expert's id). The copies back are enqueued before
+            // any move, so each expert's bytes are still where it was.
+            std::vector<int> was;
+            if(demote && host_pool){was.resize(expert_count);for(ExpertId e=0;e<expert_count;++e)was[e]=pool.residency(e);}
             const auto moves=pool.lend(slots,dropped);
             // s0ma change 64: an expert lend() drops, or whose slot a moved expert takes, survives in RAM when it has no
             // copy there: copied back on the copy stream before the moves overwrite or cudaFree releases its bytes
@@ -718,8 +722,14 @@ struct OffloadStore::Impl {
                     cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,copy));
                     demoting[x]=done;rescuing.push_back({x,done,std::move(held)});++counters.demotions;++counters.rescued;
                 };
-                for(const auto& m:moves)if(m.evicted>=0)rescue(ExpertId(m.evicted),m.to);
-                for(auto id:dropped){auto it=held_in.find(id);if(it!=held_in.end())rescue(id,it->second);}
+                for(const auto& m:moves){
+                    if(m.evicted<0)continue;
+                    const auto x=ExpertId(m.evicted);
+                    if(was[x]>=0 && pool.residency(x)<0)rescue(x,size_t(was[x]));   // evicted for good (not moved on)
+                }
+                for(auto id:dropped)if(was[id]>=0 && pool.residency(id)<0)rescue(id,size_t(was[id]));
+                for(const auto& m:moves)if(m.evicted>=0 && !host.count(ExpertId(m.evicted)) && pool.residency(ExpertId(m.evicted))<0)++counters.lost_lend;
+                for(auto id:dropped)if(!host.count(id))++counters.lost_lend;
             }
             auto* views=static_cast<DeviceExpert*>(entries->data());
             auto* gens=static_cast<uint32_t*>(generations->data());
@@ -765,12 +775,14 @@ struct OffloadStore::Impl {
     }
     int admit_host(ExpertId id,bool speculative,std::vector<SlotPool::Allocation>* hold=nullptr){
         if(!host_pool)return -1;
+        struct Timed{Stats& c;Clock::time_point t;~Timed(){c.admit_ns+=ns(Clock::now()-t);}} timed{counters,Clock::now()};   // s0ma change 65
         std::vector<SlotPool::Allocation> a;
         try{a=host_pool->acquire({id},true);}catch(const std::runtime_error&){++counters.ram_admission_blocked;return -1;}
         if(policy_audit.is_open())audit_ram.insert(audit_ram.end(),a.begin(),a.end());
         auto v=a.front();
         if(!v.hit){
             if(!host_arena)host_arena=std::make_shared<HostBuffer>(host_total,true);
+            if(v.evicted>=0 && placed && pool.residency(ExpertId(v.evicted))<0)++counters.lost_ram;   // s0ma change 65
             if(v.evicted>=0){host.erase(ExpertId(v.evicted));++counters.ram.evictions;if(host_prefetched.erase(ExpertId(v.evicted)))counters.ram.wasted_bytes+=records.at(ExpertId(v.evicted)).bytes;}
             host[id]=hoff(v.slot);++counters.ram.promotions;
             if(speculative)host_prefetched.insert(id);

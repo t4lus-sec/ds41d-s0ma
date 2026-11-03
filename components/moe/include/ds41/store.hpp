@@ -78,6 +78,11 @@ struct Stats {
     uint64_t demotions=0, demote_resident=0, direct_evictions=0;
     // s0ma change 64: direct evictions of an expert with no RAM copy, copied back to RAM before the slot was reused
     uint64_t rescued=0;
+    // s0ma change 65: experts left only on the drive, by how: a direct eviction or a demotion that could not get a RAM
+    // slot, a RAM eviction of an expert not in VRAM, a prompt's lend. And the store worker's own time (ns) in the VRAM
+    // pool's acquire (loads), in demotion top-ups, and in RAM-tier admissions.
+    uint64_t lost_direct=0, lost_topup=0, lost_ram=0, lost_lend=0;
+    uint64_t acquire_ns=0, topup_ns=0, admit_ns=0, loads=0;
     // s0ma change 8 (DS41_MOE_SPEC_NVME=N): predicted NVMe-tier experts read ahead into N pinned slots; demand
     // misses found there (or still being read) upload from them instead of waiting for a fresh read.
     uint64_t spec_reads=0, spec_hits=0, spec_waits=0, spec_dropped=0, spec_queued=0;

@@ -498,6 +498,11 @@ void tier_census() {
            <<both_b/double(1ull<<30)<<" GiB); demotions "<<st.demotions<<", victims already in RAM "<<st.demote_resident
            <<", RAM evictions "<<st.ram.evictions<<"; direct evictions "<<st.direct_evictions<<" ("<<st.rescued
            <<" copied back to RAM); only on the drive "<<(15360-(vram+ram-both))<<"\n";
+  // s0ma change 65: how experts came to be only on the drive, and the store worker's own time a load
+  std::cerr<<"store: lost by direct eviction "<<st.lost_direct<<", by demotion "<<st.lost_topup<<", by RAM eviction "
+           <<st.lost_ram<<", by lend "<<st.lost_lend<<"; worker ms a load: acquire "
+           <<(st.loads?st.acquire_ns/1e6/double(st.loads):0.0)<<", top-ups "<<(st.loads?st.topup_ns/1e6/double(st.loads):0.0)
+           <<", RAM admissions "<<(st.loads?st.admit_ns/1e6/double(st.loads):0.0)<<" ("<<st.loads<<" loads)\n";
 }
 // s0ma change 56: decode's NVMe misses after a prompt against what that prompt read from the SSD and what its last
 // 256 rows routed. A miss counted under "prompt read" is one the prompt's sweep had already brought through host

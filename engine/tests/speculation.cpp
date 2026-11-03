@@ -197,6 +197,37 @@ int main() {
     prefix.push_back(step.inputs()[0]);
     assert(r.emitted[0] == argmax(row(prefix)));
   }
+  // s0ma change 72: copied drafts (suffix drafting). The drafter is not consulted (no choose_width, begin or
+  // logits), only rolled back; right copies are all accepted, a wrong one is replaced by the target's token; at a
+  // positive temperature the point-mass q gives the same acceptance arithmetic.
+  for (double temperature : {0.0, 1.0}) {
+    for (int wrong : {-1, 2}) {
+      Target t; seed(t); Admission d(t);
+      std::vector<int> prefix = t.committed, copy;
+      prefix.push_back(0);
+      for (int k = 0; k < 5; ++k) {
+        int next = argmax(row(prefix));
+        if (k == wrong) next = (next + 1) % 6;   // never eos (6)
+        copy.push_back(next);
+        prefix.push_back(next);
+      }
+      Sampling s2 = sampling; s2.temperature = temperature;
+      SpeculativeStep step(t, &d, 0, 3, s2, 4, 1, 6, &copy);
+      assert(step.copied() && d.calls == 0 && d.begins == 0 && step.inputs().size() == 6);
+      const auto &r = step.result();
+      if (wrong < 0) assert(r.accepted == 5 && !r.rejected && r.emitted.size() == 6);
+      else assert(r.accepted == size_t(wrong) && r.rejected && r.emitted.size() == size_t(wrong) + 1);
+      std::vector<int> p2(t.committed.begin(), t.committed.begin() + 3);
+      p2.push_back(0);
+      for (size_t k = 0; k < r.emitted.size(); ++k) {
+        assert(r.emitted[k] == argmax(row(p2)));   // the target's own choice (rows are near point masses)
+        p2.push_back(r.emitted[k]);
+      }
+      const size_t rows = step.finish(r.emitted.size(), false);
+      assert(d.completions == 0 && d.aborts == 0 && d.rolled == int64_t(t.committed.size()));
+      assert(rows == r.accepted + 1);
+    }
+  }
   // Invalid or regressing snapshots abort the pending target transaction.
   for (bool nonfinite : {false, true}) {
     InvalidCounters t; seed(t); t.nonfinite = nonfinite;

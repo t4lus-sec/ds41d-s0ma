@@ -76,7 +76,7 @@ DemandCounters Forward::demand_counters() const {
 SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
                                  int anchor, int64_t committed,
                                  const Sampling &sampling, uint64_t position,
-                                 uint64_t step, int maximum)
+                                 uint64_t step, int maximum, const std::vector<int> *copy)
     : target_(target), draft_(draft), begin_(committed) {
   static const double floor = stop_floor();
   static const std::vector<double> model = stop_model();
@@ -90,9 +90,13 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
       maximum > 6 || anchor < 0 || anchor >= target.vocab())
     throw std::invalid_argument("speculative step position/width/anchor");
   try {
-    draft_attempt_ = draft != nullptr;
-    int width = draft ? draft->prepare({anchor, maximum, committed, step,
-                                       sampling.temperature, sampling.top_p}) : 1;
+    // s0ma change 72: a copied proposal needs the drafter only for its rollback (the target's attention state);
+    // no drafter transaction is opened, so its width policy never sees copy steps
+    copied_ = draft && copy && !copy->empty() && maximum > 1;
+    draft_attempt_ = draft != nullptr && !copied_;
+    int width = copied_ ? 1 + std::min(int(copy->size()), maximum - 1)
+                : draft ? draft->prepare({anchor, maximum, committed, step,
+                                          sampling.temperature, sampling.top_p}) : 1;
     if (width < 1 || width > maximum)
       throw std::runtime_error("draft policy returned invalid width");
     observed_.width = width;
@@ -108,7 +112,30 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
       qdev.push_back(g.q_device);
     };
     const Rng rng{sampling.seed};
-    if (width > 1) {
+    if (copied_) {
+      // s0ma change 72: q_k is a point mass on the copied token: acceptance min(1, p(d)), and on a rejection the
+      // residual max(0, p - q) renormalized: the target's distribution, whatever was copied
+      const double started = milliseconds();
+      for (int k = 0; k < width - 1; ++k) {
+        const int d = (*copy)[size_t(k)];
+        if (d < 0 || d >= target.vocab()) throw std::invalid_argument("copied draft token");
+        proposals.push_back(d);
+        inputs_.push_back(d);
+        if (sampling.temperature == 0) continue;   // greedy compares the target's argmax: no q
+        const double *dev = (sampling.top_p == 1.0) ? draft->onehot_q(k, d) : nullptr;
+        if (dev) {
+          q.emplace_back();
+          qdev.push_back(dev);
+        } else {
+          Distribution one(size_t(target.vocab()), 0.0);
+          one[size_t(d)] = 1.0;
+          q.push_back(std::move(one));
+          qdev.push_back(nullptr);
+        }
+      }
+      observed_.width = width;
+      observed_.draft_ms = milliseconds() - started;
+    } else if (width > 1) {
       double started = milliseconds();
       draft->begin(anchor);
       observed_.draft_ms += milliseconds() - started;
@@ -247,7 +274,7 @@ SpeculativeStep::SpeculativeStep(Forward &target, DraftProvider *draft,
     if (cut) result_.accepted_input_rows = std::min(result_.accepted_input_rows, rows_.size());
     observed_.accepted_drafts = result_.accepted;
     observed_.tested_drafts = result_.accepted + size_t(result_.rejected);
-    if (stop_log_) {
+    if (stop_log_ && !copied_) {   // (s0ma change 72: copy steps are not the drafter's)
       std::lock_guard<std::mutex> lock(stop_mutex());
       *stop_log_ << width << ' ' << result_.accepted;
       for (double c : confidence_) *stop_log_ << ' ' << c;
@@ -313,7 +340,8 @@ size_t SpeculativeStep::finish(size_t delivered, bool terminal, bool cancelled) 
         ++observed_.tested_drafts;
       observed_.other_ms = std::max(0.0, milliseconds() - started_ms_ -
                                         observed_.draft_ms - observed_.verify_ms);
-      if (cancelled) abort_draft();
+      if (copied_) {}   // s0ma change 72: no drafter transaction to complete
+      else if (cancelled) abort_draft();
       else {
         draft_->complete(observed_, terminal);
         draft_attempt_ = false;

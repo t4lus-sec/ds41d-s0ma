@@ -281,6 +281,9 @@ public:
   virtual void fetch_q(const double *, std::vector<double> &) {
     throw std::logic_error("draft q on the device without a fetch");
   }
+  // s0ma change 72: q for a copied draft (suffix drafting): a point mass on `token` at draft position k, on the
+  // device for verify_gpu; nullptr = none here (the step then gives the host verifier a one-hot q)
+  virtual const double *onehot_q(int, int) { return nullptr; }
   virtual void observe(const DraftObservation &) = 0;
   virtual void complete(const DraftObservation &observation, bool censored) {
     if (!censored) observe(observation);
@@ -307,12 +310,17 @@ class SpeculativeStep {
   std::ofstream *stop_log_ = nullptr;
   std::vector<double> confidence_;
   std::vector<float> head_confidence_;
+  bool copied_ = false;   // s0ma change 72: this step's drafts were copied from the context, not drawn
 
 public:
+  // s0ma change 72: copy, when not empty, is the suffix drafter's proposal (tokens that followed an earlier
+  // occurrence of the context's last tokens): the step verifies anchor + up to maximum_width - 1 of them, each
+  // with a point-mass q, so the result has the target's distribution exactly; the drafter is not run.
   SpeculativeStep(Forward &, DraftProvider *, int anchor,
                   int64_t committed_inputs, const Sampling &,
                   uint64_t first_output_position, uint64_t transaction_step,
-                  int maximum_width);
+                  int maximum_width, const std::vector<int> *copy = nullptr);
+  bool copied() const { return copied_; }
   ~SpeculativeStep();
   SpeculativeStep(const SpeculativeStep &) = delete;
   SpeculativeStep &operator=(const SpeculativeStep &) = delete;

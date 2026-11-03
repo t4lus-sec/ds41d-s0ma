@@ -127,6 +127,8 @@ class SparkTarget final : public Forward, public DraftProvider {
     if (!c->meta || !c->hidden) throw std::runtime_error("DS41_DRAFT_CAPTURE: cannot write in " + std::string(dir));
     return c;
   }();
+  bool capture_copy_ = false;   // s0ma change 72: this step's drafts were copied (not the drafter's)
+  double *onehot_host_ = nullptr;
   int capture_anchor_ = -1;
   int64_t capture_position_ = -1;
   const void *capture_hd_ = nullptr;
@@ -628,6 +630,7 @@ public:
     const double started = clock_ms();
 #endif
     checked(ds41_spark_forward(spark_.get(), anchor, &u, &hd));
+    capture_copy_ = false;
     if (capture_) {   // s0ma change 70
       capture_anchor_ = anchor; capture_hd_ = hd; capture_position_ = ds41_spark_committed(spark_.get());
       std::fill(capture_conf_, capture_conf_ + 5, std::numeric_limits<float>::quiet_NaN());
@@ -765,8 +768,33 @@ public:
         rejected = host.rejected;
       }
     }
-    if (capture_) capture_step(proposals, q, temperature, seed, step, emitted, accepted, rejected, cut);   // change 70
+    if (capture_ && !capture_copy_) capture_step(proposals, q, temperature, seed, step, emitted, accepted, rejected, cut);   // change 70
     return true;
+  }
+  // s0ma change 72: a copied draft's q, a point mass on token, in the draws' device rows (verify_gpu reads them)
+  const double *onehot_q(int k, int token) override {
+    if (!gpu_verify_on() || k < 0 || k > 4) return nullptr;
+    check();
+    const size_t n = size_t(vocab());
+    if (token < 0 || size_t(token) >= n) return nullptr;
+    auto stream = static_cast<cudaStream_t>(weights_.cuda_stream);
+    if (!draw_q_dev_) {
+      cuda_checked(cudaMalloc(reinterpret_cast<void **>(&draw_q_dev_), 5 * n * sizeof(double)));
+      cuda_checked(cudaMalloc(&draw_scratch_, ds41_draft_draw_scratch_bytes()));
+      cuda_checked(cudaMallocHost(reinterpret_cast<void **>(&draw_q_host_), n * sizeof(double)));
+      cuda_checked(cudaMallocHost(&draw_result_host_, 64));
+    }
+    if (!onehot_host_) {
+      void *h = nullptr;
+      cuda_checked(cudaMallocHost(&h, sizeof(double)));
+      onehot_host_ = static_cast<double *>(h);
+      *onehot_host_ = 1.0;
+    }
+    double *q = draw_q_dev_ + size_t(k) * n;
+    cuda_checked(cudaMemsetAsync(q, 0, n * sizeof(double), stream));
+    cuda_checked(cudaMemcpyAsync(q + token, onehot_host_, sizeof(double), cudaMemcpyHostToDevice, stream));
+    capture_copy_ = true;   // change 70's capture records drafter steps only
+    return q;
   }
   void fetch_q(const double *q_device, std::vector<double> &out) override {
     const size_t n = size_t(vocab());

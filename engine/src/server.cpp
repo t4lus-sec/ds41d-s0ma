@@ -21,6 +21,7 @@
 #include <sys/un.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 namespace ds41e {
 namespace {
 volatile std::sig_atomic_t stopping = 0;
@@ -279,6 +280,77 @@ class Service {
              std::equal(keys.begin(), keys.end(), prompt.begin());
     }
   } prefix;
+  // s0ma change 72: suffix drafting. The committed tokens of the live conversation, indexed by their last 4, 8, 16
+  // and 32 tokens (each n-gram's latest end). Before a step, the context's last tokens (the anchor included) are
+  // looked up, longest n first; on a match the tokens that followed the earlier occurrence are proposed. Whether a
+  // step copies or asks the drafter depends on the copies' running acceptance by match length against the
+  // drafter's running accepted drafts a step. Either way the target verifies: the output distribution is exact.
+  struct SuffixIndex {
+    static constexpr int kN[4] = {32, 16, 8, 4};
+    std::vector<int> tokens;
+    std::array<std::unordered_map<uint64_t, uint32_t>, 4> last;   // n-gram hash -> end (exclusive) of its latest
+    static uint64_t hash(const int *p, int n) {
+      uint64_t h = 0x9E3779B97F4A7C15ull ^ uint64_t(n);
+      for (int i = 0; i < n; ++i) { h ^= uint64_t(uint32_t(p[i])) + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2); h *= 0xBF58476D1CE4E5B9ull; }
+      return h;
+    }
+    void clear() { tokens.clear(); for (auto &m : last) m.clear(); }
+    void push(int t) {
+      tokens.push_back(t);
+      const size_t e = tokens.size();
+      for (int i = 0; i < 4; ++i)
+        if (e >= size_t(kN[i])) last[size_t(i)][hash(tokens.data() + e - kN[i], kN[i])] = uint32_t(e);
+    }
+    // the indexed tokens become `inputs` (appending when they extend what is indexed, else from scratch)
+    void sync(const std::vector<int> &inputs) {
+      if (inputs.size() < tokens.size() || !std::equal(tokens.begin(), tokens.end(), inputs.begin())) clear();
+      for (size_t i = tokens.size(); i < inputs.size(); ++i) push(inputs[i]);
+    }
+    // the continuation of the latest earlier occurrence of (tokens + anchor)'s last n tokens, longest n first;
+    // returns the n that matched (0: none) and up to `want` tokens in out
+    int lookup(int anchor, int want, std::vector<int> &out) const {
+      out.clear();
+      const size_t e = tokens.size() + 1;
+      std::vector<int> tail;
+      for (int i = 0; i < 4; ++i) {
+        const int n = kN[i];
+        if (e < size_t(n) + 1) continue;
+        tail.assign(tokens.end() - (n - 1), tokens.end());
+        tail.push_back(anchor);
+        auto it = last[size_t(i)].find(hash(tail.data(), n));
+        if (it == last[size_t(i)].end()) continue;
+        const size_t end = it->second;   // tokens[end - n, end) == tail, if not a hash collision
+        if (end >= tokens.size() || !std::equal(tail.begin(), tail.end(), tokens.begin() + (end - n))) continue;
+        for (size_t j = end; j < tokens.size() && int(out.size()) < want; ++j) out.push_back(tokens[j]);
+        return n;
+      }
+      return 0;
+    }
+  } suffix;
+  // per match length: the copies' acceptance a draft (EWMA, priors below); the drafter's accepted drafts a step
+  struct SuffixPolicy {
+    double copy[4] = {0.85, 0.75, 0.6, 0.45};
+    double spark = 1.8;
+    static int bucket(int n) { return n >= 32 ? 0 : n >= 16 ? 1 : n >= 8 ? 2 : 3; }
+    double expected(int n, int drafts) const {
+      const double a = copy[bucket(n)];
+      double e = 0, r = 1;
+      for (int k = 0; k < drafts; ++k) { r *= a; e += r; }
+      return e;
+    }
+    void observe_copy(int n, size_t accepted, size_t tested) {
+      if (!tested) return;
+      double &a = copy[bucket(n)];
+      const double w = 1 - std::pow(0.97, double(tested));
+      a += w * (double(accepted) / double(tested) - a);
+    }
+    void observe_spark(size_t accepted) { spark += 0.03 * (double(accepted) - spark); }
+    uint64_t declined = 0;   // every 32nd declined match is copied anyway, so a bucket's estimate can recover
+  } suffix_policy;
+  static bool suffix_on() {
+    static const bool on = [] { const char *v = std::getenv("DS41_SUFFIX_DRAFT"); return !v || std::string(v) != "0"; }();
+    return on;
+  }
 
 public:
   std::atomic<int> connections{0};
@@ -586,6 +658,10 @@ public:
         AttemptCounter attempts;
         DraftProvider *drafter =
             draft_mode == "off" ? nullptr : model->drafter();
+        const bool copying = drafter && suffix_on();   // s0ma change 72
+        if (copying) suffix.sync(prefix.inputs);
+        std::vector<int> copy;
+        uint64_t copy_steps = 0, copy_drafted = 0, copy_accepted = 0;
         std::string reason = "length";
         uint64_t cycles = 0, drafted = 0, accepted = 0, verified_accepted = 0;
         double draft_ms = 0, verify_ms = 0, draft_forward_ms = 0, draft_draw_ms = 0;
@@ -642,9 +718,20 @@ public:
             // Burn the nonce before width selection, including failed attempts.
             const uint64_t nonce = attempts.take();
             ++cycles;
+            int match = 0;
+            if (copying && maximum > 1) {   // s0ma change 72: copy when the copies are expected to beat the drafter
+              match = suffix.lookup(anchor, maximum - 1, copy);
+              if (!match || copy.empty() ||
+                  (suffix_policy.expected(match, int(copy.size())) < suffix_policy.spark &&
+                   ++suffix_policy.declined % 32 != 0)) {
+                copy.clear();
+                match = 0;
+              }
+            }
             SpeculativeStep step(*model, drafter, anchor,
                                  int64_t(prefix.inputs.size()), sampling,
-                                 uint64_t(prompt + completed), nonce, maximum);
+                                 uint64_t(prompt + completed), nonce, maximum,
+                                 match ? &copy : nullptr);
             const auto &result = step.result();
             drafted += step.inputs().size() - 1;
             verified_accepted += result.accepted;
@@ -668,8 +755,19 @@ public:
             const size_t consumed = step.finish(delivered, terminal,
                                                  reason == "cancelled");
             accepted += std::min(delivered, result.accepted);
+            if (copying) {   // s0ma change 72
+              const size_t tested = std::min(delivered, result.accepted) + (result.rejected ? 1 : 0);
+              if (step.copied()) {
+                ++copy_steps; copy_drafted += step.inputs().size() - 1; copy_accepted += std::min(delivered, result.accepted);
+                suffix_policy.observe_copy(match, std::min(delivered, result.accepted), tested);
+              } else if (step.inputs().size() > 1) {
+                suffix_policy.observe_spark(std::min(delivered, result.accepted));
+              }
+            }
             prefix.inputs.insert(prefix.inputs.end(), step.inputs().begin(),
                                  step.inputs().begin() + consumed);
+            if (copying)
+              for (size_t i = 0; i < consumed; ++i) suffix.push(step.inputs()[i]);
             prefix.keys.insert(prefix.keys.end(), step.inputs().begin(),
                                step.inputs().begin() + consumed);
             prefix.logits = step.rows()[consumed - 1];
@@ -715,6 +813,9 @@ public:
         stats["verified_accepted"] = verified_accepted;
         stats["acceptance"] =
             drafted ? double(accepted) / double(drafted) : 0.0;
+        stats["copy_steps"] = copy_steps;          // s0ma change 72: suffix drafting
+        stats["copy_drafted"] = copy_drafted;
+        stats["copy_accepted"] = copy_accepted;
         finish(reason, nullptr, stats);
         break;
       }

@@ -32,4 +32,8 @@ void store_groups(const void *packed,void *global,const int64_t *position,
                    int rows,int bytes,int ratio,cudaStream_t);
 void lengths_aux(const int *visible,int *out,int rows,int divisor,int fixed,
                   cudaStream_t);
+// s0ma change 83: each row's six experts (biased scores [rows, 384], rows <= 6) and the route plan, as bmoe's host
+// partial_sort and plan_routes make them: ids [rows*6], source and slots [rows*6]; host (mapped, may be null) gets
+// ids at [0], sources at [36] and slots at [72].
+void route_plan(const float *biased,int rows,int *ids,int *source,int *slots,int *host,cudaStream_t);
 } // namespace ds41e::hotpath

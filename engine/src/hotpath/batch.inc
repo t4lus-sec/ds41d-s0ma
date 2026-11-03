@@ -237,10 +237,34 @@ const void *lookahead_input(int t,int m) {
   bf16_float(la_x.p,la_in.as<float>(),m*H,stream);
   return la_in.p;
 }
+// s0ma change 83 (profile, lane A): the layer's route gap opens when its route event is recorded
+void route_gap_open(int l) {
+  if(!config.hotpath_profile || lane_b_active || l<0 || l>=40) return;
+  CK(cudaEventRecord(route_gap[l]->start,stream));
+  route_gap_first[l]=-1;
+}
 // Front half of the MoE block: queue the route-score copy (and lookahead) behind the router.
 void bmoe_scores(int l,int m) {
-  zc(host_alias(lane_scores()),biased.p,m*384*4);
-  CK(cudaEventRecord(route_events[lane_b_active],stream));
+  // s0ma change 83: with DS41_GPU_ROUTE the GPU picks the routes, plans them, weighs and gathers the rows here, behind
+  // the router; the host's wait (bmoe) is only for the ids it needs for the store demand.
+  bool &routed=gpu_routed[lane_b_active];
+  routed=gpu_route && exl3 && config.streamed_experts && !lane_b_active && !h1_config().on && m>=1 && m<=6;
+  if(routed) {
+    hotpath::route_plan(biased.as<float>(),m,ids_device.as<int>(),route_source.as<int>(),route_slots.as<int>(),
+        static_cast<int *>(host_alias(lane_scores())),stream);
+    if(gpu_route==2) zc(host_alias(lane_scores()+1024),biased.p,m*384*4);   // the scores too, for the check
+    CK(cudaEventRecord(route_events[lane_b_active],stream));
+    route_gap_open(l);
+    if(rows_route && m>1) route_weights_rows(unbiased.as<float>(),ids_device.as<int>(),route.as<float>(),6,m,384,stream);
+    else for(int r=0;r<m;++r) route_weights(unbiased.as<float>(r*384*4),
+        ids_device.as<int>(r*6*4),route.as<float>(r*6*4),6,stream);
+    hotpath::gather_routes_bf16(x.p,route.as<float>(),route_source.as<int>(),
+        route_slots.as<int>(),bxh.p,broute.as<float>(),m*6,stream);
+  } else {
+    zc(host_alias(lane_scores()),biased.p,m*384*4);
+    CK(cudaEventRecord(route_events[lane_b_active],stream));
+    route_gap_open(l);
+  }
   if(lookahead_sync && l+1<40 && !lane_b_active && (m==1 || !lookahead_audit.is_open())) {
     // Score layer l+1's router on this layer's FFN input (f32, every verify row) behind the route
     // copy. The host waits only for the route copy; the prediction is read after this layer's demand.
@@ -320,22 +344,37 @@ void bmoe(int l,int m) {
   // s0ma change 62: the shared expert needs no routing; queue it before waiting for the route scores, so the GPU has
   // it to run while the host picks and plans this layer's experts (bmoe_streamed then skips it)
   if(config.streamed_experts) bgraph(p+".shared",m,[&]{bshared(p,m);});
+  // s0ma change 83: the GPU work queued ahead of the host's plan ends here (profile)
+  if(config.hotpath_profile && !lane_b_active && route_gap_first[l]==-1) CK(cudaEventRecord(route_gap[l]->end,stream));
   CK(cudaEventSynchronize(route_events[lane_b_active]));
   route_ms+=clock_ms()-t;
   check_moe_retirement(false);
   double plan_start=clock_ms();
   std::array<int,36> selected{};
-  for(int r=0;r<m;++r) {
-    std::array<int,384> order{};
-    std::iota(order.begin(),order.end(),0);
-    std::partial_sort(order.begin(),order.begin()+6,order.end(),[&](int a,int b){
-      return score_host[r*384+a]==score_host[r*384+b]?a<b:
-             score_host[r*384+a]>score_host[r*384+b];
-    });
-    std::copy_n(order.begin(),6,selected.begin()+r*6);
-  }
+  auto host_top6=[&](const float *scores,int *out){
+    for(int r=0;r<m;++r) {
+      std::array<int,384> order{};
+      std::iota(order.begin(),order.end(),0);
+      std::partial_sort(order.begin(),order.begin()+6,order.end(),[&](int a,int b){
+        return scores[r*384+a]==scores[r*384+b]?a<b:
+               scores[r*384+a]>scores[r*384+b];
+      });
+      std::copy_n(order.begin(),6,out+r*6);
+    }
+  };
+  const bool routed_on_gpu=gpu_routed[lane_b_active];   // s0ma change 83
+  const int *gpu_out=reinterpret_cast<const int *>(score_host);
+  if(routed_on_gpu) { std::copy_n(gpu_out,m*6,selected.begin()); ++gpu_route_layers; }
+  else host_top6(score_host,selected.data());
   if(const int cut=h1_cut(l,m,selected.data()); cut<m) m=cut;   // s0ma change 47 (H1): rows cut..m-1 end here
   auto plan=hotpath::plan_routes(selected.data(),m,l);
+  if(routed_on_gpu && gpu_route==2) {   // s0ma change 83: the host's own pick and plan against the GPU's
+    std::array<int,36> mine{};
+    host_top6(score_host+1024,mine.data());
+    bool same=std::equal(mine.begin(),mine.begin()+m*6,selected.begin());
+    for(int i=0;i<plan.count;++i) same=same && gpu_out[36+i]==plan.source[i] && gpu_out[72+i]==plan.destination[i];
+    if(!same) ++gpu_route_mismatches;
+  }
   if(lookahead_audit.is_open() && m==1) {
     auto snap=experts->residency_snapshot();
     lookahead_audit<<audit_pos<<' '<<l;
@@ -386,6 +425,7 @@ void bmoe(int l,int m) {
     else dj.push_back({e.id,e.count,eq.as<uint8_t>(e.begin*I),
         es.as<uint8_t>(e.begin*I/32),compact_down.as<Bf16>(e.begin*H*2)});
   }
+  if(!routed_on_gpu) {   // s0ma change 83: bmoe_scores already did all of this on the GPU
   zc_begin();
   upload(ids_device,selected.data(),m*6*4);
   upload(route_source,plan.source.data(),plan.count*4);
@@ -397,7 +437,9 @@ void bmoe(int l,int m) {
   if(rows_route && m>1) route_weights_rows(unbiased.as<float>(),ids_device.as<int>(),route.as<float>(),6,m,384,stream);
   else for(int r=0;r<m;++r) route_weights(unbiased.as<float>(r*384*4),
       ids_device.as<int>(r*6*4),route.as<float>(r*6*4),6,stream);
-  if(exl3) hotpath::gather_routes_bf16(x.p,route.as<float>(),route_source.as<int>(),
+  }
+  if(routed_on_gpu) {}
+  else if(exl3) hotpath::gather_routes_bf16(x.p,route.as<float>(),route_source.as<int>(),
       route_slots.as<int>(),bxh.p,broute.as<float>(),plan.count,stream);
   else {
     CK(ds41::quantize_mxfp8(x.as<Bf16>(),aq.as<uint8_t>(),as.as<uint8_t>(),m,H,stream));
@@ -495,6 +537,7 @@ StepMarks step_marks(int64_t pos) {
   expert_event_index=0;
   if(consumer_readiness) consumer_readiness->reset();
   phase_index=0; phase_names.clear(); upload_cursor=4<<20;
+  route_gap_first.fill(-2);   // s0ma change 83
   in_step=true; graph_ready=pos>0;
   return k;
 }
@@ -660,6 +703,18 @@ std::vector<std::vector<float>> batch_finish(int64_t pos,int m,const StepMarks &
         {"nvme_misses",after.nvme_misses-stats_before.nvme_misses},
         {"h2d_bytes",after.h2d_bytes-stats_before.h2d_bytes},
         {"nvme_bytes",after.nvme_bytes-stats_before.nvme_bytes}};
+    {   // s0ma change 83: the route gaps (see route_gap)
+      double gap=0,queued=0; int layers=0;
+      for(int l=0;l<40;++l) {
+        const int e=route_gap_first[l];
+        if(e<0 || size_t(e)>=expert_event_index) continue;
+        float a=0,b=0;
+        CK(cudaEventElapsedTime(&a,route_gap[l]->start,expert_events[e]->start));
+        CK(cudaEventElapsedTime(&b,route_gap[l]->start,route_gap[l]->end));
+        gap+=a; queued+=b; ++layers;
+      }
+      step["route_gap_ms"]=gap; step["route_gap_queued_ms"]=queued; step["route_gap_layers"]=layers;
+    }
     step["moe_delta"]=hotpath::moe_delta(stats_before,after,true);
     step["stream_phase_ms_including_stalls"]=step_phases;
     step["demand_calls"]=std::move(step_demands);

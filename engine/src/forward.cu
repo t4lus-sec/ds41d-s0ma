@@ -678,6 +678,27 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::unique_ptr<hotpath::ConsumerReadiness> consumer_readiness;
   double host_plan_ms=0, callback_enqueue_ms=0;
   Json profile_steps=Json::array(), step_demands=Json::array();
+  // s0ma change 83: DS41_GPU_ROUTE=1 picks each layer's six experts a row, the route plan, the route weights and the
+  // gathered expert rows on the GPU right behind the router (hotpath::route_plan), instead of after the host's wait:
+  // the host reads the 6 x m ids (not the 384 x m scores) and plans only the store demand. The same ids, plan and
+  // arithmetic as the host's. "check" also copies the scores and counts every layer whose ids or plan differ from the
+  // host's own (gpu_route_mismatches, which must stay 0). EXL3 streamed experts, lane A, H1 off; otherwise the host.
+  const int gpu_route = [] {
+    const char *v = std::getenv("DS41_GPU_ROUTE");
+    const std::string s = v ? v : "";
+    if (s.empty() || s == "0") return 0;
+    if (s == "1") return 1;
+    if (s == "check") return 2;
+    throw std::invalid_argument("DS41_GPU_ROUTE: 0, 1 or check");
+  }();
+  std::array<bool, 2> gpu_routed{};   // by lane: this layer's routes came from the GPU (set in bmoe_scores, read in bmoe)
+  uint64_t gpu_route_layers = 0, gpu_route_mismatches = 0;
+  // s0ma change 83 (profile, lane A): per layer, the route scores copied (start) -> the GPU work queued before the host
+  // plans (end: lookahead, shared expert and, with DS41_GPU_ROUTE, the route weights and gather); route_gap_first[l] is
+  // the layer's first expert segment event (-1: none yet, -2: not recorded this step). The gap to that event less the
+  // queued work is the time the GPU waits for the host's routes.
+  std::vector<std::unique_ptr<Phase>> route_gap;
+  std::array<int, 40> route_gap_first{};
   // s0ma change 63: DS41_PROFILE_STEPS=A:B opens the CUDA profiler range (cudaProfilerStart) before the engine's A-th
   // verify step and closes it after its B-th (counted from 1 over the process). Under nsys --capture-range=
   // cudaProfilerApi only that window is traced, and the trace is complete when the range closes, while the engine
@@ -1005,6 +1026,7 @@ public:
       phases.push_back(std::make_unique<Phase>());
     if(c.hotpath_profile) {
       for(int i=0;i<1440;++i) expert_events.push_back(std::make_unique<Phase>());
+      for(int i=0;i<40;++i) route_gap.push_back(std::make_unique<Phase>());   // s0ma change 83
       consumer_readiness=std::make_unique<hotpath::ConsumerReadiness>();
     }
     reset();
@@ -1222,6 +1244,7 @@ public:
     measured.clear();prefill_summary=Json::object();
     host_plan_ms=callback_enqueue_ms=0; profile_steps=Json::array();
     stream_callbacks=stream_hit_batches=0;
+    gpu_route_layers=gpu_route_mismatches=0;   // s0ma change 83
     initial_stats = sample_expert_stats();
     initial_demand = experts->demand_totals();
     if (async_engram)
@@ -1607,6 +1630,9 @@ public:
     j["streamed_experts"]=config.streamed_experts;
     j["stream_callbacks"]=stream_callbacks;
     j["stream_hit_batches"]=stream_hit_batches;
+    j["gpu_route"]=gpu_route;   // s0ma change 83
+    j["gpu_route_layers"]=gpu_route_layers;
+    j["gpu_route_mismatches"]=gpu_route_mismatches;
     j["prefetch_previous_routes"]=config.prefetch_routes;
     j["graphs_requested"] = config.graphs;
     j["prefill"] = prefill_summary;

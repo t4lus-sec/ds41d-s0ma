@@ -120,6 +120,55 @@ __global__ void aux(const int *visible,int *out,int rows,int divisor,int fixed) 
   int r=threadIdx.x;
   if(r<rows) out[r]=fixed>=0?fixed:(visible[r]+divisor-1)/divisor;
 }
+// s0ma change 83: the host's route pick and plan (bmoe's partial_sort and plan_routes) on the GPU. One warp per row
+// takes its six best experts, best first: a higher biased score wins, an equal score goes to the lower index (the
+// host comparator, == included, so -0 and +0 tie). Then the stable sort by expert id: route i lands at
+// #{j: id_j < id_i} + #{j < i: id_j == id_i}, with source = i / 6 and slot = i. host (mapped) gets the ids at 0,
+// the sources at 36 and the slots at 72, for the host's plan and its check.
+__device__ __forceinline__ bool route_better(float a,int ai,float b,int bi){ return a==b ? ai<bi : a>b; }
+__global__ void route_plan_rows(const float *biased,int rows,int *ids,int *source,int *slots,int *host) {DS41_PDL_WAIT();
+  __shared__ int sel[36];
+  const int warp=threadIdx.x/32, lane=threadIdx.x%32;
+  if(warp<rows) {
+    const float *s=biased+warp*384;
+    float v[12];
+    #pragma unroll
+    for(int j=0;j<12;++j) v[j]=s[lane+32*j];
+    int picked[6];
+    #pragma unroll
+    for(int k=0;k<6;++k) {
+      float best=0.f; int bi=-1;
+      #pragma unroll
+      for(int j=0;j<12;++j) {
+        const int idx=lane+32*j;
+        bool taken=false;
+        #pragma unroll
+        for(int q=0;q<6;++q) if(q<k) taken|=picked[q]==idx;
+        if(!taken && (bi<0 || route_better(v[j],idx,best,bi))) { best=v[j]; bi=idx; }
+      }
+      #pragma unroll
+      for(int o=16;o;o>>=1) {
+        const float ob=__shfl_xor_sync(0xffffffffu,best,o);
+        const int oi=__shfl_xor_sync(0xffffffffu,bi,o);
+        if(oi>=0 && (bi<0 || route_better(ob,oi,best,bi))) { best=ob; bi=oi; }
+      }
+      picked[k]=bi;
+    }
+    if(lane==0) {
+      #pragma unroll
+      for(int k=0;k<6;++k) sel[warp*6+k]=picked[k];
+    }
+  }
+  __syncthreads();
+  const int count=rows*6, i=threadIdx.x;
+  if(i<count) {
+    const int key=sel[i];
+    int rank=0;
+    for(int j=0;j<count;++j) { const int kj=sel[j]; rank+=(kj<key)||(kj==key&&j<i); }
+    ids[i]=key; source[rank]=i/6; slots[rank]=i;
+    if(host) { host[i]=key; host[36+rank]=i/6; host[72+rank]=i; }
+  }
+}
 }
 void embedding(const void *table, const int *tokens, void *h, float *pre,
                int rows, cudaStream_t s) {
@@ -164,6 +213,9 @@ void store_groups(const void *packed,void *global,const int64_t *position,
 }
 void lengths_aux(const int *v,int *out,int rows,int divisor,int fixed,cudaStream_t s) {
   aux<<<1,32,0,s>>>(v,out,rows,divisor,fixed);
+}
+void route_plan(const float *biased,int rows,int *ids,int *source,int *slots,int *host,cudaStream_t s) {
+  route_plan_rows<<<1,192,0,s>>>(biased,rows,ids,source,slots,host);
 }
 } // namespace ds41e::hotpath
 extern "C" int ds41_hotpath_rms(const void *x,const void *w,void *out,int rows,

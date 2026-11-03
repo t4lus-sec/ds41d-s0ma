@@ -39,6 +39,7 @@ void bmoe_streamed(const std::string &p,int m,const hotpath::RoutePlan &plan,
     Phase *event=nullptr;
     if(config.hotpath_profile && !lane_b_active) {
       if(expert_event_index==expert_events.size()) throw std::logic_error("expert profile event capacity");
+      if(route_gap_first[layer]==-1) route_gap_first[layer]=int(expert_event_index);   // s0ma change 83: the gap closes
       event=expert_events[expert_event_index++].get();
       CK(cudaEventRecord(event->start,stream));
     }

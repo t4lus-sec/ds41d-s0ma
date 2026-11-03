@@ -1,6 +1,7 @@
 #include "ds41/offload.hpp"
 #include "ds41/gds_reader.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cmath>
@@ -129,6 +130,28 @@ struct OffloadStore::Impl {
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<std::function<void()>> demand;
+    // s0ma change 83: DS41_MOE_SPIN_US=N (0..100000): with nothing queued, the worker polls for the next task for up to
+    // N us before it sleeps on the condition variable, and a demand's caller polls for its result as long before it blocks; the wake
+    // of a sleeping thread is then off each layer's route round trip. Same tasks, same order; 0 (default) as before.
+    size_t spin_us=[]{const char* v=std::getenv("DS41_MOE_SPIN_US");if(!v||!*v)return size_t(0);
+        const long n=std::stol(v);if(n<0||n>100000)throw std::invalid_argument("DS41_MOE_SPIN_US: 0..100000");return size_t(n);}();
+    std::atomic<size_t> queued_size{0};   // demand + speculative tasks queued, stored under mutex at every change
+    void mirror_queued(){size_t n=demand.size();for(const auto& q:speculative)n+=q.size();queued_size.store(n,std::memory_order_release);}
+    static void cpu_relax(){
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+    }
+    void spin_for_demand() const {
+        if(!spin_us)return;
+        const auto until=Clock::now()+std::chrono::microseconds(spin_us);
+        while(queued_size.load(std::memory_order_acquire)==0 && Clock::now()<until)cpu_relax();
+    }
+    template<class R> void spin_for(const std::future<R>& f) const {
+        if(!spin_us)return;
+        const auto until=Clock::now()+std::chrono::microseconds(spin_us);
+        while(f.wait_for(std::chrono::seconds(0))!=std::future_status::ready && Clock::now()<until)cpu_relax();
+    }
     std::array<std::deque<std::function<void()>>,3> speculative;
     bool has_speculative()const {for(const auto& q:speculative)if(!q.empty())return true;return false;}
     bool stopping=false;
@@ -312,6 +335,7 @@ struct OffloadStore::Impl {
             if(set_device!=cudaSuccess) fail(std::make_exception_ptr(std::runtime_error(cudaGetErrorString(set_device))));
             for(;;){
                 std::function<void()> f;
+                spin_for_demand();   // s0ma change 83
                 {
                     std::unique_lock<std::mutex> lock(mutex);
                     cv.wait(lock,[this]{return stopping || !demand.empty() || has_speculative();});
@@ -330,6 +354,7 @@ struct OffloadStore::Impl {
                     }
                     if(!demand.empty()){f=std::move(demand.front());demand.pop_front();}
                     else for(int p=2;p>=0;--p)if(!speculative[p].empty()){f=std::move(speculative[p].front());speculative[p].pop_front();break;}
+                    mirror_queued();   // s0ma change 83
                 }
                 f();
             }
@@ -383,7 +408,8 @@ struct OffloadStore::Impl {
             return f();
         });
         auto future=task->get_future();
-        {std::lock_guard<std::mutex> lock(mutex);if(stopping)throw std::runtime_error("store shutting down");(priority<0?demand:speculative.at(priority)).emplace_back([task]{(*task)();});}
+        {std::lock_guard<std::mutex> lock(mutex);if(stopping)throw std::runtime_error("store shutting down");(priority<0?demand:speculative.at(priority)).emplace_back([task]{(*task)();});
+         mirror_queued();}   // s0ma change 83
         cv.notify_one();return future;
     }
     void collect(bool wait) {
@@ -592,6 +618,7 @@ struct OffloadStore::Impl {
             if(demote && batch_callback && !is_prefetch){
                 std::lock_guard<std::mutex> lock(mutex);
                 demand.emplace_front([this,ids]{try{top_up(ids);}catch(...){fail(std::current_exception());}});
+                mirror_queued();   // s0ma change 83
             }
             // Keep prefetch leases until DMA finishes; demand ownership is
             // transferred to the caller and released only after its consumer.
@@ -810,7 +837,9 @@ struct OffloadStore::Impl {
 OffloadStore::OffloadStore(std::vector<Record> r,Config c):impl_(new Impl(std::move(r),c)){}
 OffloadStore::~OffloadStore()=default;
 OffloadStore::Lease OffloadStore::need_now(std::vector<ExpertId> ids,cudaStream_t stream) {
-    return impl_->submit([this,ids=std::move(ids),stream]{return impl_->load(ids,stream,false);}).get();
+    auto f=impl_->submit([this,ids=std::move(ids),stream]{return impl_->load(ids,stream,false);});
+    impl_->spin_for(f);   // s0ma change 83
+    return f.get();
 }
 OffloadStore::Lease OffloadStore::need_streamed(std::vector<ExpertId> ids,cudaStream_t stream,ReadyCallback ready) {
     if(!ready)throw std::invalid_argument("empty ready callback");
@@ -818,7 +847,9 @@ OffloadStore::Lease OffloadStore::need_streamed(std::vector<ExpertId> ids,cudaSt
 }
 OffloadStore::Lease OffloadStore::need_streamed_batches(std::vector<ExpertId> ids,cudaStream_t stream,ReadyBatchCallback ready,bool drift_demand) {
     if(!ready)throw std::invalid_argument("empty ready batch callback");
-    return impl_->submit([this,ids=std::move(ids),stream,ready=std::move(ready),drift_demand]{return impl_->load(ids,stream,false,{},ready,true,drift_demand);}).get();
+    auto f=impl_->submit([this,ids=std::move(ids),stream,ready=std::move(ready),drift_demand]{return impl_->load(ids,stream,false,{},ready,true,drift_demand);});
+    impl_->spin_for(f);   // s0ma change 83
+    return f.get();
 }
 void OffloadStore::stream_prefill(std::vector<ExpertId> ids,cudaStream_t stream,ReadyCallback ready,size_t window) {
     if(!ready)throw std::invalid_argument("empty prefill callback");

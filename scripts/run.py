@@ -319,6 +319,12 @@ def environment(cfg, render=True):
         env.setdefault('DS41_PROMPT_ADMIT_GIB', '8')
         # change 25: a lab --env DS41_EXPERT_EXTRA_GIB=... (in ENGINE_ENV) wins
         env.setdefault('DS41_EXPERT_EXTRA_GIB', SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
+    # s0ma change 79: the conversations kept in RAM (change 73) sized to the window: a saved conversation holds ~0.9 KB a
+    # token (the four global layers' compressed KV and indexer keys up to its frontier, 890 B, and its ids) and 3 MB
+    # of rings, so s0ma's main turn and its workers at twice max_context in all need 2 KiB a token of it, plus 1 GiB.
+    # 1 GiB up to 262,144 tokens (as before); 3 GiB at 1,048,576. A lab --env DS41_CONVERSATIONS_GIB=... still wins
+    env.setdefault('DS41_CONVERSATIONS_GIB',
+                   str(max(1, -(-2 * cfg['max_context'] * 1024 // 2**30) + 1) if cfg['max_context'] > 262144 else 1))
     # the pinned cuBLAS pair (dist/blas) before CUDA 13.4's own libraries (cudart, cuFile)
     env['LD_LIBRARY_PATH'] = f'{dist}:{dist}/blas:{cuda_lib()}'
     if gds(cfg):

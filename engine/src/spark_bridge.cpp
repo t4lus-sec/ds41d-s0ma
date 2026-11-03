@@ -128,6 +128,16 @@ class SparkTarget final : public Forward, public DraftProvider {
     return c;
   }();
   bool capture_copy_ = false;   // s0ma change 72: this step's drafts were copied (not the drafter's)
+  // s0ma change 80: the drafter's GPU time, split (DS41_SPARK_TIMING=1, lab only). begin() only launches the forward,
+  // so the host clock charges its GPU time to the first draw; events around each part tell them apart.
+  const bool timing_ = [] { const char *v = std::getenv("DS41_SPARK_TIMING"); return v && v[0] == '1'; }();
+  cudaEvent_t tev_[4] = {};   // forward start, forward end, draw start, draw end
+  bool forward_timed_ = false;
+  double forward_gpu_ms_ = 0, draw_gpu_ms_ = 0;
+  uint64_t forwards_timed_ = 0, draws_timed_ = 0;
+  void timing_events() {
+    if (!tev_[0]) for (auto &e : tev_) cuda_checked(cudaEventCreate(&e));
+  }
   double *onehot_host_ = nullptr;
   int capture_anchor_ = -1;
   int64_t capture_position_ = -1;
@@ -365,6 +375,7 @@ public:
     } catch (...) {
     }
     cudaStreamSynchronize(static_cast<cudaStream_t>(weights_.cuda_stream));
+    for (auto e : tev_) if (e) cudaEventDestroy(e);
   }
   float last_confidence() const override { return last_confidence_; }
   int vocab() const override { return target_->vocab(); }
@@ -602,6 +613,12 @@ public:
     if (gpu_verify_mode() == 2) out["spark_gpu_verify_mismatches"] = gpu_verify_mismatches_;
     out["spark_seed_mode"] = seed_mode_;
     out["spark_append_restores"] = append_restores_;
+    if (timing_) {   // s0ma change 80: engine-life totals
+      out["spark_forward_gpu_ms"] = forward_gpu_ms_;
+      out["spark_forwards_timed"] = forwards_timed_;
+      out["spark_draw_gpu_ms"] = draw_gpu_ms_;
+      out["spark_draws_timed"] = draws_timed_;
+    }
     out["spark_draft_prior_scope"] =
         "owner-resident-context128-fp32-softmax-gpu-v2-excludes-target-offload";
     out["spark_policy_draft_ms"] =
@@ -668,7 +685,15 @@ public:
       throw std::logic_error("policy anchor changed before forward");
     const double started = clock_ms();
 #endif
+    if (timing_) {   // s0ma change 80
+      timing_events();
+      cuda_checked(cudaEventRecord(tev_[0], static_cast<cudaStream_t>(weights_.cuda_stream)));
+    }
     checked(ds41_spark_forward(spark_.get(), anchor, &u, &hd));
+    if (timing_) {
+      cuda_checked(cudaEventRecord(tev_[1], static_cast<cudaStream_t>(weights_.cuda_stream)));
+      forward_timed_ = true;
+    }
     capture_copy_ = false;
     if (capture_) {   // s0ma change 70
       capture_anchor_ = anchor; capture_hd_ = hd; capture_position_ = ds41_spark_committed(spark_.get());
@@ -723,19 +748,31 @@ public:
       cuda_checked(cudaMallocHost(&draw_result_host_, 64));
     }
     const float *data = nullptr, *confidence = nullptr;
-    checked(ds41_spark_markov(spark_.get(), k, previous, &data, &confidence));
     auto stream = static_cast<cudaStream_t>(weights_.cuda_stream);
+    if (timing_) { timing_events(); cuda_checked(cudaEventRecord(tev_[2], stream)); }   // s0ma change 80
+    checked(ds41_spark_markov(spark_.get(), k, previous, &data, &confidence));
     // probabilities() floors a positive temperature at 1e-5; zero is greedy
     const double t = temperature > 0 ? std::max(temperature, 1e-5) : 0.0;
     void *result = nullptr;
     double *q_dev = draw_q_dev_ + (gpu_verify_on() ? size_t(k) * n : 0);
     cuda_checked(cudaError_t(ds41_draft_draw_gpu(data, int(n), t, seed, step, slot, purpose, q_dev,
                                                  draw_scratch_, &result, stream)));
+    if (timing_) cuda_checked(cudaEventRecord(tev_[3], stream));
     cuda_checked(cudaMemcpyAsync(draw_result_host_, result, 24, cudaMemcpyDeviceToHost, stream));
     cuda_checked(cudaMemcpyAsync(confidence_host_.get(), confidence, sizeof(float), cudaMemcpyDeviceToHost, stream));
     if (t > 0 && !gpu_verify_on())
       cuda_checked(cudaMemcpyAsync(draw_q_host_, draw_q_dev_, n * sizeof(double), cudaMemcpyDeviceToHost, stream));
     cuda_checked(cudaStreamSynchronize(stream));
+    if (timing_) {   // s0ma change 80
+      float ms = 0;
+      cuda_checked(cudaEventElapsedTime(&ms, tev_[2], tev_[3]));
+      draw_gpu_ms_ += ms; ++draws_timed_;
+      if (forward_timed_) {
+        cuda_checked(cudaEventElapsedTime(&ms, tev_[0], tev_[1]));
+        forward_gpu_ms_ += ms; ++forwards_timed_;
+        forward_timed_ = false;
+      }
+    }
     const auto *r = static_cast<const char *>(draw_result_host_);
     int32_t token;
     double c;

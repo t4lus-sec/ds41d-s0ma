@@ -199,6 +199,14 @@ __global__ void spark_rows(const __nv_bfloat16 *in, __nv_bfloat16 *out, const in
   if (gather) out[size_t(p) * H + c] = in[size_t(perm[p] / 3) * H + c];
   else out[size_t(perm[p]) * H + c] = in[size_t(p) * H + c];
 }
+// s0ma change 80: the drafter's routes counted per (MTP layer, expert): counts[stage * 128 + e] += 1 for each of the
+// rows * 3 ids (lab only, DS41_SPARK_ROUTE_COUNTS=1; stream-ordered, so it works inside a captured graph)
+__global__ void spark_count_routes(const int32_t *ids, int rows, int stage, unsigned long long *counts) {
+  const int i = threadIdx.x;
+  if (i >= rows * 3 || stage < 0 || stage > 2) return;
+  const int e = ids[i];
+  if (e >= 0 && e < 128) atomicAdd(counts + stage * 128 + e, 1ull);
+}
 struct Weight {
   Device data;
   std::vector<uint64_t> shape;
@@ -308,6 +316,12 @@ class Native final : public Forward, public hotpath::GateEvidence {
   bool mtp_exl3 = false;
   int mtp_bits = 0;
   double mtp_extra_gib = 0;                           // VRAM they gave back, for target expert slots
+  // s0ma change 81: DS41_SPARK_COLD=ID,... (drafter experts, global ids 15360..15743): those experts stay out of
+  // VRAM; the drafter's kernels read them in place from pinned host memory (zero-copy, ~54 GB/s), through a private
+  // copy of the drafter's table. The same bytes and kernels: drafts unchanged. Their VRAM goes to target slots.
+  std::set<ds41::ExpertId> spark_cold;
+  void *spark_cold_host = nullptr;    // cudaHostAlloc, mapped
+  Device spark_table;                 // the drafter store's table with the cold entries pointing at host memory
   // s0ma change 51 (V6): DS41_PREFILL_LEND_GIB=N adds N GiB of expert slots in chunks that each prompt borrows back for
   // its scratch (begin_prompt) and decode takes again (the first verify after the prompt)
   size_t lend_chunks_total = 0, lend_chunk_bytes = 0, lent_chunks = 0, lend_margin = size_t(256) << 20;
@@ -493,6 +507,9 @@ class Native final : public Forward, public hotpath::GateEvidence {
   // s0ma change 61: device-built drafter jobs (DS41_SPARK_GPU_JOBS=0 turns them off)
   Device spark_gx, spark_dout, spark_perm, spark_rw;
   int *spark_err = nullptr;   // mapped host flag
+  // s0ma change 80: per-expert drafter routing counts (lab only)
+  const bool spark_route_counts = [] { const char *v = std::getenv("DS41_SPARK_ROUTE_COUNTS"); return v && v[0] == '1'; }();
+  Device spark_counts;
   bool spark_gpu_jobs = [] { const char *v = std::getenv("DS41_SPARK_GPU_JOBS"); return !(v && std::string(v) == "0"); }();
   const bool prefill_chunk_fit = [] { const char *v = std::getenv("DS41_PREFILL_CHUNK_FIT"); return v && std::string(v) == "1"; }();
   // s0ma leg 26: a verify step's per-row cuBLAS rows, hyper-connection mixes and route weights in one launch each,
@@ -879,6 +896,24 @@ public:
                   << " GB in place of " << native / 1e9 << " GB of MXFP4; " << mtp_extra_gib << " GiB more expert slots\n";
         mtp = std::move(q);
         mtp_exl3 = true;
+        if (const char *cold = std::getenv("DS41_SPARK_COLD"); cold && *cold) {   // s0ma change 81
+          if (!spark_gpu_jobs) throw std::invalid_argument("DS41_SPARK_COLD needs the device-built drafter jobs (DS41_SPARK_GPU_JOBS)");
+          std::stringstream list(cold);
+          std::string item;
+          while (std::getline(list, item, ',')) {
+            if (item.empty()) continue;
+            size_t used = 0;
+            const unsigned long v = std::stoul(item, &used);
+            if (used != item.size() || v < 15360 || v >= 15744) throw std::invalid_argument("DS41_SPARK_COLD: ids 15360..15743");
+            spark_cold.insert(ds41::ExpertId(v));
+          }
+          if (spark_cold.size() >= 384) throw std::invalid_argument("DS41_SPARK_COLD: at most 383 experts");
+          size_t freed = 0;
+          for (auto &r : mtp) if (spark_cold.count(r.id)) freed += (size_t(r.bytes) + 4095) / 4096 * 4096;
+          mtp_extra_gib += double(freed) / double(size_t(1) << 30);
+          std::cerr << "DSpark cold experts (DS41_SPARK_COLD): " << spark_cold.size() << " read in place from host memory; "
+                    << double(freed) / double(size_t(1) << 30) << " GiB more expert slots\n";
+        }
       }
       records = ds41::load_records(c.exl3_experts);
       validate_k3_records(records, c.exl3_receipts);
@@ -1001,6 +1036,7 @@ public:
     fused.reset();
     experts.reset();
     mtp_experts.reset();
+    if (spark_cold_host) { cudaFreeHost(spark_cold_host); spark_cold_host = nullptr; }   // s0ma change 81
     reader.reset();
     pages.reset();
     host.reset();
@@ -1454,6 +1490,16 @@ public:
       j["mtp_expert_requests"]=req; j["mtp_expert_vram_hits"]=hit;
       j["mtp_expert_host_hits"]=host; j["mtp_expert_nvme_misses"]=nvme;
     }
+    if (spark_route_counts) {   // s0ma change 80: engine-life totals, [MTP layer][expert]
+      std::vector<unsigned long long> c(384, 0);
+      if (spark_counts.p) {
+        CK(cudaMemcpyAsync(c.data(), spark_counts.p, 384 * sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream));
+        CK(cudaStreamSynchronize(stream));
+      }
+      Json rc = Json::array();
+      for (int l = 0; l < 3; ++l) rc.push_back(std::vector<unsigned long long>(c.begin() + l * 128, c.begin() + (l + 1) * 128));
+      j["spark_route_counts"] = rc;
+    }
     j["fuse_library"]=config.fuse_library;
     j["moe_source_api"]=DS41_MOE_SOURCE_API;
     j["moe_stats_snapshot"]=stale?"last successful snapshot after error":"fresh";
@@ -1462,6 +1508,7 @@ public:
     j["expert_kernel"]=exl3?"grouped_exl3 (target), grouped_mxfp4_native_parallel (MTP)":"grouped_mxfp4_native_parallel";
     j["target_expert_format"]=exl3_mixed?"EXL3 mixed mul1 ("+mixed_k3_layers+")":exl3?(exl3_bits_loaded==2?"EXL3 K2 mul1":"EXL3 K3 mul1"):"MXFP4";
     if(mtp_experts) j["mtp_expert_store"]="native MXFP4, 384 VRAM pins";
+    if(!spark_cold.empty()) j["spark_cold_experts"]=spark_cold.size();   // s0ma change 81
     j["xk_enabled"]=false; // Cache-only adapter never constructs DecodeBackend/XK.
     j["moe_demand_grouping"]="sorted unique logical-ID union per layer/verify";
     j["dynamic_host"]=config.dynamic_host;j["async_retire"]=config.async_retire;
@@ -1606,6 +1653,14 @@ private:
       throw std::logic_error(
           "DSpark callback during target verify transaction");
     constexpr int max_rows = 8, max_jobs = 3 * max_rows;
+    if (spark_route_counts) {   // s0ma change 80
+      if (!spark_counts.p) {
+        spark_counts.resize(384 * sizeof(unsigned long long));
+        CK(cudaMemsetAsync(spark_counts.p, 0, spark_counts.bytes, stream));
+      }
+      spark_count_routes<<<1, 32, 0, stream>>>(ids, rows, stage, spark_counts.as<unsigned long long>());
+      CK(cudaGetLastError());
+    }
     if (!spark_aq.p) {
       spark_aq.resize(max_rows * H);
       spark_as.resize(max_rows * H / 32);
@@ -1642,19 +1697,20 @@ private:
       spark_rows<<<(count * H + 255) / 256, 256, 0, stream>>>(static_cast<const Bf16 *>(input), spark_gx.as<Bf16>(),
                                                                spark_perm.as<int32_t>(), count, true);
       CK(cudaGetLastError());
-      CK(ds41::grouped_exl3_bits(spark_store().table(), spark_jobs.as<ds41::GemmJob>(), count,
+      CK(ds41::grouped_exl3_bits(spark_expert_table(), spark_jobs.as<ds41::GemmJob>(), count,
                                  ds41::Projection::Gate, I, H, mtp_bits, stream));
-      CK(ds41::grouped_exl3_bits(spark_store().table(), spark_up_jobs.as<ds41::GemmJob>(), count,
+      CK(ds41::grouped_exl3_bits(spark_expert_table(), spark_up_jobs.as<ds41::GemmJob>(), count,
                                  ds41::Projection::Up, I, H, mtp_bits, stream));
       CK(ds41::swiglu(spark_gate.as<Bf16>(), spark_up.as<Bf16>(), spark_rw.as<float>(), spark_act.as<Bf16>(), count, I,
                       10, stream));
-      CK(ds41::grouped_exl3_bits(spark_store().table(), spark_down_jobs.as<ds41::GemmJob>(), count,
+      CK(ds41::grouped_exl3_bits(spark_expert_table(), spark_down_jobs.as<ds41::GemmJob>(), count,
                                  ds41::Projection::Down, H, I, mtp_bits, stream));
       spark_rows<<<(count * H + 255) / 256, 256, 0, stream>>>(spark_dout.as<Bf16>(), static_cast<Bf16 *>(output),
                                                                spark_perm.as<int32_t>(), count, false);
       CK(cudaGetLastError());
       return;
     }
+    if (!spark_cold.empty()) throw std::logic_error("DS41_SPARK_COLD: the drafter's host path cannot reach cold experts");
     // One deliberate route boundary, then unique logical IDs under one lease.
     auto selected = static_cast<int32_t *>(host->data());
     double t = clock_ms();
@@ -3057,6 +3113,15 @@ private:
   // and GDS switches configure the target store, so this fixed store is built without them.
   void make_mtp_store(std::vector<ds41::Record> mtp) {
     if (mtp.size() != 384) throw std::runtime_error("native manifest must hold the 384 MTP experts");
+    // s0ma change 81: the cold ones into pinned host memory, the rest pinned in VRAM as before
+    if (const char *v = std::getenv("DS41_SPARK_COLD"); v && *v && spark_cold.empty())
+      throw std::invalid_argument("DS41_SPARK_COLD needs the drafter's EXL3 bank (DS41_MTP_EXL3)");
+    std::vector<ds41::Record> cold;
+    if (!spark_cold.empty()) {
+      std::vector<ds41::Record> hot;
+      for (auto &r : mtp) (spark_cold.count(r.id) ? cold : hot).push_back(std::move(r));
+      mtp = std::move(hot);
+    }
     ds41::Placement place;
     for (auto &r : mtp) place.vram_pins.push_back(r.id);
     struct Saved { std::vector<std::pair<std::string, std::string>> v;
@@ -3065,11 +3130,49 @@ private:
                              "DS41_MOE_GDS", "DS41_MOE_POLICY_AUDIT"})
       if (const char *value = std::getenv(name)) { saved.v.emplace_back(name, value); unsetenv(name); }
     ds41::OffloadStore::Config mc;
-    mc.slots = 384;
+    mc.slots = mtp.size();
     mc.staging_slots = 8;
     mc.io_depth = 64;
     mtp_experts = std::make_unique<ds41::OffloadStore>(std::move(mtp), mc);
     mtp_experts->place(place);
+    if (!cold.empty()) spark_cold_table(cold);
+  }
+  // s0ma change 81: the cold drafter experts read from their bank files into one mapped host allocation, and a
+  // private table: the store's own entries (its pins, final once place() returns) with the cold ones pointing there
+  void spark_cold_table(const std::vector<ds41::Record> &cold) {
+    size_t total = 0;
+    for (auto &r : cold) total += (size_t(r.bytes) + 4095) / 4096 * 4096;
+    CK(cudaHostAlloc(&spark_cold_host, total, cudaHostAllocMapped | cudaHostAllocPortable));
+    char *dev = nullptr;
+    CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&dev), spark_cold_host, 0));
+    CK(cudaDeviceSynchronize());   // the store's table writes (its own streams) are complete
+    spark_table.resize(size_t(ds41::expert_count) * sizeof(ds41::DeviceExpert));
+    CK(cudaMemcpy(spark_table.p, mtp_experts->table(), spark_table.bytes, cudaMemcpyDeviceToDevice));
+    size_t at = 0;
+    for (auto &r : cold) {
+      if (r.extents.size() != 1 || r.extents[0].dst_offset != 0 || r.extents[0].bytes != r.bytes)
+        throw std::runtime_error("DS41_SPARK_COLD: a drafter record must be one bank extent");
+      const auto &x = r.extents[0];
+      char *host = static_cast<char *>(spark_cold_host) + at;
+      const int fd = ::open(x.path.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd < 0) throw std::runtime_error("DS41_SPARK_COLD: open " + x.path);
+      size_t done = 0;
+      while (done < r.bytes) {
+        const ssize_t n = ::pread(fd, host + done, r.bytes - done, off_t(x.file_offset + done));
+        if (n <= 0) { ::close(fd); throw std::runtime_error("DS41_SPARK_COLD: short read " + x.path); }
+        done += size_t(n);
+      }
+      ::close(fd);
+      const auto *b = reinterpret_cast<const uint8_t *>(dev + at);
+      const ds41::DeviceExpert e{b + r.gate.offset, b + r.gate_scale.offset, b + r.up.offset, b + r.up_scale.offset,
+                                 b + r.down.offset, b + r.down_scale.offset, nullptr, 0, -1};
+      CK(cudaMemcpy(spark_table.as<ds41::DeviceExpert>(size_t(r.id) * sizeof(ds41::DeviceExpert)), &e, sizeof(e),
+                    cudaMemcpyHostToDevice));
+      at += (size_t(r.bytes) + 4095) / 4096 * 4096;
+    }
+  }
+  const ds41::DeviceExpert *spark_expert_table() {
+    return spark_table.p ? spark_table.as<ds41::DeviceExpert>() : spark_store().table();
   }
   void validate_records(const std::vector<ds41::Record> &records) {
     std::set<unsigned> seen;

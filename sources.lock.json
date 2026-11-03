@@ -36,7 +36,7 @@
         "third_party/include/ds41/dense.h"
       ],
       "files": 78,
-      "tree_sha256": "4c267d20dc8ca2ba3f3714760c187baa4f5e5dbf80c9a09b1b1ed33a4fd7613f"
+      "tree_sha256": "54c5135a7fe5e024068b9a07b16540093c3f67f8cb67101e04ecaef98176338f"
     },
     {
       "path": "components/moe",

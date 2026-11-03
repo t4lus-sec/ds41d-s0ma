@@ -461,6 +461,8 @@ class Native final : public Forward, public hotpath::GateEvidence {
   Device scores, top{512 * 4}, visible{4}, position_device{8}, blocks,
       block_visible{4}, chosen_blocks{2048 * 4}, candidate_ids{16384 * 4},
       candidate_top{512 * 4}, top_scratch;
+  // s0ma change 67: prefill's Engram projection batched, 8 prompt rows a call (pengram_rows)
+  Device pe_raw{8 * 24 * 264}, pe_bf{8 * 6144 * 2}, pe_kv{8 * (HC + 1) * H * 2}, pe_aq{8 * 6144}, pe_as{8 * 6144 / 32};
   Device rows_raw{24 * 256}, scales_raw{24 * 8}, rows_bf{24 * 256 * 2},
       engram_kv{(HC + 1) * H * 2}, rows_interleaved{24 * 264};
   Device braw_kv{6*512*4}, braw_score{6*512*4}, batch_tokens{6*4};

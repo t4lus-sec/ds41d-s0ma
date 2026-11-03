@@ -406,6 +406,43 @@ Json pmoe(int l,ds41e::prefill::Span span) {
 #include "batch.inc"
 #include "chunk.inc"
 
+// s0ma change 67: the Engram projection for up to 8 prompt rows in one FP8 call. pengram ran it one row at a time:
+// a full pass over the 157 MB wkv matrix for each row of the prompt, at layers 1 and 14 (~16,000 passes for an 8K
+// prompt). The n-gram rows do not depend on the hidden state, so all of a group's rows are copied, dequantized and
+// projected together; each row's gate then runs as before. Exact: the FP8 kernel keeps every k32 dot of each row and
+// adds them in ascending K whatever the row count (its other rows are other MMA columns), and the input quantization
+// is per 32 elements of a row. DS41_PREFILL_ENGRAM_BATCH=0 keeps the row-at-a-time path.
+static bool prefill_engram_batch() {
+  static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_ENGRAM_BATCH"); return !v || std::string(v) != "0"; }();
+  return on;
+}
+void pengram_rows(int layer,const char* raw,const int* rows,int count,Device& chunk_h) {
+  auto p="layers."+std::to_string(layer)+".engram";
+  auto &weight=w(p+".wkv.weight");
+  const bool fp8=weight.dtype=="F8_E4M3"||weight.dtype=="F8_E4M3FN";
+  if(!fp8||dense_of(p+".wkv")||weight.shape!=std::vector<uint64_t>({uint64_t((HC+1)*H),6144ull})) {
+    for(int i=0;i<count;++i) {   // not the native FP8 projection: the row-at-a-time path
+      char* row_h=chunk_h.as<char>(size_t(rows[i])*HC*H*2);
+      pcopy(h.p,row_h,HC*H*2);pengram(layer,raw+size_t(rows[i])*24*264);pcopy(row_h,h.p,HC*H*2);
+    }
+    return;
+  }
+  constexpr size_t R=24*264;
+  for(int i=0;i<count;++i)
+    CK(cudaMemcpyAsync(pe_raw.as<char>(size_t(i)*R),raw+size_t(rows[i])*R,R,cudaMemcpyHostToDevice,stream));
+  async_engram->dequant(pe_raw.p,pe_bf.p,24*count,stream);
+  CK(ds41_dense_quant(pe_bf.p,pe_aq.p,pe_as.p,count,6144,stream));
+  CK(ds41_dense_fp8(pe_aq.p,pe_as.p,weight.data.p,w(p+".wkv.scale").data.p,pe_kv.p,count,(HC+1)*H,6144,2,stream));
+  for(int i=0;i<count;++i) {
+    char* row_h=chunk_h.as<char>(size_t(rows[i])*HC*H*2);
+    const char* kv=pe_kv.as<char>(size_t(i)*(HC+1)*H*2);
+    pcopy(h.p,row_h,HC*H*2);
+    CK(ds41_dense_engram_gate(h.p,kv,kv+size_t(HC)*H*2,w(p+".q_weight").data.p,w(p+".k_weight").data.p,nullptr,
+                              next_h.p,1,H,1e-20f,stream));
+    std::swap(h,next_h);
+    pcopy(row_h,h.p,HC*H*2);
+  }
+}
 void pengram(int layer,const void* raw) {
   auto p="layers."+std::to_string(layer)+".engram";
   CK(cudaMemcpyAsync(rows_interleaved.p,raw,24*264,cudaMemcpyHostToDevice,stream));

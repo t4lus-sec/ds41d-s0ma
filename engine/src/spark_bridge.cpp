@@ -6,6 +6,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cuda_runtime_api.h>
+#include <cstdio>
+#include <memory>
+#include <numeric>
+#include <string>
+#include <unistd.h>
+#include <vector>
 #ifdef DS41_SPARK_POLICY_V2
 #include "ds41/spark_policy.h"
 #endif
@@ -96,6 +102,112 @@ class SparkTarget final : public Forward, public DraftProvider {
   std::unique_ptr<void, decltype(&cudaFree)> prompt_tail_{nullptr, cudaFree};
   std::string callback_error_;
 
+  // s0ma change 70: DS41_DRAFT_CAPTURE=DIR (the lab's draft capture; bench prompts only, never the service). For each
+  // speculative step verified on the GPU: per draft depth, the drafter's q and the target's p (the normalized
+  // measures the acceptance test used) as their top 64, the exact acceptance probability sum(min(p, q)) over the whole
+  // vocabulary, the Markov previous token and the confidence head's raw value; the bonus row's p; what was emitted.
+  // Lines of JSON (token ids and numbers only) in DIR/draft-PID.jsonl; the drafter's final hidden rows before
+  // mtp.2.norm (hd, BF16 [5, 5120]) in DIR/draft-PID.hd, record i at byte i * 51200. Reads only: tokens, draws and
+  // acceptance are what they are without it.
+  struct DraftCapture {
+    FILE *meta = nullptr, *hidden = nullptr;
+    uint64_t steps = 0, requests = 0;
+    std::vector<double> p, q;
+    std::vector<int> order;
+    std::vector<uint16_t> hd;
+    ~DraftCapture() { if (meta) std::fclose(meta); if (hidden) std::fclose(hidden); }
+  };
+  std::unique_ptr<DraftCapture> capture_ = [] {
+    const char *dir = std::getenv("DS41_DRAFT_CAPTURE");
+    if (!dir || !*dir) return std::unique_ptr<DraftCapture>();
+    auto c = std::make_unique<DraftCapture>();
+    const std::string base = std::string(dir) + "/draft-" + std::to_string(::getpid());
+    c->meta = std::fopen((base + ".jsonl").c_str(), "w");
+    c->hidden = std::fopen((base + ".hd").c_str(), "wb");
+    if (!c->meta || !c->hidden) throw std::runtime_error("DS41_DRAFT_CAPTURE: cannot write in " + std::string(dir));
+    return c;
+  }();
+  int capture_anchor_ = -1;
+  int64_t capture_position_ = -1;
+  const void *capture_hd_ = nullptr;
+  float capture_conf_[5] = {};
+  int capture_prev_[5] = {};
+  static constexpr int kCaptureTop = 64;
+  // the top kCaptureTop ids of row x (descending, lower id first on ties) as "[[id,prob],...]"
+  void capture_top(const double *x, size_t n, std::string &out) {
+    auto &o = capture_->order;
+    o.resize(n);
+    std::iota(o.begin(), o.end(), 0);
+    auto better = [x](int a, int b) { return x[a] > x[b] || (x[a] == x[b] && a < b); };
+    std::partial_sort(o.begin(), o.begin() + kCaptureTop, o.end(), better);
+    char buf[48];
+    out += '[';
+    for (int i = 0; i < kCaptureTop; ++i) {
+      std::snprintf(buf, sizeof(buf), "%s[%d,%.7g]", i ? "," : "", o[size_t(i)], x[o[size_t(i)]]);
+      out += buf;
+    }
+    out += ']';
+  }
+  void capture_step(const std::vector<int> &proposals, const std::vector<const double *> &q, double temperature,
+                    uint64_t seed, uint64_t step, const std::vector<int> &emitted, size_t accepted, bool rejected,
+                    bool cut) {
+    auto &c = *capture_;
+    const size_t n = size_t(vocab()), count = proposals.size();
+    auto stream = static_cast<cudaStream_t>(weights_.cuda_stream);
+    c.p.resize((count + 1) * n);
+    c.q.resize(std::max<size_t>(count, 1) * n);
+    cuda_checked(cudaMemcpyAsync(c.p.data(), verify_p_dev_, (count + 1) * n * sizeof(double), cudaMemcpyDeviceToHost,
+                                 stream));
+    for (size_t k = 0; k < count; ++k)
+      cuda_checked(cudaMemcpyAsync(c.q.data() + k * n, q[k], n * sizeof(double), cudaMemcpyDeviceToHost, stream));
+    long hd_index = -1;
+    if (capture_hd_) {
+      c.hd.resize(5 * 5120);
+      cuda_checked(cudaMemcpyAsync(c.hd.data(), capture_hd_, c.hd.size() * 2, cudaMemcpyDeviceToHost, stream));
+    }
+    cuda_checked(cudaStreamSynchronize(stream));
+    if (capture_hd_) {
+      if (std::fwrite(c.hd.data(), 2, c.hd.size(), c.hidden) != c.hd.size())
+        throw std::runtime_error("DS41_DRAFT_CAPTURE: hidden rows not written");
+      hd_index = long(c.steps);
+    }
+    std::string line;
+    line.reserve(16384);
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "{\"step\":%llu,\"request\":%llu,\"rng_step\":%llu,\"seed\":%llu,\"position\":%lld,\"anchor\":%d,"
+                  "\"temperature\":%.6g,\"width\":%zu,\"accepted\":%zu,\"rejected\":%d,\"cut\":%d,\"hd\":%ld,",
+                  (unsigned long long)c.steps, (unsigned long long)c.requests, (unsigned long long)step,
+                  (unsigned long long)seed, (long long)capture_position_, capture_anchor_, temperature, count,
+                  accepted, int(rejected), int(cut), hd_index);
+    line += buf;
+    line += "\"emitted\":[";
+    for (size_t i = 0; i < emitted.size(); ++i) line += (i ? "," : "") + std::to_string(emitted[i]);
+    line += "],\"depths\":[";
+    for (size_t k = 0; k < count; ++k) {
+      const double *pk = c.p.data() + k * n, *qk = c.q.data() + k * n;
+      double alpha = 0;
+      for (size_t i = 0; i < n; ++i) alpha += std::min(pk[i], qk[i]);
+      const int d = proposals[k];
+      const double conf = double(capture_conf_[k < 5 ? k : 4]);
+      char cbuf[32];
+      if (std::isfinite(conf)) std::snprintf(cbuf, sizeof(cbuf), "%.7g", conf); else std::snprintf(cbuf, sizeof(cbuf), "null");
+      std::snprintf(buf, sizeof(buf),
+                    "%s{\"draft\":%d,\"previous\":%d,\"confidence\":%s,\"alpha\":%.9g,\"p_draft\":%.7g,"
+                    "\"q_draft\":%.7g,\"p\":",
+                    k ? "," : "", d, capture_prev_[k < 5 ? k : 4], cbuf, alpha, pk[d], qk[d]);
+      line += buf;
+      capture_top(pk, n, line);
+      line += ",\"q\":";
+      capture_top(qk, n, line);
+      line += '}';
+    }
+    line += "],\"bonus_p\":";
+    capture_top(c.p.data() + count * n, n, line);
+    line += "}\n";
+    if (std::fputs(line.c_str(), c.meta) < 0) throw std::runtime_error("DS41_DRAFT_CAPTURE: record not written");
+    if (++c.steps % 64 == 0) { std::fflush(c.meta); std::fflush(c.hidden); }
+  }
   void check() const {
     if (poisoned_)
       throw std::runtime_error("native Spark adapter poisoned; restart ds41d");
@@ -257,6 +369,7 @@ public:
   int eos() const override { return target_->eos(); }
   void begin_request() override {
     check();
+    if (capture_) { ++capture_->requests; std::fflush(capture_->meta); std::fflush(capture_->hidden); }   // change 70
 #ifdef DS41_SPARK_POLICY_V2
     // Server attempt nonces restart on each request, including prefix reuse.
     if (policy2_pending_) throw std::logic_error("request during policy transaction");
@@ -515,6 +628,11 @@ public:
     const double started = clock_ms();
 #endif
     checked(ds41_spark_forward(spark_.get(), anchor, &u, &hd));
+    if (capture_) {   // s0ma change 70
+      capture_anchor_ = anchor; capture_hd_ = hd; capture_position_ = ds41_spark_committed(spark_.get());
+      std::fill(capture_conf_, capture_conf_ + 5, std::numeric_limits<float>::quiet_NaN());
+      std::fill(capture_prev_, capture_prev_ + 5, -1);
+    }
 #ifdef DS41_SPARK_POLICY_V2
     if (policy2_pending_) {
       const float *data = nullptr, *confidence = nullptr;
@@ -584,6 +702,7 @@ public:
     if (token < 0 || size_t(token) >= n || !std::isfinite(c))
       throw std::runtime_error(token == -2 ? "draft logits not finite" : "GPU draft draw found no token");
     last_confidence_ = *confidence_host_;
+    if (capture_) { capture_conf_[k] = last_confidence_; capture_prev_[k] = previous; }   // change 70
     out.token = token;
     out.confidence = c;
     out.head = last_confidence_;
@@ -646,6 +765,7 @@ public:
         rejected = host.rejected;
       }
     }
+    if (capture_) capture_step(proposals, q, temperature, seed, step, emitted, accepted, rejected, cut);   // change 70
     return true;
   }
   void fetch_q(const double *q_device, std::vector<double> &out) override {
@@ -675,6 +795,7 @@ public:
                                  cudaMemcpyDeviceToHost, stream));
     cuda_checked(cudaStreamSynchronize(stream));
     last_confidence_ = *confidence_host_;
+    if (capture_ && k >= 0 && k < 5) { capture_conf_[k] = last_confidence_; capture_prev_[k] = previous; }   // change 70
     return out;
   }
   void complete(const DraftObservation &o, bool censored) override {

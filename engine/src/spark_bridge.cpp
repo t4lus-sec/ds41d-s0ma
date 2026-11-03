@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cuda_runtime_api.h>
 #include <cstdio>
+#include <istream>
+#include <ostream>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -553,6 +555,37 @@ public:
     prompt_rows_ = captures_seen_ = tail_rows_ = 0;
     append_pending_ = false; tail_limit_ = append_old_ = 0;
     seed_mode_ = "loaded-conversation";
+  }
+  // s0ma change 81: "DS41SCV1", the drafter's committed length and rings, then the target's own bytes
+  bool write_conversation(const Snapshot &base, std::ostream &out) const override {
+    auto *s = dynamic_cast<const SparkConversation *>(&base);
+    if (!s || !s->target) return false;
+    const uint64_t committed = uint64_t(s->spark_committed), n = s->rings.size();
+    out.write("DS41SCV1", 8);
+    out.write(reinterpret_cast<const char *>(&committed), 8);
+    out.write(reinterpret_cast<const char *>(&n), 8);
+    out.write(reinterpret_cast<const char *>(s->rings.data()), std::streamsize(n));
+    return bool(out) && target_->write_conversation(*s->target, out);
+  }
+  std::shared_ptr<Snapshot> read_conversation(std::istream &in) const override {
+    char magic[8];
+    uint64_t committed = 0, n = 0;
+    in.read(magic, 8);
+    in.read(reinterpret_cast<char *>(&committed), 8);
+    in.read(reinterpret_cast<char *>(&n), 8);
+    if (!in || std::memcmp(magic, "DS41SCV1", 8)) throw std::runtime_error("conversation file: not a Spark conversation");
+    if (n != ds41_spark_state_bytes()) throw std::runtime_error("conversation file: drafter state size");
+    auto s = std::make_shared<SparkConversation>();
+    s->rings.resize(n);
+    in.read(reinterpret_cast<char *>(s->rings.data()), std::streamsize(n));
+    if (!in) throw std::runtime_error("conversation file: truncated");
+    s->target = target_->read_conversation(in);
+    if (!s->target) return nullptr;
+    s->spark_committed = int64_t(committed);
+    s->position = s->target->position;
+    if (s->spark_committed != s->position) throw std::runtime_error("conversation file: drafter and target lengths differ");
+    s->host_bytes = s->target->host_bytes + n;
+    return s;
   }
   std::map<std::string, std::vector<uint8_t>> live_state() override {
     return target_->live_state();

@@ -327,12 +327,56 @@ def environment(cfg, render=True):
                    str(max(1, -(-2 * cfg['max_context'] * 1024 // 2**30) + 1) if cfg['max_context'] > 262144 else 1))
     # the pinned cuBLAS pair (dist/blas) before CUDA 13.4's own libraries (cudart, cuFile)
     env['LD_LIBRARY_PATH'] = f'{dist}:{dist}/blas:{cuda_lib()}'
+    # s0ma change 81: the conversations saved to disk (ds41d's server: a restarted engine reads none of a known prompt
+    # again), keyed by a tag of everything that shapes a conversation's state; a lab --env DS41_CONVERSATIONS_* wins
+    # (the lab turns the disk off: its benchmark prompts must be read cold every run)
+    env.setdefault('DS41_CONVERSATIONS_DIR', str(ROOT / 'conversations'))
+    env.setdefault('DS41_CONVERSATIONS_DISK_GIB', '32')
     if gds(cfg):
         env.update(GDS_ENV)
         env['CUFILE_ENV_PATH_JSON'] = str(cufile_config(cfg) if render else runtime_dir(cfg) / 'cufile.json')
         if mount_needs_shim(Path(cfg['weights'])):
             env['LD_PRELOAD'] = str(dist / 'mountinfo_shim.so')
+    env['DS41_CONVERSATIONS_TAG'] = conversations_tag(cfg, env)
     return env
+
+
+def conversations_tag(cfg, env):
+    """s0ma change 81: a digest of what shapes a saved conversation's bytes: the build's files (size and mtime: a
+    rebuild changes it), the engine's arguments but the socket and the RAM tier, each file or bank they name, and
+    every DS41_* setting but the disk cache's own. A file of another tag is never loaded."""
+    import hashlib
+
+    def stamp(value):
+        q = Path(value)
+        try:
+            if q.is_dir():
+                r = q / 'receipts.json'
+                q = r if r.exists() else q
+            st = q.stat()
+            return f'{q}:{st.st_size}:{st.st_mtime_ns}'
+        except (OSError, ValueError):
+            return None
+
+    parts = []
+    dist = Path(cfg['build']) / 'dist'
+    if dist.is_dir():
+        parts += [stamp(f) for f in sorted(dist.rglob('*')) if f.is_file()]
+    cmd, skip, i = command(cfg, 'socket'), {'--socket', '--host-gib'}, 0
+    while i < len(cmd):
+        if cmd[i] in skip:
+            i += 2
+            continue
+        parts.append(cmd[i])
+        if str(cmd[i]).startswith('/'):
+            parts.append(stamp(cmd[i]))
+        i += 1
+    for k in sorted(env):
+        if k.startswith('DS41_') and not k.startswith('DS41_CONVERSATIONS'):
+            parts.append(f'{k}={env[k]}')
+            if str(env[k]).startswith('/'):
+                parts.append(stamp(env[k]))
+    return hashlib.sha256('\n'.join(p for p in parts if p).encode()).hexdigest()
 
 
 def api_command(cfg, socket):

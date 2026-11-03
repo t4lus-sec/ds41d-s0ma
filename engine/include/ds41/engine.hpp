@@ -152,6 +152,12 @@ public:
   // place of whatever sequence is live. nullptr: unsupported. host_bytes is what the snapshot holds.
   virtual std::shared_ptr<Snapshot> save_conversation() { return nullptr; }
   virtual void load_conversation(const Snapshot &) { throw std::logic_error("load_conversation unsupported"); }
+  // s0ma change 81: a conversation snapshot as bytes (the server's disk cache), and back. The bytes are only the
+  // snapshot's own (nothing about the build or the bank: the server keys files by an identity tag). write: false =
+  // unsupported. read: validates every size against this engine's arenas before returning, so a state it returns
+  // loads without failing on shape; nullptr = unsupported. Both may run beside requests (they touch no engine state).
+  virtual bool write_conversation(const Snapshot &, std::ostream &) const { return false; }
+  virtual std::shared_ptr<Snapshot> read_conversation(std::istream &) const { return nullptr; }
   virtual std::vector<int> cached_prefix() const { return {}; }
   // Diagnostic only: position-addressed, logically live bytes for X3/X3b.
   virtual std::map<std::string,std::vector<uint8_t>> live_state() {

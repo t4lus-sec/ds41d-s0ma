@@ -1341,6 +1341,75 @@ public:
       CK(cudaStreamSynchronize(stream));
     } catch (...) { poisoned = true; throw; }
   }
+  // s0ma change 81: ConversationState as bytes (the server's disk cache). Layout: "DS41NCV1", position, the rings
+  // (count, then each size and bytes), the global owners (count, then layer and its four arenas), the hash
+  // history and the committed ids. read_conversation checks every size against this engine's arenas.
+  bool write_conversation(const Snapshot &base, std::ostream &out) const override {
+    auto *s = dynamic_cast<const ConversationState *>(&base);
+    if (!s) return false;
+    auto u64 = [&](uint64_t v) { out.write(reinterpret_cast<const char *>(&v), 8); };
+    auto bytes = [&](const void *p, size_t n) { u64(n); if (n) out.write(static_cast<const char *>(p), std::streamsize(n)); };
+    out.write("DS41NCV1", 8);
+    u64(uint64_t(s->position));
+    u64(s->windows.size());
+    for (auto &w : s->windows) bytes(w.data(), w.size());
+    u64(s->globals.size());
+    for (auto &[l, r] : s->globals) { u64(uint64_t(l)); for (auto &v : r) bytes(v.data(), v.size()); }
+    bytes(s->hash.data(), s->hash.size() * 8);
+    bytes(s->prefix_ids.data(), s->prefix_ids.size() * 4);
+    return bool(out);
+  }
+  std::shared_ptr<Snapshot> read_conversation(std::istream &in) const override {
+    auto fail = [](const char *what) -> std::shared_ptr<Snapshot> { throw std::runtime_error(std::string("conversation file: ") + what); };
+    auto u64 = [&] { uint64_t v = 0; in.read(reinterpret_cast<char *>(&v), 8); if (!in) fail("truncated"); return v; };
+    auto bytes = [&](std::vector<uint8_t> &dst, uint64_t most) {
+      const uint64_t n = u64();
+      if (n > most) fail("an arena larger than this engine's");
+      dst.resize(n);
+      if (n) in.read(reinterpret_cast<char *>(dst.data()), std::streamsize(n));
+      if (!in) fail("truncated");
+    };
+    char magic[8];
+    in.read(magic, 8);
+    if (!in || std::memcmp(magic, "DS41NCV1", 8)) return fail("not a native conversation");
+    auto s = std::make_shared<ConversationState>();
+    s->position = int64_t(u64());
+    if (s->position < 1 || s->position > config.max_context) return fail("position");
+    if (u64() != windows.size()) return fail("ring count");
+    for (auto &w : windows) {
+      s->windows.emplace_back();
+      bytes(s->windows.back(), w.bytes);
+      if (s->windows.back().size() != w.bytes) return fail("ring size");
+      s->host_bytes += w.bytes;
+    }
+    if (u64() != globals.size()) return fail("global owner count");
+    for (size_t i = 0; i < globals.size(); ++i) {
+      const int l = int(u64());
+      auto g = globals.find(l);
+      if (g == globals.end() || s->globals.count(l)) return fail("global owner");
+      auto &r = s->globals[l];
+      bytes(r[0], g->second->raw_kv.bytes);
+      bytes(r[1], g->second->raw_score.bytes);
+      bytes(r[2], g->second->kv.bytes);
+      bytes(r[3], g->second->key.bytes);
+      if (r[0].size() != g->second->raw_kv.bytes || r[1].size() != g->second->raw_score.bytes) return fail("raw arena size");
+      const size_t entries = std::min<size_t>(size_t(g->second->capacity), size_t((s->position + g->second->ratio - 1) / g->second->ratio));
+      if (r[2].size() != entries * 288 || r[3].size() != entries * 68) return fail("compressed entries");
+      for (auto &v : r) s->host_bytes += v.size();
+    }
+    std::vector<uint8_t> raw;
+    bytes(raw, (uint64_t(config.max_context) + 8) * 8);   // by absolute position: at least the committed ones
+    if (raw.size() % 8 || raw.size() / 8 < size_t(s->position)) return fail("hash history");
+    s->hash.resize(raw.size() / 8);
+    if (!raw.empty()) std::memcpy(s->hash.data(), raw.data(), raw.size());
+    bytes(raw, uint64_t(config.max_context) * 4);
+    if (raw.size() != size_t(s->position) * 4) return fail("committed ids");
+    s->prefix_ids.resize(size_t(s->position));
+    std::memcpy(s->prefix_ids.data(), raw.data(), raw.size());
+    for (int id : s->prefix_ids) if (id < 0 || id >= V) return fail("committed id");
+    s->host_bytes += s->hash.size() * 8 + s->prefix_ids.size() * 4;
+    return s;
+  }
   void reset() override {
     begin_request();
     committed = 0;

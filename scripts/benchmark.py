@@ -78,7 +78,7 @@ def run_seed(cfg, seed, workdir):
     log = (workdir / f'engine-{seed}.log').open('w')
     start = time.perf_counter()
     engine = subprocess.Popen(run.command(cfg, path), stdout=log, stderr=subprocess.STDOUT,
-                              env=run.environment(cfg))
+                              env={**run.environment(cfg), 'DS41_CONVERSATIONS_DISK_GIB': '0'})   # s0ma change 81: always cold
     try:
         while not path.exists():
             if engine.poll() is not None:

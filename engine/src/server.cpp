@@ -7,6 +7,11 @@
 #include <cmath>
 #include <condition_variable>
 #include <csignal>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <sys/time.h>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -401,8 +406,14 @@ class Service {
     }
     if (!state) return;
     Saved e{prefix.conversation, prefix.inputs, prefix.keys, prefix.logits, state, 0};
-    e.bytes = state->host_bytes + e.inputs.size() * 4 + e.keys.size() * 8 + e.logits.size() * 4;
-    if (e.bytes > budget) return;
+    if (disk_on()) disk_enqueue(e);   // s0ma change 81 (also when RAM cannot hold it)
+    if (remember(std::move(e))) ++conversation_saves;
+  }
+  // the RAM list's own bookkeeping: an entry in at the front, the prompts it extends out, the oldest out past the budget
+  bool remember(Saved e) {
+    const size_t budget = conversations_budget();
+    e.bytes = e.state->host_bytes + e.inputs.size() * 4 + e.keys.size() * 8 + e.logits.size() * 4;
+    if (!budget || e.bytes > budget) return false;
     // an earlier prompt of the same conversation that this one extends is no longer needed
     for (auto it = saved.begin(); it != saved.end();) {
       if ((prefix_any || it->conversation == e.conversation) && it->keys.size() <= e.keys.size() &&
@@ -413,11 +424,352 @@ class Service {
     }
     saved_bytes += e.bytes;
     saved.push_front(std::move(e));
-    ++conversation_saves;
-    while (saved_bytes > budget && !saved.empty()) {
+    while (saved_bytes > budget && saved.size() > 1) {
       saved_bytes -= saved.back().bytes;
       saved.pop_back();
       ++conversation_evictions;
+    }
+    return true;
+  }
+  // s0ma change 81: the saved conversations on disk too, so a restarted ds41d reads none of a known prompt again.
+  // Every RAM save is also written, in the background, to DS41_CONVERSATIONS_DIR (one file a prompt: identity tag,
+  // conversation, ids, keys, the prompt's last logits, then the model's own bytes via Forward::write_conversation),
+  // written to a temporary name and renamed. A file is used only when its tag equals DS41_CONVERSATIONS_TAG, which
+  // run.py builds from everything that shapes the state (the build's files, the bank, the settings), so a rebuilt
+  // or reconfigured engine never loads another's state. At start the directory is indexed (headers only); a request
+  // that no RAM entry serves as far loads the longest matching file, then keeps it in RAM. A file a newer one extends
+  // is deleted; past DS41_CONVERSATIONS_DISK_GIB the least recently used go first. Off unless the tag and a budget are
+  // set (run.py sets them for serving; the lab sets the budget to 0).
+  struct DiskEntry {
+    std::string path, conversation;
+    std::vector<uint64_t> keys;   // empty for another tag's file (counted for the budget only)
+    uint64_t bytes = 0;
+    int64_t used = 0;             // ns: the file's mtime, refreshed on each load
+    bool ours = false;
+  };
+  struct DiskJob { Saved e; std::chrono::steady_clock::time_point at; };
+  std::mutex disk_m;
+  std::condition_variable disk_cv;
+  std::list<DiskEntry> disk;
+  std::deque<DiskJob> disk_jobs;
+  bool disk_stop = false;
+  std::thread disk_writer;
+  std::string disk_dir, disk_tag;
+  uint64_t disk_budget = 0, disk_writes = 0, disk_loads = 0, disk_deletes = 0, disk_failures = 0, disk_skipped = 0;
+  double disk_write_ms = 0, disk_read_ms = 0;
+  bool disk_on() const { return disk_budget && !disk_tag.empty(); }
+  std::atomic<int> active{0};   // requests holding the engine
+  size_t disk_queued_bytes = 0;
+  // a 64-bit digest of a byte stream, eight bytes at a time (any chunking gives the same value)
+  struct Digest {
+    uint64_t h = 0x9E3779B97F4A7C15ull, total = 0;
+    uint8_t carry[8];
+    int n = 0;
+    void word(uint64_t w) { h = (h ^ w) * 0xBF58476D1CE4E5B9ull; h ^= h >> 31; }
+    void add(const void *p, size_t len) {
+      auto *b = static_cast<const uint8_t *>(p);
+      total += len;
+      while (len && n) { carry[n++] = *b++; --len; if (n == 8) { uint64_t w; std::memcpy(&w, carry, 8); word(w); n = 0; } }
+      for (; len >= 8; b += 8, len -= 8) { uint64_t w; std::memcpy(&w, b, 8); word(w); }
+      while (len--) carry[n++] = *b++;
+    }
+    uint64_t done() {
+      uint64_t w = 0;
+      std::memcpy(&w, carry, size_t(n));
+      word(w ^ (total << 3));
+      return h;
+    }
+  };
+  // the writer's sink: every byte digested; every 32 MiB it yields to a request holding the engine, unless the job
+  // has waited 60 s (so a busy s0ma still gets its files)
+  struct WriteBuf : std::streambuf {
+    std::streambuf *out;
+    Digest d;
+    std::atomic<int> &active;
+    std::chrono::steady_clock::time_point due;
+    size_t since = 0;
+    WriteBuf(std::streambuf *o, std::atomic<int> &a, std::chrono::steady_clock::time_point t) : out(o), active(a), due(t) {}
+    std::streamsize xsputn(const char *p, std::streamsize n) override {
+      d.add(p, size_t(n));
+      since += size_t(n);
+      if (since >= (size_t(32) << 20)) {
+        since = 0;
+        while (active.load() > 0 && std::chrono::steady_clock::now() < due)
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      return out->sputn(p, n);
+    }
+    int_type overflow(int_type c) override {
+      if (traits_type::eq_int_type(c, traits_type::eof())) return traits_type::not_eof(c);
+      const char ch = traits_type::to_char_type(c);
+      return xsputn(&ch, 1) == 1 ? c : traits_type::eof();
+    }
+  };
+  static void put(std::ostream &out, const void *p, size_t n) { out.write(static_cast<const char *>(p), std::streamsize(n)); }
+  static void put64(std::ostream &out, uint64_t v) { put(out, &v, 8); }
+  static uint64_t get64(std::istream &in) {
+    uint64_t v = 0; in.read(reinterpret_cast<char *>(&v), 8);
+    if (!in) throw std::runtime_error("conversation file: truncated");
+    return v;
+  }
+  static std::string get_string(std::istream &in, uint64_t most) {
+    const uint64_t n = get64(in);
+    if (n > most) throw std::runtime_error("conversation file: header");
+    std::string v(n, '\0');
+    in.read(v.data(), std::streamsize(n));
+    if (!in) throw std::runtime_error("conversation file: truncated");
+    return v;
+  }
+  static int64_t mtime_ns(const std::string &path) {
+    struct stat st {};
+    return ::stat(path.c_str(), &st) ? 0 : int64_t(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
+  }
+  // the header up to the keys: (tag, conversation, keys); false when not a conversation file
+  static bool read_header(std::istream &in, std::string &tag, std::string &conversation, std::vector<int> &inputs,
+                          std::vector<uint64_t> &keys) {
+    char magic[8];
+    in.read(magic, 8);
+    if (!in || std::memcmp(magic, "DS41CV01", 8)) return false;
+    tag = get_string(in, 4096);
+    conversation = get_string(in, 4096);
+    const uint64_t n = get64(in);
+    if (n == 0 || n > (uint64_t(1) << 24)) throw std::runtime_error("conversation file: length");
+    inputs.resize(n);
+    keys.resize(n);
+    in.read(reinterpret_cast<char *>(inputs.data()), std::streamsize(n * 4));
+    in.read(reinterpret_cast<char *>(keys.data()), std::streamsize(n * 8));
+    if (!in) throw std::runtime_error("conversation file: truncated");
+    return true;
+  }
+  void disk_open() {   // never throws: on any trouble the disk cache stays off
+    try { disk_open_or_throw(); } catch (const std::exception &e) {
+      std::cerr << "conversations on disk: off (" << e.what() << ")\n";
+      disk_budget = 0; disk_tag.clear(); disk.clear(); disk_bytes_all = 0;
+    }
+  }
+  void disk_open_or_throw() {
+    const char *dir = std::getenv("DS41_CONVERSATIONS_DIR"), *tag = std::getenv("DS41_CONVERSATIONS_TAG"),
+               *gib = std::getenv("DS41_CONVERSATIONS_DISK_GIB");
+    const double g = gib && *gib ? std::strtod(gib, nullptr) : 0.0;
+    if (!std::isfinite(g) || g < 0 || g > 4096) throw std::invalid_argument("DS41_CONVERSATIONS_DISK_GIB must be 0..4096");
+    if (!dir || !*dir || !tag || !*tag || !(g > 0) || !prefix_cache) return;
+    disk_dir = dir;
+    disk_tag = tag;
+    disk_budget = uint64_t(g * double(uint64_t(1) << 30));
+    std::error_code ec;
+    std::filesystem::create_directories(disk_dir, ec);
+    ::chmod(disk_dir.c_str(), 0700);   // the files hold s0ma's token ids
+    size_t ours = 0;
+    for (auto &f : std::filesystem::directory_iterator(disk_dir, ec)) {
+      const std::string path = f.path().string();
+      if (path.size() > 13 && path.compare(path.size() - 13, 13, ".ds41conv.tmp") == 0) {   // a write cut short
+        std::filesystem::remove(f.path(), ec);
+        continue;
+      }
+      if (f.path().extension() != ".ds41conv") continue;
+      DiskEntry d;
+      d.path = path;
+      d.bytes = uint64_t(f.file_size(ec));
+      d.used = mtime_ns(path);
+      try {
+        std::ifstream in(path, std::ios::binary);
+        std::string t;
+        std::vector<int> inputs;
+        if (read_header(in, t, d.conversation, inputs, d.keys) && t == disk_tag) { d.ours = true; ++ours; }
+        else d.keys.clear();
+      } catch (const std::exception &) { d.keys.clear(); }
+      disk.push_back(std::move(d));
+    }
+    for (auto &d : disk) disk_bytes_all += d.bytes;
+    std::cerr << "conversations on disk (" << disk_dir << "): " << ours << " for this engine of " << disk.size()
+              << ", " << double(disk_bytes_all) / double(uint64_t(1) << 30) << " GiB of "
+              << double(disk_budget) / double(uint64_t(1) << 30) << "\n";
+    disk_writer = std::thread([this] { disk_loop(); });
+  }
+  uint64_t disk_bytes_all = 0;
+  // queued states are held beside the RAM list (each about its conversation's KV): at most a budget's worth, and a
+  // queued prompt that this one extends is not written at all
+  void disk_enqueue(const Saved &e) {
+    std::lock_guard<std::mutex> l(disk_m);
+    for (auto it = disk_jobs.begin(); it != disk_jobs.end();) {
+      const auto &k = it->e.keys;
+      if ((prefix_any || it->e.conversation == e.conversation) && k.size() <= e.keys.size() &&
+          std::equal(k.begin(), k.end(), e.keys.begin())) {
+        disk_queued_bytes -= it->e.state->host_bytes;
+        it = disk_jobs.erase(it);
+      } else ++it;
+    }
+    const size_t limit = std::max(conversations_budget(), size_t(1) << 30);
+    if (disk_jobs.size() >= 4 || disk_queued_bytes + e.state->host_bytes > limit) { ++disk_skipped; return; }
+    disk_queued_bytes += e.state->host_bytes;
+    disk_jobs.push_back({e, std::chrono::steady_clock::now()});
+    disk_cv.notify_one();
+  }
+  static std::string file_name(const Saved &e) {
+    uint64_t h = 1469598103934665603ull;   // FNV-1a over the conversation and the keys
+    auto mix = [&](const void *p, size_t n) { auto *b = static_cast<const uint8_t *>(p); for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; } };
+    mix(e.conversation.data(), e.conversation.size());
+    mix(e.keys.data(), e.keys.size() * 8);
+    char name[48];
+    std::snprintf(name, sizeof name, "%016llx-%zu.ds41conv", static_cast<unsigned long long>(h), e.keys.size());
+    return name;
+  }
+  void disk_loop() {
+    for (;;) {
+      DiskJob job;
+      {
+        std::unique_lock<std::mutex> l(disk_m);
+        disk_cv.wait(l, [&] { return disk_stop || !disk_jobs.empty(); });
+        if (disk_jobs.empty()) return;
+        job = std::move(disk_jobs.front());
+        disk_jobs.pop_front();
+        disk_queued_bytes -= job.e.state->host_bytes;
+      }
+      // not while a request runs (its decode reads Engram rows from the drive), unless the job has waited 60 s
+      const auto due = job.at + std::chrono::seconds(60);
+      while (active.load() > 0 && std::chrono::steady_clock::now() < due && !disk_stop)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      const auto t0 = std::chrono::steady_clock::now();
+      const Saved &e = job.e;
+      const std::string path = disk_dir + "/" + file_name(e), tmp = path + ".tmp";   // (*.ds41conv.tmp)
+      bool ok = false;
+      try {
+        {
+          const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+          if (fd < 0) throw std::runtime_error("open " + tmp);
+          ::close(fd);
+          std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+          WriteBuf sink(file.rdbuf(), active, job.at + std::chrono::seconds(60));
+          std::ostream out(&sink);
+          out.write("DS41CV01", 8);
+          put64(out, disk_tag.size()); put(out, disk_tag.data(), disk_tag.size());
+          put64(out, e.conversation.size()); put(out, e.conversation.data(), e.conversation.size());
+          put64(out, e.inputs.size());
+          put(out, e.inputs.data(), e.inputs.size() * 4);
+          put(out, e.keys.data(), e.keys.size() * 8);
+          put64(out, e.logits.size()); put(out, e.logits.data(), e.logits.size() * 4);
+          if (!model->write_conversation(*e.state, out)) throw std::runtime_error("this model cannot write its state");
+          // the digest of every byte before it, then the end marker (both outside the digest)
+          const uint64_t digest = sink.d.done();
+          file.write(reinterpret_cast<const char *>(&digest), 8);
+          file.write("DS41END1", 8);
+          file.flush();
+          if (!out || !file) throw std::runtime_error("write " + tmp + " (disk full?)");
+        }
+        {   // on the drive before the name is: a crash leaves the old file or the new one, never half of it
+          const int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC);
+          if (fd < 0 || ::fdatasync(fd)) { if (fd >= 0) ::close(fd); throw std::runtime_error("fdatasync " + tmp); }
+          ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   // out of the page cache: s0ma's next turn needs RAM more
+          ::close(fd);
+        }
+        std::filesystem::rename(tmp, path);
+        ok = true;
+      } catch (const std::exception &x) {
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        std::cerr << "conversation write failed: " << x.what() << "\n";
+      }
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      std::lock_guard<std::mutex> l(disk_m);
+      disk_write_ms += ms;
+      if (!ok) { ++disk_failures; continue; }
+      ++disk_writes;
+      std::error_code ec;
+      // the files this one extends (and an older copy of itself) go
+      for (auto it = disk.begin(); it != disk.end();) {
+        const bool extended = it->ours && (prefix_any || it->conversation == e.conversation) &&
+            it->keys.size() <= e.keys.size() && std::equal(it->keys.begin(), it->keys.end(), e.keys.begin());
+        if (extended || it->path == path) {
+          if (it->path != path) { std::filesystem::remove(it->path, ec); ++disk_deletes; }
+          disk_bytes_all -= it->bytes;
+          it = disk.erase(it);
+        } else ++it;
+      }
+      DiskEntry d{path, e.conversation, e.keys, uint64_t(std::filesystem::file_size(path, ec)), mtime_ns(path), true};
+      disk_bytes_all += d.bytes;
+      disk.push_back(std::move(d));
+      while (disk_bytes_all > disk_budget && disk.size() > 1) {   // least recently used first, never the newest
+        auto oldest = std::min_element(disk.begin(), std::prev(disk.end()),
+                                       [](const DiskEntry &a, const DiskEntry &b) { return a.used < b.used; });
+        std::filesystem::remove(oldest->path, ec);
+        ++disk_deletes;
+        disk_bytes_all -= oldest->bytes;
+        disk.erase(oldest);
+      }
+    }
+  }
+  // the longest file of this engine whose keys begin this request's and are longer than `beyond`, read in full
+  std::optional<Saved> disk_read(const std::string &conversation, const std::vector<uint64_t> &keys, size_t beyond) {
+    std::string path;
+    {
+      std::lock_guard<std::mutex> l(disk_m);
+      const DiskEntry *best = nullptr;
+      for (auto &d : disk)
+        if (d.ours && (prefix_any || (!conversation.empty() && d.conversation == conversation)) &&
+            d.keys.size() > beyond && d.keys.size() <= keys.size() &&
+            std::equal(d.keys.begin(), d.keys.end(), keys.begin()) && (!best || d.keys.size() > best->keys.size()))
+          best = &d;
+      if (!best) return std::nullopt;
+      path = best->path;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+      {   // the digest first: every byte but the last 16 (the digest and the end marker)
+        std::ifstream whole(path, std::ios::binary);
+        whole.seekg(0, std::ios::end);
+        const int64_t size = int64_t(whole.tellg());
+        if (size < 64) throw std::runtime_error("conversation file: too short");
+        whole.seekg(0);
+        Digest d;
+        std::vector<char> buf(size_t(8) << 20);
+        for (int64_t left = size - 16; left > 0;) {
+          const std::streamsize n = std::streamsize(std::min<int64_t>(left, int64_t(buf.size())));
+          whole.read(buf.data(), n);
+          if (!whole) throw std::runtime_error("conversation file: truncated");
+          d.add(buf.data(), size_t(n));
+          left -= n;
+        }
+        uint64_t stored = 0;
+        char end[8];
+        whole.read(reinterpret_cast<char *>(&stored), 8);
+        whole.read(end, 8);
+        if (!whole || std::memcmp(end, "DS41END1", 8)) throw std::runtime_error("conversation file: end marker");
+        if (stored != d.done()) throw std::runtime_error("conversation file: digest (damaged)");
+      }
+      std::ifstream in(path, std::ios::binary);
+      Saved e;
+      std::string tag;
+      if (!read_header(in, tag, e.conversation, e.inputs, e.keys) || tag != disk_tag)
+        throw std::runtime_error("conversation file: header");
+      const uint64_t v = get64(in);
+      if (v != uint64_t(model->vocab())) throw std::runtime_error("conversation file: logits");
+      e.logits.resize(v);
+      in.read(reinterpret_cast<char *>(e.logits.data()), std::streamsize(v * 4));
+      if (!in) throw std::runtime_error("conversation file: truncated");
+      e.state = model->read_conversation(in);
+      if (!e.state || e.state->position != int64_t(e.inputs.size())) throw std::runtime_error("conversation file: state");
+      for (size_t i = 0; i < e.inputs.size(); ++i)   // the keys are the ids but at image positions (their digests)
+        if (e.inputs[i] < 0 || e.inputs[i] >= model->vocab()) throw std::runtime_error("conversation file: ids");
+      uint64_t digest = 0;
+      char end[8];
+      in.read(reinterpret_cast<char *>(&digest), 8);
+      in.read(end, 8);
+      if (!in || std::memcmp(end, "DS41END1", 8)) throw std::runtime_error("conversation file: end marker");
+      std::lock_guard<std::mutex> l(disk_m);
+      disk_read_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      ++disk_loads;
+      ::utimensat(AT_FDCWD, path.c_str(), nullptr, 0);   // least recently used is by mtime, across restarts too
+      for (auto &d : disk) if (d.path == path) d.used = mtime_ns(path);
+      return e;
+    } catch (const std::exception &x) {
+      std::cerr << "conversation file unusable (" << path << "): " << x.what() << "\n";
+      std::lock_guard<std::mutex> l(disk_m);
+      ++disk_failures;
+      std::error_code ec;
+      std::filesystem::remove(path, ec);   // damaged or unusable: never tried again
+      for (auto it = disk.begin(); it != disk.end(); ++it)
+        if (it->path == path) { disk_bytes_all -= it->bytes; disk.erase(it); break; }
+      return std::nullopt;
     }
   }
   // the saved prompt that is the longest prefix of this request's (its conversation, or any with prefix_any)
@@ -439,13 +791,20 @@ public:
   std::atomic<int> connections{0};
   Service(std::unique_ptr<Forward> m, int c, bool reuse, bool any = false, size_t dense_batch = 1)
       : model(std::move(m)), context(c), prefix_cache(reuse), prefix_any(any),
-        prefill_dense_batch(dense_batch) {}
+        prefill_dense_batch(dense_batch) { disk_open(); }   // s0ma change 81
+  ~Service() {
+    { std::lock_guard<std::mutex> l(disk_m); disk_stop = true; }
+    disk_cv.notify_all();
+    if (disk_writer.joinable()) disk_writer.join();   // pending writes finish first
+  }
   void handle(int fd) {
     std::string id, pending, line;
     std::shared_ptr<Live> state;
     int prompt = 0, completed = 0;
     bool finished = false, registered = false;
     std::unique_lock<std::mutex> run(serial, std::defer_lock);
+    bool counted = false;   // s0ma change 81: this connection holds the engine (the disk writer defers to it)
+    struct Uncount { std::atomic<int> &a; bool &c; ~Uncount() { if (c) --a; } } uncount{active, counted};
     auto finish = [&](std::string reason, Json error = nullptr,
                       Json stats = Json::object()) {
       if (finished)
@@ -565,6 +924,7 @@ public:
             break;
           std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        if (run.owns_lock() && !counted) { counted = true; ++active; }   // s0ma change 81: the disk writer waits
         if (cancelled()) {
           finish("cancelled");
           break;
@@ -659,21 +1019,25 @@ public:
             reused = 0;
           }
         }
-        bool loaded = false;
-        if (!reused && prefix_cache && !saved.empty()) {   // s0ma change 73
+        bool loaded = false, from_file = false;
+        if (!reused && prefix_cache && (!saved.empty() || disk_on())) {   // s0ma change 73 (81: or from disk)
           auto best = find_saved(conversation, keys);
-          if (best != saved.end()) {
+          std::optional<Saved> file;
+          if (disk_on()) file = disk_read(conversation, keys, best != saved.end() ? best->keys.size() : 0);
+          const Saved *use = file ? &*file : best != saved.end() ? &*best : nullptr;
+          if (use) {
             try {
-              model->load_conversation(*best->state);
+              model->load_conversation(*use->state);
               prefix = {};
-              prefix.conversation = best->conversation;
-              prefix.inputs = best->inputs;
-              prefix.keys = best->keys;
-              prefix.logits = best->logits;
+              prefix.conversation = use->conversation;
+              prefix.inputs = use->inputs;
+              prefix.keys = use->keys;
+              prefix.logits = use->logits;
               reused = prefix.inputs.size();
               rewound = loaded = true;
               ++conversation_loads;
-              saved.splice(saved.begin(), saved, best);
+              if (file) { from_file = true; remember(std::move(*file)); }
+              else saved.splice(saved.begin(), saved, best);
             } catch (const std::exception &e) {
               std::cerr << "conversation load failed: " << e.what() << "\n";
               reused = 0;
@@ -922,6 +1286,21 @@ public:
         stats["acceptance"] =
             drafted ? double(accepted) / double(drafted) : 0.0;
         stats["conversation_loaded"] = loaded;     // s0ma change 73
+        stats["conversation_from_disk"] = from_file;   // s0ma change 81
+        if (disk_on()) {
+          std::lock_guard<std::mutex> l(disk_m);
+          size_t ours = 0;
+          for (auto &d : disk) ours += d.ours;
+          stats["conversations_on_disk"] = ours;
+          stats["conversations_disk_bytes"] = disk_bytes_all;
+          stats["conversation_disk_writes"] = disk_writes;
+          stats["conversation_disk_loads"] = disk_loads;
+          stats["conversation_disk_deletes"] = disk_deletes;
+          stats["conversation_disk_failures"] = disk_failures;
+          stats["conversation_disk_skipped"] = disk_skipped;
+          stats["conversation_disk_write_ms"] = disk_write_ms;
+          stats["conversation_disk_read_ms"] = disk_read_ms;
+        }
         stats["conversations_saved"] = saved.size();
         stats["conversations_saved_bytes"] = saved_bytes;
         stats["conversation_saves"] = conversation_saves;

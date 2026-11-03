@@ -262,6 +262,97 @@ template<int BITS>
 __global__ __launch_bounds__(256,1) void prefill(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,int K,int max_tokens) {DS41_PDL_WAIT();
     prefill_body<BITS>(table,jobs[blockIdx.y],projection,N,K,max_tokens);
 }
+// s0ma change 68: prefill with each job's rows rotated once a projection (prefill_body rotates them again in every
+// one of the N/128 column blocks, eight dependent 16-bit loads and a shuffle butterfly a row and k-block, latency the
+// CTA's eight warps cannot hide). rotate_job writes the FP16 rows prefill_body would put in shared memory (the same
+// rotate_input on the same values), up to two projections from one read of the input (gate and up). prefill_rot then
+// copies them in with 16-byte cp.async, double-buffered, and loads the next k-block's trellis words during this one.
+// The mma sequence, k order and epilogue are prefill_body's: the same bits out.
+__global__ __launch_bounds__(256) void rotate_job(const DeviceExpert* table,const GemmJob* jobs,int p0,int p1,int K,
+                                                  half* a0,half* a1) {DS41_PDL_WAIT();
+    const GemmJob job=jobs[0];
+    const int kb=K/128,warp=(blockIdx.x*blockDim.x+threadIdx.x)/32,lane=threadIdx.x%32;
+    if(warp>=job.tokens*kb)return;
+    DeviceExpert e=table[job.expert];wait_ready(e);
+    const int r=warp/kb,c=(warp%kb)*128;
+    const auto* x=reinterpret_cast<const __nv_bfloat16*>(job.x)+size_t(r)*K+c;
+    rotate_input(x,scales(e,p0)+c,a0+size_t(r)*K+c,lane);
+    if(a1)rotate_input(x,scales(e,p1)+c,a1+size_t(r)*K+c,lane);
+}
+__device__ __forceinline__ void cp_async16(void* dst,const void* src) {
+    const unsigned addr=static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"::"r"(addr),"l"(src));
+}
+template<int BITS>
+__global__ __launch_bounds__(256,1) void prefill_rot(const DeviceExpert* table,const GemmJob* jobs,int projection,
+                                                               int N,int K,const half* rotated) {DS41_PDL_WAIT();
+    const GemmJob job=jobs[blockIdx.y];
+    const int m0=blockIdx.z*64;if(m0>=job.tokens)return;
+    DeviceExpert e=table[job.expert];wait_ready(e);
+    const uint32_t* B=weights(e,projection);
+    const half* sv=scales(e,projection)+K;
+    // two 64x136 FP16 stages (34,816 B); after the k loop the same bytes hold the 64x128 FP32 results (32,768 B)
+    __shared__ __align__(16) unsigned char smem[2*64*136*2];
+    half* As=reinterpret_cast<half*>(smem);
+    float* out=reinterpret_cast<float*>(smem);
+    const int warp=threadIdx.x/32,lane=threadIdx.x%32,r=lane/4,rows=min(64,job.tokens-m0);
+    auto stage=[&](int k0,int st){
+        half* dst=As+st*64*136;
+        for(int i=threadIdx.x;i<rows*16;i+=256){const int row=i>>4,c=(i&15)*8;
+            cp_async16(dst+row*136+c,rotated+size_t(m0+row)*K+k0+c);}
+        asm volatile("cp.async.commit_group;");
+    };
+    auto words=[&](int k0,TileW<BITS> (&w)[8]){
+        #pragma unroll
+        for(int ki=0;ki<8;++ki)w[ki]=load_tile<BITS>(B+(size_t((k0/16)+ki)*(N/16)+blockIdx.x*8+warp)*(8*BITS),lane);
+    };
+    float acc[4][2][4]={};
+    TileW<BITS> cur[8],next[8];
+    stage(0,0);words(0,cur);
+    for(int k0=0,st=0;k0<K;k0+=128,st^=1){
+        const bool more=k0+128<K;
+        if(more){stage(k0+128,st^1);asm volatile("cp.async.wait_group 1;":::"memory");}
+        else asm volatile("cp.async.wait_group 0;":::"memory");
+        __syncthreads();
+        if(more)words(k0+128,next);
+        const half* A=As+st*64*136;
+        #pragma unroll
+        for(int ki=0;ki<8;++ki){
+            Pair f0,f1;dqk<BITS>(cur[ki],f0,f1,lane);
+            #pragma unroll
+            for(int mi=0;mi<4;++mi){
+                uint32_t a[4]={};
+                #pragma unroll
+                for(int hr=0;hr<2;++hr){int row=mi*16+r+hr*8;
+                    if(m0+row<job.tokens){
+                        const uint32_t* p=reinterpret_cast<const uint32_t*>(A+row*136)+ki*8+(lane&3);
+                        a[hr]=p[0];a[hr+2]=p[4];
+                    }
+                }
+                mma(acc[mi][0],a,f0);mma(acc[mi][1],a,f1);
+            }
+        }
+        __syncthreads();
+        if(more){
+            #pragma unroll
+            for(int ki=0;ki<8;++ki)cur[ki]=next[ki];
+        }
+    }
+    #pragma unroll
+    for(int mi=0;mi<4;++mi){
+        #pragma unroll
+        for(int hr=0;hr<2;++hr){
+            int row=mi*16+r+hr*8;
+            #pragma unroll
+            for(int f=0;f<2;++f){int col=warp*16+f*8+(lane&3)*2;
+                out[row*128+col]=acc[mi][f][hr*2];out[row*128+col+1]=acc[mi][f][hr*2+1];
+            }
+        }
+    }
+    __syncthreads();
+    for(int row=warp;row<64;row+=8)if(m0+row<job.tokens)
+        rotate_output(out+row*128,sv+blockIdx.x*128,job.output+size_t(m0+row)*N+blockIdx.x*128,lane);
+}
 // s0ma change 34 (N1): one dense job by value, up to 256 rows
 template<int BITS>
 __global__ __launch_bounds__(256,1) void prefill_one(const DeviceExpert* table,const GemmJob job,int N,int K,int xs,int os) {DS41_PDL_WAIT();
@@ -609,6 +700,26 @@ cudaError_t exl3_dense_f32(const DeviceExpert* t,GemmJob j,int n,int k,int bits,
         case 5: return launch_one_k<5,float>(t,j,n,k,xs,os,1,0,0,s);
         default: return cudaErrorInvalidValue;
     }
+}
+// s0ma change 68: prefill with the rows rotated once (exl3.cuh)
+cudaError_t exl3_prefill_rotate(const DeviceExpert* t,const GemmJob* job,Projection p0,Projection p1,int k,int rows,
+                                half* a0,half* a1,cudaStream_t s){
+    if(!t||!job||!a0||rows<1||rows>256||k<=0||k%128)return cudaErrorInvalidValue;
+    exl3_detail::rotate_job<<<(rows*(k/128)+7)/8,256,0,s>>>(t,job,int(p0),int(p1),k,a0,a1);
+    return cudaGetLastError();
+}
+cudaError_t exl3_prefill_rotated(const DeviceExpert* t,const GemmJob* job,Projection p,int n,int k,int rows,int bits,
+                                 const half* a,cudaStream_t s){
+    if(!t||!job||!a||rows<1||rows>256||n<=0||n%128||k<=0||k%128)return cudaErrorInvalidValue;
+    const dim3 grid(n/128,1,(rows+63)/64);
+    switch(bits){
+        case 2: exl3_detail::prefill_rot<2><<<grid,256,0,s>>>(t,job,int(p),n,k,a); break;
+        case 3: exl3_detail::prefill_rot<3><<<grid,256,0,s>>>(t,job,int(p),n,k,a); break;
+        case 4: exl3_detail::prefill_rot<4><<<grid,256,0,s>>>(t,job,int(p),n,k,a); break;
+        case 5: exl3_detail::prefill_rot<5><<<grid,256,0,s>>>(t,job,int(p),n,k,a); break;
+        default: return cudaErrorInvalidValue;
+    }
+    return cudaGetLastError();
 }
 // s0ma change 37: prefill pieces for the caller's FP16 GEMM
 cudaError_t exl3_dense_reconstruct(const DeviceExpert* t,int index,int n,int k,int bits,half* w,cudaStream_t s){

@@ -704,6 +704,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
   // one stream). Each expert's math is unchanged and its rows land in their own slots of `routed`.
   struct PrefillLane {
     Device bxh, bw, gate, up, act, down;
+    Device rg, ru, rd;   // s0ma change 68: rows rotated once (gate, up: 256 x H FP16; down: 256 x I)
     cudaStream_t s = nullptr;
     cudaEvent_t done = nullptr;
   };
@@ -722,6 +723,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
       auto L = std::make_unique<PrefillLane>();
       L->bxh.resize(size_t(256) * H * 2); L->bw.resize(256 * 4); L->gate.resize(size_t(256) * I * 2);
       L->up.resize(size_t(256) * I * 2); L->act.resize(size_t(256) * I * 2); L->down.resize(size_t(256) * H * 2);
+      L->rg.resize(size_t(256) * H * 2); L->ru.resize(size_t(256) * H * 2); L->rd.resize(size_t(256) * I * 2);
       CK(cudaStreamCreateWithFlags(&L->s, cudaStreamNonBlocking));
       CK(cudaEventCreateWithFlags(&L->done, cudaEventDisableTiming));
       prefill_side.push_back(std::move(L));

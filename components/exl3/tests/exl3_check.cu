@@ -213,7 +213,23 @@ static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
         else dense_split(dt, job, N, K, bits, 0, 0, 1, 0, 0, invariant);   // s0ma change 37: split when narrow
         CK(ds41::exl3_set_bits(bits));
     }
-    else if (c.prefill) CK(ds41::grouped_exl3_prefill(dt, dj, 1, c.p, N, K, M, 0));
+    else if (c.prefill) {
+        CK(ds41::grouped_exl3_prefill(dt, dj, 1, c.p, N, K, M, 0));
+        // s0ma change 68: the rows rotated once, then the pipelined kernel: the same bits (a1, the second output)
+        half *ra0, *ra1; __nv_bfloat16* ro; ds41::GemmJob* drj;
+        CK(cudaMalloc(&ra0, size_t(M) * K * 2)); CK(cudaMalloc(&ra1, size_t(M) * K * 2));
+        CK(cudaMalloc(&ro, size_t(M) * N * 2)); CK(cudaMemset(ro, 0, size_t(M) * N * 2));
+        ds41::GemmJob rj{0, M, reinterpret_cast<const uint8_t*>(dx), nullptr, ro};
+        CK(cudaMalloc(&drj, sizeof rj)); CK(cudaMemcpy(drj, &rj, sizeof rj, cudaMemcpyHostToDevice));
+        CK(ds41::exl3_prefill_rotate(dt, drj, c.p, c.p, K, M, ra0, ra1, 0));
+        CK(ds41::exl3_prefill_rotated(dt, drj, c.p, N, K, M, bits, ra1, 0));
+        CK(cudaDeviceSynchronize());
+        std::vector<uint16_t> a(size_t(M) * N), b(size_t(M) * N);
+        CK(cudaMemcpy(a.data(), dout, a.size() * 2, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(b.data(), ro, b.size() * 2, cudaMemcpyDeviceToHost));
+        if (a != b) { std::printf("  rotate-once prefill differs from grouped_exl3_prefill\n"); if (invariant) *invariant = false; }
+        cudaFree(ra0); cudaFree(ra1); cudaFree(ro); cudaFree(drj);
+    }
     else if (c.var) {   // s0ma change 15: the mixed-width launch, its expert's width from a device table
         uint8_t* dbits; const uint8_t b8 = uint8_t(bits);
         CK(cudaMalloc(&dbits, 1)); CK(cudaMemcpy(dbits, &b8, 1, cudaMemcpyHostToDevice));

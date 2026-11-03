@@ -54,6 +54,14 @@ cudaError_t exl3_dense_rotate_in(const DeviceExpert* table, int index, const __n
                                  int x_stride, half* a, cudaStream_t stream);
 cudaError_t exl3_dense_rotate_out(const DeviceExpert* table, int index, const float* c, int rows, int n, int k,
                                   __nv_bfloat16* out, int out_stride, cudaStream_t stream);
+// s0ma change 68: an expert's prefill with its rows rotated once. exl3_prefill_rotate writes job[0]'s rows (BF16,
+// row stride k) rotated with projection p0's input scales into a0 and, if a1, with p1's into a1: FP16 [rows, k], as
+// grouped_exl3_prefill rotates them. exl3_prefill_rotated is grouped_exl3_prefill_bits for count 1 and max_tokens rows
+// with A read from those rows: the same results bit for bit. rows 1..256; a 16-byte aligned.
+cudaError_t exl3_prefill_rotate(const DeviceExpert* table, const GemmJob* job, Projection p0, Projection p1, int k,
+                                int rows, half* a0, half* a1, cudaStream_t stream);
+cudaError_t exl3_prefill_rotated(const DeviceExpert* table, const GemmJob* job, Projection p, int n, int k, int rows,
+                                 int bits, const half* a, cudaStream_t stream);
 cudaError_t exl3_dense_prefill(const DeviceExpert* table, GemmJob job, int n, int k, int bits, cudaStream_t stream,
                                int x_stride = 0, int out_stride = 0);
 // s0ma change 43: exl3_dense's decode (no split, no groups) writing FP32 rows: job.output points to floats and

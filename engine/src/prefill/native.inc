@@ -1,4 +1,10 @@
 // Included inside Native. The decode/verify implementation remains independent.
+// s0ma change 68: the routed experts' EXL3 prefill with each projection's rows rotated once (exl3_prefill_rotate,
+// exl3_prefill_rotated: the same bits as grouped_exl3_prefill_bits). DS41_PREFILL_EXL3_ROTATED=0 keeps the old kernel.
+static bool prefill_exl3_rotated() {
+  static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_EXL3_ROTATED"); return !v || std::string(v) != "0"; }();
+  return on;
+}
 struct PrefillData {
   size_t rows;
   int64_t begin, end;
@@ -12,6 +18,7 @@ struct PrefillData {
   Device window, selected, candidates, ids, weights, quant, scales, routed, capture;
   Device bx{256*H}, bs{256*H/32}, bw{256*4};
   Device bxh; // EXL3: 256 gathered BF16 rows
+  Device rg, ru, rd; // s0ma change 68: the rows rotated once for gate, up (256 x H FP16) and down (256 x I)
   Device gate{256*I*2}, up{256*I*2}, act{256*I*2},
       eq{256*I}, es{256*I/32}, down{256*H*2};
   std::array<std::vector<int64_t>,2> rowids;
@@ -319,6 +326,9 @@ Json pmoe(int l,ds41e::prefill::Span span) {
   std::vector<ds41::ExpertId> needed;
   size_t job=0,offset=0;
   if(exl3 && !pf.bxh.p) pf.bxh.resize(size_t(256)*H*2);
+  if(exl3 && prefill_exl3_rotated() && !pf.rg.p){   // s0ma change 68
+    pf.rg.resize(size_t(256)*H*2);pf.ru.resize(size_t(256)*H*2);pf.rd.resize(size_t(256)*I*2);
+  }
   for(auto &g:groups) {
     auto id=ds41::expert_id(l,g.expert);needed.push_back(id);
     for(size_t first=0;first<g.slots.size();first+=256) {
@@ -361,10 +371,21 @@ Json pmoe(int l,ds41e::prefill::Span span) {
         ds41e::prefill::gather_routes_bf16(pf.ffn_input.as<char>(base*H*2),pf.weights.as<float>(base*6*4),
             gpu_slots+b.offset,bxh,bw,b.rows,s);
         const int bits=width_of.empty()?expert_bits(int(id/384)):width_of[id];   // s0ma changes 12, 15: this expert's width
+        if(prefill_exl3_rotated()) {   // s0ma change 68: each projection's rows rotated once, the same bits out
+          half *rg=L?L->rg.as<half>():pf.rg.as<half>(),*ru=L?L->ru.as<half>():pf.ru.as<half>(),
+              *rd=L?L->rd.as<half>():pf.rd.as<half>();
+          CK(ds41::exl3_prefill_rotate(table,J,ds41::Projection::Gate,ds41::Projection::Up,H,b.rows,rg,ru,s));
+          CK(ds41::exl3_prefill_rotated(table,J,ds41::Projection::Gate,I,H,b.rows,bits,rg,s));
+          CK(ds41::exl3_prefill_rotated(table,J+1,ds41::Projection::Up,I,H,b.rows,bits,ru,s));
+          CK(ds41::swiglu(gate,up,bw,act,b.rows,I,10,s));
+          CK(ds41::exl3_prefill_rotate(table,J+2,ds41::Projection::Down,ds41::Projection::Down,I,b.rows,rd,nullptr,s));
+          CK(ds41::exl3_prefill_rotated(table,J+2,ds41::Projection::Down,H,I,b.rows,bits,rd,s));
+        } else {
         CK(ds41::grouped_exl3_prefill_bits(table,J,1,ds41::Projection::Gate,I,H,b.rows,bits,s));
         CK(ds41::grouped_exl3_prefill_bits(table,J+1,1,ds41::Projection::Up,I,H,b.rows,bits,s));
         CK(ds41::swiglu(gate,up,bw,act,b.rows,I,10,s));
         CK(ds41::grouped_exl3_prefill_bits(table,J+2,1,ds41::Projection::Down,H,I,b.rows,bits,s));
+        }
         ds41e::prefill::scatter_routes(down,gpu_slots+b.offset,pf.routed.as<char>(base*6*H*2),b.rows,s);
         CK(cudaGetLastError());
         continue;

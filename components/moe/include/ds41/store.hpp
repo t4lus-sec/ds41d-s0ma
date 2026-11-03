@@ -76,6 +76,8 @@ struct Stats {
     // DS41_MOE_DEMOTE: VRAM victims copied back to RAM, victims already in RAM, demand evictions
     // that took a victim's slot directly (reserve empty, no demotion).
     uint64_t demotions=0, demote_resident=0, direct_evictions=0;
+    // s0ma change 64: direct evictions of an expert with no RAM copy, copied back to RAM before the slot was reused
+    uint64_t rescued=0;
     // s0ma change 8 (DS41_MOE_SPEC_NVME=N): predicted NVMe-tier experts read ahead into N pinned slots; demand
     // misses found there (or still being read) upload from them instead of waiting for a fresh read.
     uint64_t spec_reads=0, spec_hits=0, spec_waits=0, spec_dropped=0, spec_queued=0;

@@ -109,6 +109,9 @@ struct OffloadStore::Impl {
     cudaEvent_t copy_idle=nullptr;
     struct HostRetirement {std::vector<std::shared_ptr<const void>> tokens;cudaEvent_t event;};
     std::deque<HostRetirement> host_retired;
+    // s0ma change 64: RAM slots held until a direct eviction's copy back to RAM has landed
+    struct Rescue { ExpertId id; cudaEvent_t event; std::vector<SlotPool::Allocation> held; };
+    std::deque<Rescue> rescuing;
     std::set<ExpertId> host_prefetched;
     Clock::time_point refill_next{};
     int device=0;
@@ -395,6 +398,12 @@ struct OffloadStore::Impl {
             auto d=demoting.find(it->id);if(d!=demoting.end() && d->second==it->event)demoting.erase(d);
             ck(cudaEventDestroy(it->event));it=draining.erase(it);
         }
+        for(auto it=rescuing.begin();it!=rescuing.end();) {   // s0ma change 64
+            auto rc=cudaEventQuery(it->event);if(rc==cudaErrorNotReady){++it;continue;}ck(rc);
+            if(!it->held.empty())host_pool->release(it->held);
+            auto d=demoting.find(it->id);if(d!=demoting.end() && d->second==it->event)demoting.erase(d);
+            ck(cudaEventDestroy(it->event));it=rescuing.erase(it);
+        }
         for(auto it=host_retired.begin();it!=host_retired.end();){auto rc=cudaEventQuery(it->event);if(rc==cudaErrorNotReady){++it;continue;}ck(rc);ck(cudaEventDestroy(it->event));it=host_retired.erase(it);}
         for(auto it=retired.begin();it!=retired.end();) {
             auto rc=wait?cudaEventSynchronize(it->event):cudaEventQuery(it->event);
@@ -461,6 +470,28 @@ struct OffloadStore::Impl {
                     if(miss_on.load(std::memory_order_relaxed)){std::lock_guard<std::mutex> l(miss_m);ram_log.push_back(a.id);}}
                 if(is_prefetch)prefetched.insert(a.id);
             }
+            // s0ma change 64: a direct eviction (the demotion reserve had no free slot of this class) drops its expert
+            // unless it has a RAM copy. With the exclusive RAM tier, one without is copied back first, on this load's
+            // copy stream, so the copy is ordered before anything this load writes into the slot. A GDS read writes
+            // outside the stream, so it waits for these copies below. Placement only.
+            std::vector<cudaEvent_t> rescues;
+            if(demote && host_pool) {   // demand and prefetch loads alike (a prefetch's copies run on its own stream)
+                for(auto a:allocations) {
+                    if(a.hit || a.evicted<0)continue;
+                    const auto x=ExpertId(a.evicted);
+                    if(host.count(x))continue;
+                    std::vector<SlotPool::Allocation> held;
+                    const int hs=admit_host(x,false,&held);
+                    if(hs<0)continue;
+                    auto rc=cudaEventQuery(slot_copy[a.slot]);   // the victim's own upload has landed
+                    if(rc==cudaErrorNotReady)ck(cudaStreamWaitEvent(cs,slot_copy[a.slot],0));else ck(rc);
+                    ck(cudaMemcpyAsync(static_cast<char*>(host_arena->data())+hoff(size_t(hs)),sptr(a.slot),
+                        records.at(x).bytes,cudaMemcpyDeviceToHost,cs));
+                    cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,cs));
+                    demoting[x]=done;rescuing.push_back({x,done,std::move(held)});rescues.push_back(done);
+                    ++counters.demotions;++counters.rescued;
+                }
+            }
             // Submit resident work first so a cold expert cannot head-of-line
             // block cache hits. Each miss is published independently afterwards.
             bool streaming=bool(callback)||bool(batch_callback);
@@ -497,6 +528,7 @@ struct OffloadStore::Impl {
                 disk.swap(rest);
             }
             if(gds && batch_callback && !is_prefetch && !disk.empty()) {
+                for(auto e:rescues)ck(cudaEventSynchronize(e));   // s0ma change 64: copies back before DMA overwrites
                 // s0ma change 51: a lendable slot is outside the registered arena; it takes the reader below
                 std::vector<SlotPool::Allocation> rest,via;
                 for(auto a:disk)(lendable(a.slot)?rest:via).push_back(a);
@@ -666,7 +698,29 @@ struct OffloadStore::Impl {
             ck(cudaStreamSynchronize(mapping));if(demote_stream)ck(cudaStreamSynchronize(demote_stream));
             lend_counters.sync_ms+=ms(t0);t0=Clock::now();
             std::vector<ExpertId> dropped;
+            // s0ma change 64: which expert each lent slot held, for those lend() drops
+            std::unordered_map<ExpertId,size_t> held_in;
+            if(demote && host_pool){
+                const std::set<size_t> chunk(slots.begin(),slots.end());
+                for(ExpertId e=0;e<expert_count;++e){const int r=pool.residency(e);if(r>=0 && chunk.count(size_t(r)))held_in[e]=size_t(r);}
+            }
             const auto moves=pool.lend(slots,dropped);
+            // s0ma change 64: an expert lend() drops, or whose slot a moved expert takes, survives in RAM when it has no
+            // copy there: copied back on the copy stream before the moves overwrite or cudaFree releases its bytes
+            if(demote && host_pool){
+                auto rescue=[&](ExpertId x,size_t slot){
+                    if(host.count(x))return;
+                    std::vector<SlotPool::Allocation> held;
+                    const int hs=admit_host(x,false,&held);
+                    if(hs<0)return;
+                    ck(cudaMemcpyAsync(static_cast<char*>(host_arena->data())+hoff(size_t(hs)),sptr(slot),records.at(x).bytes,
+                        cudaMemcpyDeviceToHost,copy));
+                    cudaEvent_t done;ck(cudaEventCreateWithFlags(&done,cudaEventDisableTiming));ck(cudaEventRecord(done,copy));
+                    demoting[x]=done;rescuing.push_back({x,done,std::move(held)});++counters.demotions;++counters.rescued;
+                };
+                for(const auto& m:moves)if(m.evicted>=0)rescue(ExpertId(m.evicted),m.to);
+                for(auto id:dropped){auto it=held_in.find(id);if(it!=held_in.end())rescue(id,it->second);}
+            }
             auto* views=static_cast<DeviceExpert*>(entries->data());
             auto* gens=static_cast<uint32_t*>(generations->data());
             for(const auto& m:moves){

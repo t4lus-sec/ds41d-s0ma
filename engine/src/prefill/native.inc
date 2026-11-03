@@ -496,7 +496,8 @@ void tier_census() {
   }
   std::cerr<<"tiers: VRAM "<<vram<<" experts, RAM "<<ram<<" ("<<ram_b/double(1ull<<30)<<" GiB), in both "<<both<<" ("
            <<both_b/double(1ull<<30)<<" GiB); demotions "<<st.demotions<<", victims already in RAM "<<st.demote_resident
-           <<", RAM evictions "<<st.ram.evictions<<"\n";
+           <<", RAM evictions "<<st.ram.evictions<<"; direct evictions "<<st.direct_evictions<<" ("<<st.rescued
+           <<" copied back to RAM); only on the drive "<<(15360-(vram+ram-both))<<"\n";
 }
 // s0ma change 56: decode's NVMe misses after a prompt against what that prompt read from the SSD and what its last
 // 256 rows routed. A miss counted under "prompt read" is one the prompt's sweep had already brought through host

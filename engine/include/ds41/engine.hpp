@@ -143,9 +143,15 @@ public:
   // Session snapshot at the committed frontier (no pending verify). It holds the
   // bytes that later positions overwrite in place (SWA rings, partial compressor
   // groups); position-addressed global KV beyond the frontier stays masked.
-  struct Snapshot { virtual ~Snapshot() = default; int64_t position = 0; };
+  struct Snapshot { virtual ~Snapshot() = default; int64_t position = 0; size_t host_bytes = 0; };
   virtual std::shared_ptr<Snapshot> snapshot() { return nullptr; }
   virtual void restore(const Snapshot &) { throw std::logic_error("restore unsupported"); }
+  // s0ma change 73: the whole committed state of the live sequence in host memory (every position-addressed byte
+  // later positions or another sequence would overwrite: KV rings, the compressed KV and indexer keys up to the
+  // frontier, partial compressor groups, the n-gram hash history, the drafter's rings), and its restoration in
+  // place of whatever sequence is live. nullptr: unsupported. host_bytes is what the snapshot holds.
+  virtual std::shared_ptr<Snapshot> save_conversation() { return nullptr; }
+  virtual void load_conversation(const Snapshot &) { throw std::logic_error("load_conversation unsupported"); }
   virtual std::vector<int> cached_prefix() const { return {}; }
   // Diagnostic only: position-addressed, logically live bytes for X3/X3b.
   virtual std::map<std::string,std::vector<uint8_t>> live_state() {

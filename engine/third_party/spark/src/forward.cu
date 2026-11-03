@@ -163,6 +163,17 @@ extern "C" int ds41_spark_rollback(ds41_spark*s,int64_t committed){SPARK_TRY{if(
 extern "C" int ds41_spark_attn_rollback(void*raw,int64_t committed,void*){SPARK_TRY{if(!raw)throw std::invalid_argument("attention state null");auto*s=(ds41::VerifyState*)raw;if(s->pending_width){int64_t rows=committed-s->pending_start;if(rows<0||rows>s->pending_width)throw std::invalid_argument("attention committed prefix");s->finish(int(rows));}else if(s->committed!=committed)throw std::invalid_argument("attention state length mismatch");return 0;}SPARK_CATCH}
 extern "C" int ds41_spark_topk3_gpu(const float*s,int32_t*ids,int rows,void*stream){if(!s||!ids||rows<1)return cudaErrorInvalidValue;select3<<<rows,32,0,(cudaStream_t)stream>>>(s,ids,rows);return cudaGetLastError();}
 extern "C" int64_t ds41_spark_committed(const ds41_spark*s){return s?s->committed:-1;}
+// s0ma change 73: the rings and the committed length, for a multi-conversation cache
+extern "C" size_t ds41_spark_state_bytes(void){return size_t(3)*128*512*2;}
+extern "C" int ds41_spark_state_export(ds41_spark*s,void*host,size_t bytes,int64_t*committed){SPARK_TRY{
+ if(!s||!host||!committed||bytes!=ds41_spark_state_bytes())throw std::invalid_argument("state export arguments");
+ if(s->poisoned)throw std::runtime_error("state poisoned; reset required");
+ for(int l=0;l<3;++l)CK(cudaMemcpyAsync((char*)host+size_t(l)*128*512*2,s->rings[l].p,128*512*2,cudaMemcpyDeviceToHost,s->stream));
+ CK(cudaStreamSynchronize(s->stream));*committed=s->committed;return 0;}SPARK_CATCH}
+extern "C" int ds41_spark_state_import(ds41_spark*s,const void*host,size_t bytes,int64_t committed){SPARK_TRY{
+ if(!s||!host||bytes!=ds41_spark_state_bytes()||committed<0)throw std::invalid_argument("state import arguments");
+ for(int l=0;l<3;++l)CK(cudaMemcpyAsync(s->rings[l].p,(const char*)host+size_t(l)*128*512*2,128*512*2,cudaMemcpyHostToDevice,s->stream));
+ CK(cudaStreamSynchronize(s->stream));s->committed=committed;s->drafted=false;s->poisoned=false;return 0;}SPARK_CATCH}
 extern "C" int ds41_spark_restore_append_tail_m1(ds41_spark*s,const ds41_spark_append_tail_v1*d){SPARK_TRY{if(!s)throw std::invalid_argument("append restore: null context");s->restore_append_tail_m1(d);return 0;}SPARK_CATCH}
 extern "C" int ds41_spark_debug_view(ds41_spark*s,const char*name,const void**out,size_t*bytes){SPARK_TRY{if(!s||!name||!out||!bytes)throw std::invalid_argument("debug view arguments");Buf*b=nullptr;std::string n=name;if(n=="main")b=&s->main;else if(n=="hidden")b=&s->h;else if(n=="pre")b=&s->pre;else if(n=="U")b=&s->U;else if(n.size()==5&&n.compare(0,4,"ring")==0&&n[4]>='0'&&n[4]<='2')b=&s->rings[n[4]-'0'];if(!b)throw std::invalid_argument("unknown debug view");*out=b->p;*bytes=b->n;return 0;}SPARK_CATCH}
 extern "C" int ds41_spark_reset(ds41_spark*s){SPARK_TRY{if(!s)throw std::invalid_argument("reset null");for(int i=0;i<3;++i)CK(cudaMemsetAsync(s->rings[i].p,0,s->rings[i].n,s->stream));s->committed=0;s->drafted=false;s->poisoned=false;return 0;}SPARK_CATCH}

@@ -92,6 +92,12 @@ int ds41_spark_rollback(ds41_spark*, int64_t committed_inputs);
  * rollback callback when user points to that state, or call from your adapter. */
 int ds41_spark_attn_rollback(void *verify_state, int64_t committed_inputs, void *stream);
 int64_t ds41_spark_committed(const ds41_spark*);
+/* s0ma change 73: the committed drafter state (the three KV rings, 3 x 128 x 512 BF16) to and from host memory, for a
+ * server that keeps several conversations. Export synchronizes the bound stream; import replaces the rings and the
+ * committed length (no draft pending afterwards). bytes must be ds41_spark_state_bytes(). */
+size_t ds41_spark_state_bytes(void);
+int ds41_spark_state_export(ds41_spark*, void *host, size_t bytes, int64_t *committed);
+int ds41_spark_state_import(ds41_spark*, const void *host, size_t bytes, int64_t committed);
 /* Fixture inspection only: names main,ring0,ring1,ring2,hidden,pre,U.
  * No copy/sync. main is the retained128-row cold projection or latest M1. */
 int ds41_spark_debug_view(ds41_spark*,const char*,const void**,size_t*);

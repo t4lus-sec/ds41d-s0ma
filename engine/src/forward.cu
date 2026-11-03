@@ -1231,6 +1231,76 @@ public:
     capture_rows = capture_committed = 0; capture_begin = 0;
     CK(cudaStreamSynchronize(stream));
   }
+  // s0ma change 73: a whole conversation in host memory (the server's multi-conversation cache). Beside what
+  // snapshot() holds (the SWA rings and the partial compressor groups), the compressed KV and indexer keys of every
+  // global owner up to the frontier (position-addressed: another sequence overwrites them), the n-gram hash history
+  // and the committed ids. Entries past the frontier are not needed: they are written before they are read.
+  struct ConversationState : Snapshot {
+    std::vector<std::vector<uint8_t>> windows;
+    std::map<int, std::array<std::vector<uint8_t>, 4>> globals;   // raw_kv, raw_score, kv, key
+    std::vector<int64_t> hash;
+    std::vector<int> prefix_ids;
+  };
+  std::shared_ptr<Snapshot> save_conversation() override {
+    if (poisoned || pending)
+      throw std::logic_error("save_conversation requires a committed, healthy state");
+    auto s = std::make_shared<ConversationState>();
+    s->position = committed;
+    auto down = [&](std::vector<uint8_t> &dst, const void *src, size_t bytes) {
+      dst.resize(bytes);
+      if (bytes) CK(cudaMemcpyAsync(dst.data(), src, bytes, cudaMemcpyDeviceToHost, stream));
+      s->host_bytes += bytes;
+    };
+    for (auto &w : windows) { s->windows.emplace_back(); down(s->windows.back(), w.p, w.bytes); }
+    for (auto &[l, g] : globals) {
+      auto &r = s->globals[l];
+      const size_t entries = std::min<size_t>(size_t(g->capacity), size_t((committed + g->ratio - 1) / g->ratio));
+      down(r[0], g->raw_kv.p, g->raw_kv.bytes);
+      down(r[1], g->raw_score.p, g->raw_score.bytes);
+      down(r[2], g->kv.p, entries * 288);
+      down(r[3], g->key.p, entries * 68);
+    }
+    s->hash = hash.history();
+    s->prefix_ids = prefix.ids();
+    s->host_bytes += s->hash.size() * 8 + s->prefix_ids.size() * 4;
+    CK(cudaStreamSynchronize(stream));
+    if (int64_t(s->prefix_ids.size()) != s->position)
+      throw std::logic_error("save_conversation: committed ids and position differ");
+    return s;
+  }
+  void load_conversation(const Snapshot &base) override {
+    auto *s = dynamic_cast<const ConversationState *>(&base);
+    if (!s || s->windows.size() != windows.size() || s->globals.size() != globals.size() ||
+        int64_t(s->prefix_ids.size()) != s->position)
+      throw std::invalid_argument("load_conversation: incompatible state");
+    if (pending) throw std::logic_error("load_conversation during an active verify");
+    begin_request();
+    try {
+      for (size_t i = 0; i < windows.size(); ++i) {
+        if (s->windows[i].size() != windows[i].bytes) throw std::invalid_argument("load_conversation: ring size");
+        CK(cudaMemcpyAsync(windows[i].p, s->windows[i].data(), windows[i].bytes, cudaMemcpyHostToDevice, stream));
+      }
+      for (auto &[l, g] : globals) {
+        const auto &r = s->globals.at(l);
+        if (r[0].size() != g->raw_kv.bytes || r[1].size() != g->raw_score.bytes ||
+            r[2].size() > g->kv.bytes || r[3].size() > g->key.bytes)
+          throw std::invalid_argument("load_conversation: global arena size");
+        CK(cudaMemcpyAsync(g->raw_kv.p, r[0].data(), r[0].size(), cudaMemcpyHostToDevice, stream));
+        CK(cudaMemcpyAsync(g->raw_score.p, r[1].data(), r[1].size(), cudaMemcpyHostToDevice, stream));
+        if (!r[2].empty()) CK(cudaMemcpyAsync(g->kv.p, r[2].data(), r[2].size(), cudaMemcpyHostToDevice, stream));
+        if (!r[3].empty()) CK(cudaMemcpyAsync(g->key.p, r[3].data(), r[3].size(), cudaMemcpyHostToDevice, stream));
+      }
+      committed = s->position;
+      gate_rows.clear();
+      for (auto &ticket : prefetch_tickets) experts->cancel(ticket);
+      prefetch_tickets.clear();
+      for (auto &routes : previous_routes) routes.clear();
+      hash.assign(s->hash);
+      prefix.reset(); prefix.commit(s->prefix_ids, s->prefix_ids.size()); pending_ids.clear();
+      capture_rows = capture_committed = 0; capture_begin = 0;
+      CK(cudaStreamSynchronize(stream));
+    } catch (...) { poisoned = true; throw; }
+  }
   void reset() override {
     begin_request();
     committed = 0;

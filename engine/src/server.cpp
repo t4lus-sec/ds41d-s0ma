@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <list>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -347,6 +348,72 @@ class Service {
     void observe_spark(size_t accepted) { spark += 0.03 * (double(accepted) - spark); }
     uint64_t declined = 0;   // every 32nd declined match is copied anyway, so a bucket's estimate can recover
   } suffix_policy;
+  // s0ma change 73: several conversations. ds41d keeps one live sequence; a request from another conversation (a
+  // worker call between two of s0ma's main turns) used to make the next main turn read its whole context again.
+  // Now, at the end of every complete prompt, the sequence's whole state goes to host memory
+  // (Forward::save_conversation); a request whose prompt extends a saved prompt, and that the live sequence does not
+  // serve, loads it and prefills only what is new. The prompt's end is the point the next turn shares even when the
+  // earlier answer is encoded differently in the history. Least recently used first out, within
+  // DS41_CONVERSATIONS_GIB (default 1 GiB of host memory; 0 turns it off).
+  struct Saved {
+    std::string conversation;
+    std::vector<int> inputs;
+    std::vector<uint64_t> keys;
+    std::vector<float> logits;
+    std::shared_ptr<Forward::Snapshot> state;
+    size_t bytes = 0;
+  };
+  std::list<Saved> saved;
+  size_t saved_bytes = 0;
+  uint64_t conversation_saves = 0, conversation_loads = 0, conversation_evictions = 0;
+  static size_t conversations_budget() {
+    static const size_t b = [] {
+      const char *v = std::getenv("DS41_CONVERSATIONS_GIB");
+      const double g = v && *v ? std::strtod(v, nullptr) : 1.0;
+      if (!std::isfinite(g) || g < 0 || g > 64) throw std::invalid_argument("DS41_CONVERSATIONS_GIB must be 0..64");
+      return size_t(g * double(size_t(1) << 30));
+    }();
+    return b;
+  }
+  void save_live() {
+    const size_t budget = conversations_budget();
+    if (!budget || prefix.inputs.empty()) return;
+    std::shared_ptr<Forward::Snapshot> state;
+    try { state = model->save_conversation(); } catch (const std::exception &e) {
+      std::cerr << "conversation save failed: " << e.what() << "\n";
+      return;
+    }
+    if (!state) return;
+    Saved e{prefix.conversation, prefix.inputs, prefix.keys, prefix.logits, state, 0};
+    e.bytes = state->host_bytes + e.inputs.size() * 4 + e.keys.size() * 8 + e.logits.size() * 4;
+    if (e.bytes > budget) return;
+    // an earlier prompt of the same conversation that this one extends is no longer needed
+    for (auto it = saved.begin(); it != saved.end();) {
+      if ((prefix_any || it->conversation == e.conversation) && it->keys.size() <= e.keys.size() &&
+          std::equal(it->keys.begin(), it->keys.end(), e.keys.begin())) {
+        saved_bytes -= it->bytes;
+        it = saved.erase(it);
+      } else ++it;
+    }
+    saved_bytes += e.bytes;
+    saved.push_front(std::move(e));
+    ++conversation_saves;
+    while (saved_bytes > budget && !saved.empty()) {
+      saved_bytes -= saved.back().bytes;
+      saved.pop_back();
+      ++conversation_evictions;
+    }
+  }
+  // the saved prompt that is the longest prefix of this request's (its conversation, or any with prefix_any)
+  std::list<Saved>::iterator find_saved(const std::string &conversation, const std::vector<uint64_t> &keys) {
+    auto best = saved.end();
+    for (auto it = saved.begin(); it != saved.end(); ++it)
+      if ((prefix_any || (!conversation.empty() && it->conversation == conversation)) && !it->keys.empty() &&
+          it->keys.size() <= keys.size() && std::equal(it->keys.begin(), it->keys.end(), keys.begin()) &&
+          (best == saved.end() || it->keys.size() > best->keys.size()))
+        best = it;
+    return best;
+  }
   static bool suffix_on() {
     static const bool on = [] { const char *v = std::getenv("DS41_SUFFIX_DRAFT"); return !v || std::string(v) != "0"; }();
     return on;
@@ -576,6 +643,27 @@ public:
             reused = 0;
           }
         }
+        bool loaded = false;
+        if (!reused && prefix_cache && !saved.empty()) {   // s0ma change 73
+          auto best = find_saved(conversation, keys);
+          if (best != saved.end()) {
+            try {
+              model->load_conversation(*best->state);
+              prefix = {};
+              prefix.conversation = best->conversation;
+              prefix.inputs = best->inputs;
+              prefix.keys = best->keys;
+              prefix.logits = best->logits;
+              reused = prefix.inputs.size();
+              rewound = loaded = true;
+              ++conversation_loads;
+              saved.splice(saved.begin(), saved, best);
+            } catch (const std::exception &e) {
+              std::cerr << "conversation load failed: " << e.what() << "\n";
+              reused = 0;
+            }
+          }
+        }
         if (reused) {
           if (!rewound) model->begin_request();
           logits = prefix.logits;
@@ -651,6 +739,7 @@ public:
           } catch (const std::exception &) {
             prefix.boundary.reset(); prefix.boundary_len = 0;
           }
+          if (!cancelled()) save_live();   // s0ma change 73
         }
         prefill_end = now();
         const auto prefill_counters = model->counters();
@@ -813,6 +902,12 @@ public:
         stats["verified_accepted"] = verified_accepted;
         stats["acceptance"] =
             drafted ? double(accepted) / double(drafted) : 0.0;
+        stats["conversation_loaded"] = loaded;     // s0ma change 73
+        stats["conversations_saved"] = saved.size();
+        stats["conversations_saved_bytes"] = saved_bytes;
+        stats["conversation_saves"] = conversation_saves;
+        stats["conversation_loads"] = conversation_loads;
+        stats["conversation_evictions"] = conversation_evictions;
         stats["copy_steps"] = copy_steps;          // s0ma change 72: suffix drafting
         stats["copy_drafted"] = copy_drafted;
         stats["copy_accepted"] = copy_accepted;

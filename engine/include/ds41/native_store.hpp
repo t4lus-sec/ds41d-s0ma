@@ -43,5 +43,6 @@ public:
   const std::vector<int64_t>& history() const { return history_; }
   void reset() { history_.clear(); }
   void truncate(size_t n) { if (n < history_.size()) history_.resize(n); }
+  void assign(const std::vector<int64_t> &h) { history_ = h; }   // s0ma change 73: a saved conversation's
 };
 } // namespace ds41e

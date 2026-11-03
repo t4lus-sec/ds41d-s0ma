@@ -504,6 +504,45 @@ public:
   std::vector<int> cached_prefix() const override {
     return target_->cached_prefix();
   }
+  // s0ma change 73: a conversation's target state and the drafter's rings and committed length, in host memory
+  struct SparkConversation : Snapshot {
+    std::shared_ptr<Snapshot> target;
+    std::vector<uint8_t> rings;
+    int64_t spark_committed = 0;
+  };
+  std::shared_ptr<Snapshot> save_conversation() override {
+    check();
+    if (prompt_active_ || incomplete_prompt_) return nullptr;
+    auto t = target_->save_conversation();
+    if (!t) return nullptr;
+    auto s = std::make_shared<SparkConversation>();
+    s->target = t;
+    s->position = t->position;
+    s->rings.resize(ds41_spark_state_bytes());
+    checked(ds41_spark_state_export(spark_.get(), s->rings.data(), s->rings.size(), &s->spark_committed));
+    if (s->spark_committed != t->position)
+      throw std::logic_error("save_conversation: Spark and target committed lengths differ");
+    s->host_bytes = t->host_bytes + s->rings.size();
+    return s;
+  }
+  void load_conversation(const Snapshot &base) override {
+    check();
+    auto *s = dynamic_cast<const SparkConversation *>(&base);
+    if (!s || !s->target) throw std::invalid_argument("load_conversation: not a Spark conversation");
+    if (prompt_active_) throw std::logic_error("load_conversation during a prompt");
+#ifdef DS41_SPARK_POLICY_V2
+    if (policy2_pending_) throw std::logic_error("load_conversation during a policy transaction");
+#endif
+    target_->load_conversation(*s->target);
+    try {
+      checked(ds41_spark_state_import(spark_.get(), s->rings.data(), s->rings.size(), s->spark_committed));
+    } catch (...) { poisoned_ = true; throw; }
+    // as reset(), but the committed length is the loaded one (the width policy keeps what it has learned)
+    prompt_active_ = cold_seed_pending_ = incomplete_prompt_ = false;
+    prompt_rows_ = captures_seen_ = tail_rows_ = 0;
+    append_pending_ = false; tail_limit_ = append_old_ = 0;
+    seed_mode_ = "loaded-conversation";
+  }
   std::map<std::string, std::vector<uint8_t>> live_state() override {
     return target_->live_state();
   }

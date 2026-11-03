@@ -21,7 +21,7 @@ static int prefill_wave_rows() {
 }
 // s0ma change 77: DS41_PREFILL_COPIES_FIRST=0 enqueues the residents before the staged copies start (as before)
 static bool prefill_copies_first() {
-  static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_COPIES_FIRST"); return !v || std::string(v) != "0"; }();
+  static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_COPIES_FIRST"); return v && std::string(v) == "1"; }();   // change 78: off unless =1
   return on;
 }
 static bool prefill_exl3_rotated() {
@@ -151,7 +151,7 @@ std::unordered_map<ds41::ExpertId, const ds41::Record *> prefetch_records;
 static size_t prefill_prefetch_bytes() {
   static const size_t b = [] {
     const char *v = std::getenv("DS41_PREFILL_PREFETCH_MIB");
-    const long x = v && *v ? std::atol(v) : 768;
+    const long x = v && *v ? std::atol(v) : 0;   // change 78: off unless asked (measured no gain)
     if (x < 0 || x > 16384) throw std::invalid_argument("DS41_PREFILL_PREFETCH_MIB must be 0..16384");
     return size_t(x) << 20;
   }();

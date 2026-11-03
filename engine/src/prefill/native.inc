@@ -1,6 +1,12 @@
 // Included inside Native. The decode/verify implementation remains independent.
 // s0ma change 68: the routed experts' EXL3 prefill with each projection's rows rotated once (exl3_prefill_rotate,
 // exl3_prefill_rotated: the same bits as grouped_exl3_prefill_bits). DS41_PREFILL_EXL3_ROTATED=0 keeps the old kernel.
+// s0ma change 69: staged (RAM or drive) experts spread over the prefill lanes; DS41_PREFILL_MISS_LANES=0 keeps them on
+// the main stream, one after another.
+static bool prefill_miss_lanes() {
+  static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_MISS_LANES"); return !v || std::string(v) != "0"; }();
+  return on;
+}
 static bool prefill_exl3_rotated() {
   static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_EXL3_ROTATED"); return !v || std::string(v) != "0"; }();
   return on;
@@ -75,7 +81,8 @@ template<class Store> std::vector<uint8_t> p_residency(Store& store) {
 }
 template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
   prefill_transfers={};prefill_vram_hits=0;
-  int side_pending=0;
+  int side_pending=0;bool spread=false;
+  std::vector<size_t> lane_load;   // s0ma change 69: experts given to each lane this layer (0: the main stream)
   auto lease=pborrow(*experts,ids);
   std::set<ds41::ExpertId> hits;std::vector<ds41::ExpertId> misses;
   try {
@@ -86,14 +93,17 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
     prefill_vram_hits=hits.size();
     for(auto id:ids)if(!hits.count(id))misses.push_back(id);
     const int sides=exl3?prefill_lanes()-1:0;
-    if(sides>0 && !hits.empty()) {
+    // s0ma change 69: staged experts on every lane too (with the side lanes in use, any expert of the layer)
+    spread=sides>0 && prefill_miss_lanes() && !misses.empty();
+    if(sides>0 && (!hits.empty() || spread)) {
       // s0ma change 27: resident experts on the side lanes, round robin, beside the staged sweep below; joined (and
       // their lease retired) before this layer's epilogue reads `routed`
       cudaEvent_t start=prefill_lane(size_t(sides-1)).done;   // any lane's event: recorded, then waited at once
       CK(cudaEventRecord(start,stream));
       for(int i=0;i<sides;++i)CK(cudaStreamWaitEvent(prefill_lane(size_t(i)).s,start,0));
       size_t k=0;
-      for(auto id:hits)consume(id,experts->table(),prefill_lane(k++%size_t(sides)).s);
+      lane_load.assign(size_t(sides)+1,0);
+      for(auto id:hits){++lane_load[1+k%size_t(sides)];consume(id,experts->table(),prefill_lane(k++%size_t(sides)).s);}
       for(int i=0;i<sides;++i){auto &L=prefill_lane(size_t(i));CK(cudaEventRecord(L.done,L.s));}
       side_pending=sides;
     } else for(auto id:hits)consume(id,experts->table(),stream);
@@ -105,6 +115,14 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
     for(int i=0;i<side_pending;++i)CK(cudaStreamWaitEvent(stream,prefill_side[size_t(i)]->done,0));
     side_pending=0;
     if(lease.serial)experts->retire(std::move(lease),stream);
+  };
+  // s0ma change 69: a staged expert, once landed, goes to the lane with the fewest experts so far (the main stream
+  // first, while the side lanes run the residents). Each lane has its own scratch; each expert writes only its own
+  // rows of `routed`, so which lane runs it changes nothing in the result.
+  std::function<cudaStream_t(ds41::ExpertId)> pick;
+  if(spread)pick=[&](ds41::ExpertId)->cudaStream_t{
+    size_t best=0;for(size_t i=1;i<lane_load.size();++i)if(lane_load[i]<lane_load[best])best=i;
+    ++lane_load[best];return best?prefill_lane(best-1).s:stream;
   };
   if(!misses.empty()) {
     if(!prefill_stage){
@@ -159,8 +177,9 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume) {
     }
     ds41e::prefill::Stager::Keep keep_vram;
     if(!vkeep_at.empty())keep_vram=[&vkeep_at](ds41::ExpertId id)->void*{auto it=vkeep_at.find(id);return it==vkeep_at.end()?nullptr:it->second;};
-    try{prefill_transfers=prefill_stage->stream(misses,stream,consume,lookup,[&]{p_engram_barrier();},keep,keep_vram);}
-    catch(...){join();throw;}
+    try{prefill_transfers=prefill_stage->stream(misses,stream,consume,lookup,[&]{p_engram_barrier();},keep,keep_vram,pick);}
+    catch(...){for(auto &L:prefill_side)cudaStreamSynchronize(L->s);join();throw;}
+    if(spread)for(auto &L:prefill_side)CK(cudaEventRecord(L->done,L->s));   // change 69: after the staged work too
     if(vadm.token) {
       if(prefill_transfers.kept_vram_ram+prefill_transfers.kept_vram_disk!=vadm.ids.size())
         throw std::logic_error("prompt VRAM admission: an admitted expert was not copied");

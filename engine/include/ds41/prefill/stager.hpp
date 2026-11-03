@@ -14,6 +14,8 @@ struct TransferStats {
 // At most one stream() call at a time. Callbacks only enqueue GPU operations,
 // never call this stager or the originating store. They are serialized so one
 // consumer scratch slab can safely be reused between complete expert jobs.
+// s0ma change 69: pick(id), called under that serialization when the record has landed, may name another consumer
+// stream for it (a prefill lane with its own scratch); the slot's reuse then waits on that stream.
 class Stager {
   struct Impl;
   std::unique_ptr<Impl> impl;
@@ -27,6 +29,7 @@ public:
   using Keep=std::function<void*(ds41::ExpertId)>;
   TransferStats stream(const std::vector<ds41::ExpertId>&,cudaStream_t,
       const Ready&,const HostLookup& = {},const std::function<void()>& before_disk = {},const Keep& keep = {},
-      const Keep& keep_vram = {});   // s0ma change 60: a device destination (the decode store's VRAM slot), copied D2D
+      const Keep& keep_vram = {},   // s0ma change 60: a device destination (the decode store's VRAM slot), copied D2D
+      const std::function<cudaStream_t(ds41::ExpertId)>& pick = {});   // s0ma change 69: each record's consumer
 };
 }

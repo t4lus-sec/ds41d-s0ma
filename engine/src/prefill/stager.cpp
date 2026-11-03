@@ -55,7 +55,8 @@ struct Stager::Impl {
  }
  ~Impl(){clear();}
  void upload(ds41::ExpertId id,const void* data,size_t slot,cudaStream_t copy,
-             cudaStream_t consumer,const Ready& ready,Event& begin,Event& end) {
+             cudaStream_t consumer,const Ready& ready,Event& begin,Event& end,
+             const std::function<cudaStream_t(ds41::ExpertId)>& pick) {
   if(used[slot])ck(cudaEventSynchronize(consumed[slot]->e));
   auto &r=records.at(id);auto* base=static_cast<uint8_t*>(weights)+slot*record_bytes;
   // Each logical ID appears once in a sweep; this mapped descriptor stays
@@ -67,6 +68,7 @@ struct Stager::Impl {
   ck(cudaMemcpyAsync(base,data,r.bytes,cudaMemcpyHostToDevice,copy));
   ck(cudaEventRecord(end.e,copy));
   {std::lock_guard<std::mutex> lock(enqueue);
+   if(pick)if(cudaStream_t s=pick(id))consumer=s;   // s0ma change 69
    ck(cudaStreamWaitEvent(consumer,end.e,0));
    ready(id,static_cast<ds41::DeviceExpert*>(table->device_data()),consumer);
    ck(cudaEventRecord(consumed[slot]->e,consumer));used[slot]=true;
@@ -77,7 +79,8 @@ Stager::Stager(std::vector<ds41::Record> records,size_t slots):impl(new Impl(std
 Stager::~Stager()=default;
 size_t Stager::device_bytes() const noexcept{return impl->slots*impl->record_bytes;}
 TransferStats Stager::stream(const std::vector<ds41::ExpertId>& ids,cudaStream_t consumer,
-    const Ready& ready,const HostLookup& host,const std::function<void()>& before_disk,const Keep& keep,const Keep& keep_vram) {
+    const Ready& ready,const HostLookup& host,const std::function<void()>& before_disk,const Keep& keep,const Keep& keep_vram,
+    const std::function<cudaStream_t(ds41::ExpertId)>& pick) {
  auto &p=*impl;if(p.poison)std::rethrow_exception(p.poison);
  if(!consumer||!ready)throw std::invalid_argument("stager consumer/callback");
  // A later sweep may reuse a logical table entry in a different slot.
@@ -107,7 +110,7 @@ TransferStats Stager::stream(const std::vector<ds41::ExpertId>& ids,cudaStream_t
   if(!ram.empty())ram_job=std::async(std::launch::async,[&]{
    double ram_start=ms();ck(cudaSetDevice(p.device));
    for(size_t i=0;i<ram.size();++i){
-    p.upload(ram[i].first,ram[i].second.data,i%ram_slots,p.ram,consumer,ready,*begins[i],*ends[i]);
+    p.upload(ram[i].first,ram[i].second.data,i%ram_slots,p.ram,consumer,ready,*begins[i],*ends[i],pick);
     // s0ma change 60: into the decode store's VRAM slot too, D2D on the same stream, before the slot's next upload
     if(keep_vram)if(void* d=keep_vram(ram[i].first)){
      ck(cudaMemcpyAsync(d,static_cast<const uint8_t*>(p.weights)+(i%ram_slots)*p.record_bytes,p.records.at(ram[i].first).bytes,
@@ -122,7 +125,7 @@ TransferStats Stager::stream(const std::vector<ds41::ExpertId>& ids,cudaStream_t
    std::vector<void*> ring;
    for(size_t i=0;i<disk_slots;++i)ring.push_back(static_cast<char*>(p.staging->data())+i*p.record_bytes);
    p.reader.stream(disk,ring,[&](size_t i,size_t buffer){
-    p.upload(disk[i]->id,ring[buffer],ram_slots+buffer,p.disk,consumer,ready,*begins[ram.size()+i],*ends[ram.size()+i]);
+    p.upload(disk[i]->id,ring[buffer],ram_slots+buffer,p.disk,consumer,ready,*begins[ram.size()+i],*ends[ram.size()+i],pick);
     ck(cudaEventRecord(p.dma_done[buffer]->e,p.disk));
     // s0ma change 57: a kept record goes to its RAM-tier slot. Change 58: by a D2H DMA from the VRAM slot it was just
     // uploaded to, on the same stream (after the upload, before the slot's next upload), instead of a CPU memcpy on

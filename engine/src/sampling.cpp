@@ -7,6 +7,9 @@
 #include <limits>
 #include <mutex>
 #include <thread>
+#include <string>
+#include <cstdlib>
+#include <vector>
 namespace ds41e {
 namespace {
 // Small persistent pool for the per-token vocabulary loops. run(n, f) calls f(piece, begin, end) on the
@@ -96,6 +99,83 @@ void parallel_probabilities(const float *x, double *p, size_t n, double t) {
   pool.run(n, [&](size_t, size_t begin, size_t end) {
     for (size_t i = begin; i < end; ++i) p[i] /= z;
   });
+}
+// s0ma change 71: ds41_spark_probabilities with top-p < 1, bit for bit, without sorting the whole vocabulary. The
+// reference stable-sorts all ids by probability (descending; equal probabilities keep id order), adds probabilities
+// in that order until the mass reaches top_p, zeroes the rest and divides every entry by that mass: 10-16 ms a row
+// on one core, for every draft row and every target row of a step. Here the candidates are every id whose
+// probability's binary exponent is at least the one where the mass (summed by exponent, any order) first passes
+// top_p with a margin: they are exactly the first |C| ids of the reference's order (an id equal to a candidate has
+// its exponent), so sorting them by "p descending, then id ascending" (the stable sort's order) and adding in that
+// order gives the reference's cut and the reference's mass. If the cut is not reached inside them (rounding), the
+// whole vocabulary is sorted, as the reference does. The exp and the divisions run on the pool, elementwise.
+void parallel_top_p(const float *x, double *p, size_t n, double t, double top) {
+  parallel_probabilities(x, p, n, t);
+  constexpr int BINS = 1100;   // bin b: probabilities in [2^-b, 2^(1-b)); the last bin also holds anything smaller
+  auto &pool = VocabPool::get();
+  const size_t parts = pool.parts();
+  thread_local std::vector<double> bin_mass;
+  thread_local std::vector<int> idx;
+  thread_local std::vector<char> keep;
+  bin_mass.assign(parts * BINS, 0.0);
+  double *bm = bin_mass.data();
+  auto bin_of = [](double v) { int e = std::ilogb(v); int b = -e; return b < 0 ? 0 : b >= BINS ? BINS - 1 : b; };
+  pool.run(n, [&](size_t piece, size_t begin, size_t end) {
+    double *m = bm + piece * BINS;
+    for (size_t i = begin; i < end; ++i) if (p[i] > 0) m[bin_of(p[i])] += p[i];
+  });
+  int cut_bin = BINS - 1;
+  double cum = 0;
+  for (int b = 0; b < BINS; ++b) {
+    for (size_t k = 0; k < parts; ++k) cum += bm[k * BINS + b];
+    if (cum >= top + 1e-6) { cut_bin = b; break; }
+  }
+  auto before = [p](int a, int b) { return p[a] > p[b] || (p[a] == p[b] && a < b); };
+  idx.clear();
+  if (cut_bin < BINS - 1) {
+    // bin_of(v) <= cut_bin exactly when v >= 2^-cut_bin (cut_bin < BINS - 1: no clamping below)
+    const double floor_p = std::ldexp(1.0, -cut_bin);
+    thread_local std::vector<std::vector<int>> found;
+    found.resize(parts);
+    auto *fp = found.data();
+    pool.run(n, [&](size_t piece, size_t begin, size_t end) {
+      auto &f = fp[piece];
+      f.clear();
+      for (size_t i = begin; i < end; ++i) if (p[i] >= floor_p) f.push_back(int(i));
+    });
+    for (size_t k2 = 0; k2 < parts; ++k2) idx.insert(idx.end(), fp[k2].begin(), fp[k2].end());
+  }
+  std::sort(idx.begin(), idx.end(), before);
+  double mass = 0;
+  size_t k = 0;
+  bool done = false;
+  // the reference's do { mass += p[idx[k++]]; } while (k < n && mass < top);
+  while (k < idx.size()) {
+    mass += p[idx[k++]];
+    if (!(k < n && mass < top)) { done = true; break; }
+  }
+  if (!done) {   // the cut lies past the candidates: the reference's full order
+    idx.resize(n);
+    for (size_t i = 0; i < n; ++i) idx[i] = int(i);
+    std::sort(idx.begin(), idx.end(), before);
+    mass = 0;
+    k = 0;
+    do { mass += p[idx[k++]]; } while (k < n && mass < top);
+  }
+  keep.assign(n, 0);
+  for (size_t i = 0; i < k; ++i) keep[size_t(idx[i])] = 1;
+  const char *kept = keep.data();   // the pool's threads have their own thread_local `keep`: pass this one's data
+  pool.run(n, [&](size_t, size_t begin, size_t end) {
+    for (size_t i = begin; i < end; ++i) {
+      if (!kept[i]) p[i] = 0;
+      p[i] /= mass;
+    }
+  });
+}
+// DS41_TOP_P_FAST=0: the reference's full sort (change 71's A/B)
+bool top_p_fast() {
+  static const bool on = [] { const char *v = std::getenv("DS41_TOP_P_FAST"); return !v || std::string(v) != "0"; }();
+  return on;
 }
 void spark_check(int rc) {
   if (rc)
@@ -211,6 +291,11 @@ Distribution probabilities(const std::vector<float> &x, double temp,
   if (temp > 0 && std::isfinite(temp) && top_p == 1.0 && x.size() >= 4096 &&
       x.size() <= size_t(std::numeric_limits<int>::max())) {
     parallel_probabilities(x.data(), p.data(), x.size(), temp);
+    return p;
+  }
+  if (temp > 0 && std::isfinite(temp) && top_p > 0 && top_p < 1 && x.size() >= 4096 &&
+      x.size() <= size_t(std::numeric_limits<int>::max()) && top_p_fast()) {
+    parallel_top_p(x.data(), p.data(), x.size(), temp, top_p);   // s0ma change 71
     return p;
   }
   spark_check(ds41_spark_probabilities(x.data(), p.data(), width(x.size()),

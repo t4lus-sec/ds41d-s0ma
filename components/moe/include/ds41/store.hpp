@@ -160,6 +160,9 @@ private:
     int scan_victim(const std::unordered_set<ExpertId>& wanted, const std::array<size_t,43>& counts, int layer, int cls = -1) const;
     bool classed_=false, uniform_=true;
     std::vector<uint8_t> slot_class_, expert_class_;
+    // s0ma change 66: per slot class, an index at or below its lowest allocatable empty slot (acquire searches from it)
+    std::array<size_t,256> empty_hint_{};
+    size_t hint_class(size_t slot) const { return classed_ ? slot_class_[slot] : 0; }
     std::array<uint8_t,43> layer_class_{};
     bool fits(size_t slot, ExpertId e) const;
     const SlotPool* peer_=nullptr;

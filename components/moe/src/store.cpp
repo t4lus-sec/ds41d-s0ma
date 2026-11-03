@@ -65,6 +65,7 @@ void SlotPool::classes(std::vector<uint8_t> slot_class,std::vector<uint8_t> expe
     if(expert_class.size()!=expert_count)throw std::invalid_argument("expert classes must cover every expert");
     for(const auto& s:slots_)if(s.id>=0)throw std::logic_error("slot classes require an empty pool");
     slot_class_=std::move(slot_class);expert_class_=std::move(expert_class);classed_=true;dirty_.fill(true);
+    empty_hint_.fill(0);
     uniform_=true;
     for(unsigned l=0;l<43;++l){
         unsigned first=expert_id(l,0),end=first+(l<40?384:128);
@@ -113,10 +114,25 @@ std::vector<SlotPool::Allocation> SlotPool::acquire(const std::vector<ExpertId>&
         if (wanted.insert(e).second) ids.push_back(e);
     }
     // Transactional capacity check: reject before changing state.
+    // s0ma change 66: (soft pools) one pass from the end (the dynamic slots; pins fill the low ones) that stops once every
+    // class has enough: the same verdict without counting all ~7,000 slots on every load.
+    const auto usable=[&](const Slot& s){return s.id < 0 || wanted.count(s.id) || (!s.pinned && !s.leases && s.retention.use_count()<=1);};
+    if(!hard_){
+        std::array<size_t,256> need{};size_t short_by=0;
+        for(auto e:ids)if(need[classed_?expert_class_[e]:0]++==0)++short_by;
+        for(size_t j=slots_.size();j-- >0 && short_by;){
+            const auto& s=slots_[j];
+            if(s.draining || s.lent || !usable(s))continue;
+            auto& n=need[hint_class(j)];
+            if(n && --n==0)--short_by;
+        }
+        if(short_by)throw std::runtime_error(classed_?"need set exceeds unleased slot capacity of its size class; split the batch":
+                                                       "need set exceeds unleased slot capacity; split the batch");
+    }
     size_t available = 0;
-    for (const auto& s : slots_) {
+    if(hard_)for (const auto& s : slots_) {
         if (s.draining || s.lent) continue;
-        if (s.id < 0 || wanted.count(s.id) || (!s.pinned && !s.leases && s.retention.use_count()<=1)) ++available;
+        if (usable(s)) ++available;
     }
     if(hard_){
         std::array<size_t,43> need{},avail{};
@@ -124,8 +140,8 @@ std::vector<SlotPool::Allocation> SlotPool::acquire(const std::vector<ExpertId>&
         for(size_t j=0;j<slots_.size();++j){const auto& s=slots_[j];if(s.draining || s.lent)continue;if(s.id<0 || wanted.count(s.id) || (!s.pinned && !s.leases && s.retention.use_count()<=1))++avail[slot_layers_[j]];}
         for(unsigned l=0;l<43;++l)if(need[l]>avail[l])throw std::runtime_error("need set exceeds hard layer capacity");
     }
-    if (ids.size() > available) throw std::runtime_error("need set exceeds unleased slot capacity; split the batch");
-    if(classed_){
+    if (hard_ && ids.size() > available) throw std::runtime_error("need set exceeds unleased slot capacity; split the batch");
+    if(hard_ && classed_){
         std::array<size_t,256> need{},avail{};
         for(auto e:ids)++need[expert_class_[e]];
         for(size_t j=0;j<slots_.size();++j){const auto& s=slots_[j];if(s.draining || s.lent)continue;if(s.id<0 || wanted.count(s.id) || (!s.pinned && !s.leases && s.retention.use_count()<=1))++avail[slot_class_[j]];}
@@ -133,24 +149,30 @@ std::vector<SlotPool::Allocation> SlotPool::acquire(const std::vector<ExpertId>&
     }
     for(auto e:ids)dirty_[layer_of(e)]=true;
     if(!prefetch)touch(input);
+    // s0ma change 66: the per-layer counts are only read by a victim search, so they are counted when the first one is
+    // needed (from the slots as they are then, which is what the running count would hold)
     std::array<size_t,43> layer_counts{};
-    for(const auto& s:slots_)if(s.id>=0 && !s.pinned)++layer_counts[layer_of(s.id)];
+    bool counted=false;
     std::vector<Allocation> result;
     for (auto e : ids) {
         int slot = residency(e);
         bool hit = slot >= 0;
         int64_t evicted=-1;
         if (!hit) {
-            for (size_t s = 0; s < slots_.size(); ++s) if (slots_[s].id < 0 && !slots_[s].draining && !slots_[s].lent && (!hard_ || slot_layers_[s]==layer_of(e)) && fits(s,e)) { slot = s; break; }
+            // s0ma change 66: the lowest allocatable empty slot of its class, searched from that class's hint
+            auto& hint=empty_hint_[classed_?expert_class_[e]:0];
+            for (size_t s = hard_ ? 0 : hint; s < slots_.size(); ++s) if (slots_[s].id < 0 && !slots_[s].draining && !slots_[s].lent && (!hard_ || slot_layers_[s]==layer_of(e)) && fits(s,e)) { slot = s; break; }
+            if(!hard_)hint=slot>=0?size_t(slot):slots_.size();
+            if (slot < 0 && !counted) {counted=true;for(const auto& s:slots_)if(s.id>=0 && !s.pinned)++layer_counts[layer_of(s.id)];}
             if (slot < 0) {
                 if(fast_ && distinct_ && !hard_ && uniform_)slot=fast_victim(wanted,layer_counts,class_of(e));
                 else slot=scan_victim(wanted,layer_counts,hard_?int(layer_of(e)):-1,class_of(e));
             }
             if (slot < 0) throw std::logic_error("capacity precheck disagreed");
             evicted=slots_[slot].id;
-            if(evicted>=0){dirty_[layer_of(evicted)]=true;++epochs_[layer_of(evicted)];--layer_counts[layer_of(evicted)];residency_[evicted]=-1;}
+            if(evicted>=0){dirty_[layer_of(evicted)]=true;++epochs_[layer_of(evicted)];if(counted)--layer_counts[layer_of(evicted)];residency_[evicted]=-1;}
             dirty_[layer_of(e)]=true;++epochs_[layer_of(e)];
-            ++layer_counts[layer_of(e)];residency_[e]=slot;slots_[slot].id=e;slots_[slot].retention=std::make_shared<const ExpertId>(e);
+            if(counted)++layer_counts[layer_of(e)];residency_[e]=slot;slots_[slot].id=e;slots_[slot].retention=std::make_shared<const ExpertId>(e);
         }
         auto& s = slots_[slot]; dirty_[layer_of(e)]=true; ++s.leases; s.stamp = ++stamp_;
         result.push_back({e, size_t(slot), hit,evicted});
@@ -198,6 +220,7 @@ std::vector<SlotPool::Allocation> SlotPool::reserve(size_t target,const std::uno
 void SlotPool::drained(size_t slot) {
     if(slot>=slots_.size() || !slots_[slot].draining || slots_[slot].id>=0)throw std::logic_error("drained requires a draining slot");
     slots_[slot].draining=false;
+    auto& h=empty_hint_[hint_class(slot)];if(slot<h)h=slot;   // s0ma change 66
 }
 void SlotPool::exclusive(bool enabled) { exclusive_=enabled;dirty_.fill(true); }
 void SlotPool::boost(ExpertId id,uint32_t count) {
@@ -210,6 +233,7 @@ void SlotPool::set_lent(size_t slot,bool lent) {
     auto& s=slots_[slot];
     if(lent && (s.id>=0 || s.leases || s.draining))throw std::logic_error("set_lent requires an empty, unleased slot (lend() moves experts)");
     s.lent=lent;dirty_.fill(true);
+    if(!lent){auto& h=empty_hint_[hint_class(slot)];if(slot<h)h=slot;}   // s0ma change 66
 }
 std::vector<SlotPool::Move> SlotPool::lend(const std::vector<size_t>& targets,std::vector<ExpertId>& dropped) {
     if(hard_)throw std::logic_error("lending slots requires soft layer budgets");
@@ -274,6 +298,10 @@ uint64_t SlotPool::score(ExpertId id)const {
         if(host_){if(peer_->residency_[id]>=0)f/=2;}
         else if(peer_->residency_[id]<0)f*=2;
     }
+    // s0ma change 66: in the exclusive RAM tier a copy of a VRAM resident (score 0) goes before any expert that lives
+    // nowhere else, even one never used (count 0): before, those tied at 0 and the older stamp lost, so seeds no one
+    // had used yet were evicted ahead of duplicates and left only on the drive.
+    if(exclusive_ && host_ && peer_)return f+1;
     return f;
 }
 bool SlotPool::less_slot(size_t a,size_t b)const {

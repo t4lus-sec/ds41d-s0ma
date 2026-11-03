@@ -290,6 +290,8 @@ public:
   // s0ma change 72: q for a copied draft (suffix drafting): a point mass on `token` at draft position k, on the
   // device for verify_gpu; nullptr = none here (the step then gives the host verifier a one-hot q)
   virtual const double *onehot_q(int, int) { return nullptr; }
+  // the most rows a step of this drafter verifies (copied drafts stay within it: no new verify widths)
+  virtual int max_width() const { return 6; }
   virtual void observe(const DraftObservation &) = 0;
   virtual void complete(const DraftObservation &observation, bool censored) {
     if (!censored) observe(observation);

@@ -808,8 +808,10 @@ public:
       }
     }
     if (capture_ && !capture_copy_) capture_step(proposals, q, temperature, seed, step, emitted, accepted, rejected, cut);   // change 70
+    capture_copy_ = false;
     return true;
   }
+  int max_width() const override { return fixed_width_ ? fixed_width_ : 6; }   // s0ma change 72
   // s0ma change 72: a copied draft's q, a point mass on token, in the draws' device rows (verify_gpu reads them)
   const double *onehot_q(int k, int token) override {
     if (!gpu_verify_on() || k < 0 || k > 4) return nullptr;

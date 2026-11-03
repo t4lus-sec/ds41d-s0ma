@@ -290,17 +290,22 @@ class Service {
     static constexpr int kN[4] = {32, 16, 8, 4};
     std::vector<int> tokens;
     std::array<std::unordered_map<uint64_t, uint32_t>, 4> last;   // n-gram hash -> end (exclusive) of its latest
+    std::array<std::unordered_map<uint64_t, uint32_t>, 4> before;   // and of the one before (runs of one token)
     static uint64_t hash(const int *p, int n) {
       uint64_t h = 0x9E3779B97F4A7C15ull ^ uint64_t(n);
       for (int i = 0; i < n; ++i) { h ^= uint64_t(uint32_t(p[i])) + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2); h *= 0xBF58476D1CE4E5B9ull; }
       return h;
     }
-    void clear() { tokens.clear(); for (auto &m : last) m.clear(); }
+    void clear() { tokens.clear(); for (auto &m : last) m.clear(); for (auto &m : before) m.clear(); }
     void push(int t) {
       tokens.push_back(t);
       const size_t e = tokens.size();
       for (int i = 0; i < 4; ++i)
-        if (e >= size_t(kN[i])) last[size_t(i)][hash(tokens.data() + e - kN[i], kN[i])] = uint32_t(e);
+        if (e >= size_t(kN[i])) {
+          auto &slot = last[size_t(i)][hash(tokens.data() + e - kN[i], kN[i])];
+          if (slot) before[size_t(i)][hash(tokens.data() + e - kN[i], kN[i])] = slot;
+          slot = uint32_t(e);
+        }
     }
     // the indexed tokens become `inputs` (appending when they extend what is indexed, else from scratch)
     void sync(const std::vector<int> &inputs) {
@@ -318,9 +323,15 @@ class Service {
         if (e < size_t(n) + 1) continue;
         tail.assign(tokens.end() - (n - 1), tokens.end());
         tail.push_back(anchor);
-        auto it = last[size_t(i)].find(hash(tail.data(), n));
+        const uint64_t h = hash(tail.data(), n);
+        auto it = last[size_t(i)].find(h);
         if (it == last[size_t(i)].end()) continue;
-        const size_t end = it->second;   // tokens[end - n, end) == tail, if not a hash collision
+        size_t end = it->second;   // tokens[end - n, end) == tail, if not a hash collision
+        if (end >= tokens.size()) {   // the latest ends at the context's end (a run of one token): the one before
+          auto b = before[size_t(i)].find(h);
+          if (b == before[size_t(i)].end()) continue;
+          end = b->second;
+        }
         if (end >= tokens.size() || !std::equal(tail.begin(), tail.end(), tokens.begin() + (end - n))) continue;
         for (size_t j = end; j < tokens.size() && int(out.size()) < want; ++j) out.push_back(tokens[j]);
         return n;
@@ -378,6 +389,11 @@ class Service {
   void save_live() {
     const size_t budget = conversations_budget();
     if (!budget || prefix.inputs.empty()) return;
+    for (auto it = saved.begin(); it != saved.end(); ++it)   // this very prompt is saved already (a retry)
+      if ((prefix_any || it->conversation == prefix.conversation) && it->keys == prefix.keys) {
+        saved.splice(saved.begin(), saved, it);
+        return;
+      }
     std::shared_ptr<Forward::Snapshot> state;
     try { state = model->save_conversation(); } catch (const std::exception &e) {
       std::cerr << "conversation save failed: " << e.what() << "\n";
@@ -665,7 +681,8 @@ public:
           }
         }
         if (reused) {
-          if (!rewound) model->begin_request();
+          // a loaded conversation starts a request too (the drafter's policy-v2 nonces restart with the server's)
+          if (!rewound || loaded) model->begin_request();
           logits = prefix.logits;
         } else {
           prefix = {};
@@ -808,8 +825,9 @@ public:
             const uint64_t nonce = attempts.take();
             ++cycles;
             int match = 0;
-            if (copying && maximum > 1) {   // s0ma change 72: copy when the copies are expected to beat the drafter
-              match = suffix.lookup(anchor, maximum - 1, copy);
+            const int copy_max = copying ? std::min(maximum, drafter->max_width()) : 0;
+            if (copying && copy_max > 1) {   // s0ma change 72: copy when the copies are expected to beat the drafter
+              match = suffix.lookup(anchor, copy_max - 1, copy);
               if (!match || copy.empty() ||
                   (suffix_policy.expected(match, int(copy.size())) < suffix_policy.spark &&
                    ++suffix_policy.declined % 32 != 0)) {
@@ -820,7 +838,7 @@ public:
             SpeculativeStep step(*model, drafter, anchor,
                                  int64_t(prefix.inputs.size()), sampling,
                                  uint64_t(prompt + completed), nonce, maximum,
-                                 match ? &copy : nullptr);
+                                 match ? &copy : nullptr);   // (copy holds at most copy_max - 1 tokens)
             const auto &result = step.result();
             drafted += step.inputs().size() - 1;
             verified_accepted += result.accepted;
@@ -845,7 +863,8 @@ public:
                                                  reason == "cancelled");
             accepted += std::min(delivered, result.accepted);
             if (copying) {   // s0ma change 72
-              const size_t tested = std::min(delivered, result.accepted) + (result.rejected ? 1 : 0);
+              const size_t tested = std::min(delivered, result.accepted) +
+                                    (result.rejected && delivered == result.emitted.size() ? 1 : 0);
               if (step.copied()) {
                 ++copy_steps; copy_drafted += step.inputs().size() - 1; copy_accepted += std::min(delivered, result.accepted);
                 suffix_policy.observe_copy(match, std::min(delivered, result.accepted), tested);

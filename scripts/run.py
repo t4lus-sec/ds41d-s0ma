@@ -325,6 +325,16 @@ def graphs_gib(env):
     return 0.25 if env.get('DS41_GRAPHS', '') in ('fixed', 'all') else 0.0
 
 
+# s0ma change 105: the drafter's starved experts (global ids; change 80's audit of the weights)
+SPARK_STARVED = '15361,15370,15372,15378,15385,15400,15404,15451,15454,15463,15476,15487,15488,15490,15496,15497,15501,15502,15503,15504,15505,15521,15528,15536,15547,15555,15557,15560,15572,15574,15575,15576,15580,15581,15587,15592,15593,15594,15605,15607,15616,15618,15619,15620,15623,15624,15634,15638,15639,15641,15642,15644,15645,15646,15647,15648,15649,15650,15652,15653,15657,15658,15666,15671,15672,15673,15676,15678,15679,15680,15681,15684,15686,15687,15688,15689,15691,15692,15702,15705,15706,15708,15711,15715,15716,15720,15721,15722,15723,15724,15729,15731,15733,15737,15739,15740,15741,15742'
+
+
+def cold_gib(env):
+    """s0ma change 105: with DS41_SPARK_COLD the first prefill had 54 MiB less free (2,226 against 2,280 MiB) and the
+    7,999-row prompt was prefilled in two pieces (+0.8 s); 0.1 GiB of the expert slots' extra goes back to it"""
+    return 0.1 if env.get('DS41_SPARK_COLD') else 0.0
+
+
 def environment(cfg, render=True):
     dist = Path(cfg['build']) / 'dist'
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DS41_', 'CUFILE_'))}
@@ -350,6 +360,13 @@ def environment(cfg, render=True):
             if (mtp / 'records-mtp.tsv').exists() and (mtp / 'receipts.json').exists():
                 env.setdefault('DS41_MTP_EXL3', str(mtp))
                 break
+        # s0ma change 105: the drafter's 98 starved experts (change 80's weight audit) read in place from host memory
+        # instead of pinned in VRAM (change 81); the freed ~0.87 GiB goes to target slots. Measured 2026-11-04
+        # (route counts): 0 of 28,800 drafter routes reach them. Sero, two seeds: 80.93 tok/s against 77.8-80.2 plain,
+        # verify 26.85 -> 26.4 ms a step, acceptance 0.755. Needs the EXL3 drafter bank. A lab --env DS41_SPARK_COLD=
+        # (empty) turns it off
+        if env.get('DS41_MTP_EXL3', '0') not in ('', '0'):
+            env.setdefault('DS41_SPARK_COLD', SPARK_STARVED)
         # s0ma change 52 (V6): 2 GiB more K3 slots in 4 chunks that each prompt borrows back for its scratch (change 51).
         # Seed 22, 46 GiB tier: 40.43 -> 41.88 tok/s, tokens 7/7 identical, verify 57.4 -> 55.3 ms a step; first
         # token 5.65 -> 6.13 s mean (all of it inside the engine's prefill; lending itself 3-10 ms). A lab
@@ -364,7 +381,7 @@ def environment(cfg, render=True):
         # s0ma change 91: the parked conversations' arenas come out of these slots, so prefill keeps the free VRAM it
         # had (1 GiB less free pushed 8K prompts into two segments, change 25)
         extra = float(SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
-        extra = max(0.0, extra - parked_gib(cfg, env) - patch_gib(env) - graphs_gib(env))
+        extra = max(0.0, extra - parked_gib(cfg, env) - patch_gib(env) - graphs_gib(env) - cold_gib(env))
         env.setdefault('DS41_EXPERT_EXTRA_GIB', f'{extra:.2f}')
     # s0ma change 79: the conversations kept in RAM (change 73) sized to the window: a saved conversation holds ~0.9 KB a
     # token (the four global layers' compressed KV and indexer keys up to its frontier, 890 B, and its ids) and 3 MB

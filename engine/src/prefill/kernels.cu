@@ -8,6 +8,7 @@
 #endif
 #endif
 #include "ds41/prefill/kernels.cuh"
+#include <cstdlib>
 #include "ds41/dense.h"
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -98,6 +99,59 @@ __global__ void promote_stats(const bf16*x,float*y,float*rstd,int M,int K,float 
  for(int i=tid*4;i<K;i+=blockDim.x*4)for(int j=0;j<4;++j)if(i+j<K){float a=__bfloat162float(xr[i+j]);yr[i+j]=a;v[j]=__fadd_rn(v[j],__fmul_rn(a,a));}
  float sum=blocksum(__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[1]),v[2]),v[3]),sh,width);if(!tid)rstd[row]=rsqrtf(__fadd_rn(__fmul_rn(sum,1.f/K),eps));
 }
+// s0ma change 94: select_rows' choices, one warp a row (as hotpath::route_plan_rows): each lane holds 12 of the 384
+// biased scores; six warp-wide picks of the greatest (ties: the lower expert), each taken before the next. Then the
+// same weights, summed in the same order by lane 0. The same ids and weights, bit for bit.
+__global__ void select_rows_warp(const float* biased,const float* unbiased,int* ids,float* weights,int rows){DS41_PDL_WAIT();
+  const int r=int((size_t(blockIdx.x)*blockDim.x+threadIdx.x)>>5),lane=threadIdx.x&31;
+  if(r>=rows)return;
+  const float* b=biased+size_t(r)*384;
+  float v[12];
+  #pragma unroll
+  for(int i=0;i<12;++i)v[i]=b[lane+32*i];
+  unsigned taken=0;int sel[6];
+  #pragma unroll
+  for(int k=0;k<6;++k){
+    float bv=0.f;int bi=0x7fffffff;bool have=false;
+    #pragma unroll
+    for(int i=0;i<12;++i){
+      if((taken>>i)&1u)continue;
+      const int e=lane+32*i;const float x=v[i];
+      if(!have||x>bv||(x==bv&&e<bi)){bv=x;bi=e;have=true;}
+    }
+    for(int d=16;d;d>>=1){
+      const float ov=__shfl_xor_sync(0xffffffffu,bv,d);const int oi=__shfl_xor_sync(0xffffffffu,bi,d);
+      const int oh=__shfl_xor_sync(0xffffffffu,int(have),d);
+      if(oh&&(!have||ov>bv||(ov==bv&&oi<bi))){bv=ov;bi=oi;have=true;}
+    }
+    sel[k]=bi;
+    if((bi&31)==lane)taken|=1u<<(bi>>5);
+  }
+  if(lane)return;
+  const float* u=unbiased+size_t(r)*384;
+  for(int k=0;k<6;++k)ids[r*6+k]=sel[k];
+  float s4[4]={0,0,0,0};for(int k=0;k<6;++k)s4[k%4]=__fadd_rn(s4[k%4],u[sel[k]]);
+  float sum=__fadd_rn(__fadd_rn(s4[0],s4[2]),__fadd_rn(s4[1],s4[3]));
+  sum=__fadd_rn(sum,1e-20f);
+  for(int k=0;k<6;++k)weights[r*6+k]=__fmul_rn(u[sel[k]]/sum,1.5f);
+}
+// s0ma change 94: libds41_dense's engram gate (ops.cu) for up to 8 prompt rows in one launch, in place: block b is
+// row rows[b/4]'s hyper-connection stream b%4. 128 threads a block, the reduction ds41_dense_engram_gate runs for one
+// row (M=1: height 4, width 128), so every row's gate and output are bit for bit the per-row call's.
+struct EngramRows{int r[8];};
+__global__ void engram_rows(bf16* h,EngramRows rows,const bf16* kv,const bf16* qw,const bf16* kw,int K,float eps){DS41_PDL_WAIT();
+ __shared__ float sh[3][512];const int t=blockIdx.x/4,j=blockIdx.x%4,tid=threadIdx.x;
+ bf16* hr=h+(size_t(rows.r[t])*4+j)*K;
+ const bf16* key=kv+size_t(t)*5*K+size_t(j)*K;const bf16* value=kv+size_t(t)*5*K+size_t(4)*K;
+ float v[3][4]={{0,0,0,0},{0,0,0,0},{0,0,0,0}};
+ for(int i=tid*4;i<K;i+=blockDim.x*4)for(int q=0;q<4;++q)if(i+q<K){int k=i+q;float a=__bfloat162float(hr[k]),b=__bfloat162float(key[k]);float w=__fmul_rn(__bfloat162float(qw[j*K+k]),__bfloat162float(kw[j*K+k]));
+  v[0][q]=__fadd_rn(v[0][q],__fmul_rn(a,a));v[1][q]=__fadd_rn(v[1][q],__fmul_rn(b,b));v[2][q]=__fadd_rn(v[2][q],__fmul_rn(__fmul_rn(a,w),b));}
+ float sum[3];for(int r=0;r<3;++r){sum[r]=__fadd_rn(__fadd_rn(__fadd_rn(v[r][0],v[r][1]),v[r][2]),v[r][3]);sh[r][tid]=sum[r];}__syncthreads();
+ for(int d=blockDim.x/2;d>=32;d>>=1){if(tid<d)for(int r=0;r<3;++r){sum[r]=__fadd_rn(sum[r],sh[r][tid+d]);sh[r][tid]=sum[r];}__syncthreads();}
+ if(tid<32){for(int d=16;d;d>>=1)for(int r=0;r<3;++r)sum[r]=__fadd_rn(sum[r],__shfl_down_sync(0xffffffff,sum[r],d));
+  if(!tid){float rstd=__fmul_rn(rsqrtf(__fadd_rn(__fmul_rn(sum[0],1.f/K),eps)),rsqrtf(__fadd_rn(__fmul_rn(sum[1],1.f/K),eps)));float dot=__fmul_rn(__fmul_rn(sum[2],rstd),1.f/sqrtf(float(K)));float gate=1.f/(1.f+expf(-copysignf(sqrtf(fmaxf(fabsf(dot),1e-6f)),dot)));sh[0][0]=gate;}}
+ __syncthreads();for(int k=tid;k<K;k+=blockDim.x)hr[k]=__float2bfloat16_rn(__fadd_rn(__bfloat162float(hr[k]),__fmul_rn(sh[0][0],__bfloat162float(value[k]))));
+}
 __global__ void select_rows(const float* biased,const float* unbiased,int* ids,float* weights,int rows){DS41_PDL_WAIT();
   int r=blockIdx.x;if(r>=rows||threadIdx.x)return;
   biased+=size_t(r)*384;unbiased+=size_t(r)*384;ids+=r*6;weights+=r*6;
@@ -129,7 +183,18 @@ int hc_mixes_rows(void* blas,const void* h,const float* fn,const float* scale,co
   return cudaGetLastError();
 }
 void select_routes_rows(const float* biased,const float* unbiased,int* ids,float* weights,int rows,cudaStream_t s){
-  rows_detail::select_rows<<<rows,32,0,s>>>(biased,unbiased,ids,weights,rows);
+  // s0ma change 94: one warp a row, 8 rows a block (DS41_PREFILL_SELECT_WARP=0: the one-thread scan)
+  static const bool warp=[]{const char* v=std::getenv("DS41_PREFILL_SELECT_WARP");return !(v&&v[0]=='0');}();
+  if(warp)rows_detail::select_rows_warp<<<(rows+7)/8,256,0,s>>>(biased,unbiased,ids,weights,rows);
+  else rows_detail::select_rows<<<rows,32,0,s>>>(biased,unbiased,ids,weights,rows);
+}
+int engram_gate_rows(void* h,const int* rows,int count,const void* kv,const void* qw,const void* kw,int K,float eps,
+    cudaStream_t s){
+  if(!h||!rows||count<1||count>8||!kv||!qw||!kw||K<128||K%4)return cudaErrorInvalidValue;
+  rows_detail::EngramRows r{};for(int i=0;i<count;++i)r.r[i]=rows[i];
+  rows_detail::engram_rows<<<count*4,128,0,s>>>((rows_detail::bf16*)h,r,(const rows_detail::bf16*)kv,
+      (const rows_detail::bf16*)qw,(const rows_detail::bf16*)kw,K,eps);
+  return cudaGetLastError();
 }
 // Token-major grouped BF16 einsum x[M,G,K] . w[G,N,K]^T -> y[M,G,N] (ds41_dense_wo_a without its M<=8 cap).
 int wo_a_rows(void* blas,const void* x,const void* w,void* y,int M,int N,int K,int G,cudaStream_t s){

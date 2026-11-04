@@ -86,6 +86,7 @@ struct PrefillData {
   std::array<std::unique_ptr<EngramAsync::Ticket>,2> engram;
   std::array<const char*,2> engram_raw{};
   double engram_barrier_ms=0;
+  double engram_wait_ms=0;   // s0ma change 94: the layer 1 and 14 waits for the prompt's Engram rows
   static size_t required_bytes(size_t n,int64_t b,size_t tail) {
     const int64_t end=b+int64_t(n);
     const int candidate_width=std::min<int64_t>(2048,(end+7)/8)*8;
@@ -1094,6 +1095,13 @@ void pengram_rows(int layer,const char* raw,const int* rows,int count,Device& ch
   async_engram->dequant(pe_raw.p,pe_bf.p,24*count,stream);
   CK(ds41_dense_quant(pe_bf.p,pe_aq.p,pe_as.p,count,6144,stream));
   CK(ds41_dense_fp8(pe_aq.p,pe_as.p,weight.data.p,w(p+".wkv.scale").data.p,pe_kv.p,count,(HC+1)*H,6144,2,stream));
+  // s0ma change 94: every row's gate in one launch, in place (the per-row call's geometry: bit for bit)
+  static const bool batched=[]{const char* v=std::getenv("DS41_PREFILL_ENGRAM_ROWS");return !(v&&v[0]=='0');}();
+  if(batched) {
+    CK(ds41e::prefill::engram_gate_rows(chunk_h.p,rows,count,pe_kv.p,w(p+".q_weight").data.p,w(p+".k_weight").data.p,
+                                         H,1e-20f,stream));
+    return;
+  }
   for(int i=0;i<count;++i) {
     char* row_h=chunk_h.as<char>(size_t(rows[i])*HC*H*2);
     const char* kv=pe_kv.as<char>(size_t(i)*(HC+1)*H*2);
@@ -1102,6 +1110,33 @@ void pengram_rows(int layer,const char* raw,const int* rows,int count,Device& ch
                               next_h.p,1,H,1e-20f,stream));
     std::swap(h,next_h);
     pcopy(row_h,h.p,HC*H*2);
+  }
+}
+// s0ma change 94: the prompt's embeddings in one launch a 32K rows, straight into pf.hidden and pf.previous_pre (the
+// same copies the per-row expand_embedding makes); image rows then overwritten row by row as before
+void pembed_rows(PrefillData &pf,const std::vector<int>& input,const std::vector<const void*>* image_embed) {
+  static const bool batched=[]{const char* v=std::getenv("DS41_PREFILL_EMBED_ROWS");return !(v&&v[0]=='0');}();
+  if(batched&&pf.ids.bytes>=input.size()*4) {
+    for(size_t first=0;first<input.size();first+=32768) {
+      const size_t n=std::min<size_t>(32768,input.size()-first);
+      CK(cudaMemcpyAsync(pf.ids.p,input.data()+first,n*4,cudaMemcpyHostToDevice,stream));
+      hotpath::embedding(w("embed.weight").data.p,pf.ids.as<int>(),pf.hidden.as<char>(first*HC*H*2),
+          pf.previous_pre.as<float>(first*4),int(n),stream);
+      CK(cudaGetLastError());
+      CK(cudaStreamSynchronize(stream));   // (the host ids are read before the next part)
+    }
+    if(image_embed)for(size_t r=0;r<input.size();++r)if(pf.image[r]) {
+      expand_embedding((*image_embed)[r],h.p,pre.as<float>(),H,stream);
+      pcopy(pf.hidden.as<char>(r*HC*H*2),h.p,HC*H*2);
+      pcopy(pf.previous_pre.as<char>(r*4*4),pre.p,4*4);
+    }
+    return;
+  }
+  for(size_t r=0;r<input.size();++r) {
+    expand_embedding(image_embed&&pf.image[r]?(*image_embed)[r]:w("embed.weight").data.as<Bf16>(size_t(input[r])*H*2),
+        h.p,pre.as<float>(),H,stream);
+    pcopy(pf.hidden.as<char>(r*HC*H*2),h.p,HC*H*2);
+    pcopy(pf.previous_pre.as<char>(r*4*4),pre.p,4*4);
   }
 }
 void pengram(int layer,const void* raw) {
@@ -1401,11 +1436,7 @@ std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup>& groups
         for(int j=0;j<2;++j)pf.rowids[j].insert(pf.rowids[j].end(),ids[j].begin(),ids[j].end());
       }
       if(async_engram)for(int j=0;j<2;++j)pf.engram[j]=async_engram->submit(j==0?1:14,pf.rowids[j]);
-      for(size_t r=0;r<input.size();++r) {
-        expand_embedding(w("embed.weight").data.as<Bf16>(size_t(input[r])*H*2),h.p,pre.as<float>(),H,stream);
-        pcopy(pf.hidden.as<char>(r*HC*H*2),h.p,HC*H*2);
-        pcopy(pf.previous_pre.as<char>(r*4*4),pre.p,4*4);
-      }
+      pembed_rows(pf,input,nullptr);
       CK(cudaStreamSynchronize(stream));
     });
     for(int l=0;l<40;++l) {
@@ -1429,7 +1460,8 @@ std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup>& groups
           const char* raw=nullptr;
           if((l==1||l==14)&&async_engram) {
             int j=l==1?0:1;
-            if(!pf.engram_raw[j])pf.engram_raw[j]=static_cast<const char*>(pf.engram[j]->wait(pf.rows*24));
+            if(!pf.engram_raw[j]){const double w0=clock_ms();   // s0ma change 94: the host's wait, timed
+              pf.engram_raw[j]=static_cast<const char*>(pf.engram[j]->wait(pf.rows*24));pf.engram_wait_ms+=clock_ms()-w0;}
             raw=pf.engram_raw[j]+size_t(first-pf.begin)*24*264;
           }
           const int64_t R=prefill_chunk->R;
@@ -1629,11 +1661,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
     if(async_engram)for(int j=0;j<2;++j)pf.engram[j]=async_engram->submit(j==0?1:14,pf.rowids[j]);
     mark("hash");
     // Start I/O before enqueueing prompt-sized embedding work as well.
-    for(size_t r=0;r<input.size();++r) {
-      expand_embedding(pf.image[r]?image_embed[r]:w("embed.weight").data.as<Bf16>(size_t(input[r])*H*2),h.p,pre.as<float>(),H,stream);
-      pcopy(pf.hidden.as<char>(r*HC*H*2),h.p,HC*H*2);
-      pcopy(pf.previous_pre.as<char>(r*4*4),pre.p,4*4);
-    }
+    pembed_rows(pf,input,&image_embed);   // s0ma change 94
     CK(cudaStreamSynchronize(stream));
     for(const auto &work:plan) {
       int l=work.layer;auto p="layers."+std::to_string(l);pf.query=work.query;
@@ -1656,7 +1684,8 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
         const char* raw=nullptr;
         if((l==1||l==14)&&async_engram) {
           int j=l==1?0:1;
-          if(!pf.engram_raw[j])pf.engram_raw[j]=static_cast<const char*>(pf.engram[j]->wait(pf.rows*24));
+          if(!pf.engram_raw[j]){const double w0=clock_ms();   // s0ma change 94: the host's wait, timed
+              pf.engram_raw[j]=static_cast<const char*>(pf.engram[j]->wait(pf.rows*24));pf.engram_wait_ms+=clock_ms()-w0;}
           raw=pf.engram_raw[j]+size_t(first-pf.begin)*24*264;
         }
         if(prefill_chunk) {
@@ -1783,12 +1812,13 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
         {"arena_bytes",prefetch->cap}};std::cerr<<"prefill prefetch: "<<prefetch->served<<" of "<<prefetch->copied
         <<" experts copied during attention served ("<<prefetch->bytes/1048576<<" MiB, arena "<<(prefetch->cap>>20)<<" MiB)\n";}
     prefetch.reset();   // s0ma change 77: the arena and its worker belong to the prompt
+    const double engram_wait_note=pf.engram_wait_ms+pf.engram_barrier_ms;   // s0ma change 94 (pf goes next)
     prefill_chunk.reset();pref.reset();result.elapsed_ms=clock_ms()-begin_ms;total_ms+=result.elapsed_ms;
     mark("free");
     {
       size_t free=0,total=0;CK(cudaMemGetInfo(&free,&total));
       std::cerr<<"prefill phases: rows "<<input.size()<<", free "<<(free>>20)<<" MiB, lent "<<lent_chunks<<" of "
-               <<lend_chunks_total<<" chunks, ms:";
+               <<lend_chunks_total<<" chunks, Engram waits "<<engram_wait_note<<" ms, ms:";
       double at=begin_ms;
       for(auto &[name,t]:phase_marks){std::cerr<<" "<<name<<" "<<std::fixed<<std::setprecision(1)<<t-at;at=t;}
       std::cerr<<std::defaultfloat<<std::setprecision(6)<<"\n";

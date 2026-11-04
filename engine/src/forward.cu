@@ -50,6 +50,8 @@ extern "C" cudaError_t cudaProfilerStop(void);
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <set>
+#include "ds41/graph_keys.hpp"   // s0ma change 100
 #include <future>
 #include <thread>
 #include <condition_variable>
@@ -241,6 +243,7 @@ extern "C" const char *ds41_pdl_node_types(cudaGraph_t graph);
 struct Graph {
   cudaGraph_t graph = nullptr;
   cudaGraphExec_t exec = nullptr;
+  bool exit_dense_since_quant = false;   // s0ma change 100: the host flag the body leaves (a replay restores it)
   ~Graph() {
     if (exec)
       cudaGraphExecDestroy(exec);
@@ -449,7 +452,9 @@ class Native final : public Forward, public hotpath::GateEvidence {
   // memory allocation nodes, and such a graph can be neither cloned nor have edges removed (the two refusals seen).
   Device pdl_blas_workspace, pdl_lane_workspace;
   void pdl_workspace(cublasHandle_t handle, cudaStream_t on, Device &ws) {
-    if (ds41_pdl_mode() <= 0) return;
+    // s0ma change 100: DS41_GRAPHS=fixed too: captured cuBLAS calls then use the same workspace as eager ones (no
+    // allocation nodes, and the same kernels chosen in and out of a graph)
+    if (ds41_pdl_mode() <= 0 && ds41e::graphs_mode() != 1) return;
     // s0ma change 39: the handle's stream first: setting a stream resets the workspace (the wrappers now set it only
     // when it changes, and the handle stays on this stream)
     if (cublasSetStream(handle, on) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasSetStream (DS41_PDL)");
@@ -461,6 +466,26 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::string pdl_error, pdl_alloc_note;   // s0ma change 38
   uint64_t pdl_skipped = 0;
   uint64_t graph_evictions = 0, initial_evictions = 0;
+  // s0ma change 100 (DS41_GRAPHS=fixed): launches of the keys left eager, and keys whose capture failed (then eager)
+  uint64_t graph_eager = 0, initial_eager = 0;
+  std::set<std::string> graph_failed;
+  // s0ma change 100: a step's layers swap h/next_h and pre/ffn_pre an even number of times, so each layer's graphs see
+  // the same buffers every step; a step that fails part way could leave them swapped, and replays would then read the
+  // other buffer. Each step starts from the first buffers it ever used (the embedding overwrites both).
+  // (lane B, --verify-lanes, has its own pair of each: index 1)
+  std::array<const void *, 2> canon_h{}, canon_pre{};
+  void canonical_buffers() {
+    const int k = lane_b_active ? 1 : 0;
+    if (!canon_h[k]) { canon_h[k] = h.p; canon_pre[k] = pre.p; return; }
+    if (h.p != canon_h[k]) std::swap(h, next_h);
+    if (pre.p != canon_pre[k]) std::swap(pre, ffn_pre);
+    if (h.p != canon_h[k] || pre.p != canon_pre[k]) {   // not expected: start over (graphs hold the old addresses)
+      std::cerr << "step buffers moved; CUDA graphs dropped and captured again\n";
+      CK(cudaStreamSynchronize(stream));
+      graphs.clear();
+      canon_h[k] = h.p; canon_pre[k] = pre.p;
+    }
+  }
   std::array<std::array<int,40>,6> attention_scan_bucket{};
   bool graph_ready = false;
   Device h{HC * H * 2}, next_h{HC * H * 2}, x{H * 2}, y{H * 2}, f32{HC * H * 4};
@@ -919,6 +944,9 @@ public:
     if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS)
       throw std::runtime_error("cublasCreate");
     pdl_workspace(blas, stream, pdl_blas_workspace);   // s0ma change 36
+    if (ds41e::graphs_mode() == 1)   // s0ma change 100
+      std::cerr << "CUDA graphs: the fixed groups only (DS41_GRAPHS=fixed): query, route, output, shared, lookahead, "
+                   "reduce, head; attention and the expert batches eager\n";
     vram_checkpoint("native_after_cublas");
     if (c.cuda_stack_bytes) {
       if (c.cuda_stack_bytes > 65536) throw std::invalid_argument("CUDA stack request exceeds bounded candidate limit");
@@ -1395,6 +1423,7 @@ public:
     initial_replays = graph_replays;
     initial_captures = graph_captures;
     initial_evictions = graph_evictions;
+    initial_eager = graph_eager;
   }
   struct NativeSnapshot : Snapshot {
     std::vector<Device> windows;
@@ -1931,6 +1960,9 @@ public:
     j["graph_count"] = graphs.size();
     j["graph_captures"] = graph_captures - initial_captures;
     j["graph_evictions"] = graph_evictions - initial_evictions;
+    j["graph_mode"] = ds41e::graphs_mode() == 1 ? "fixed" : ds41e::graphs_mode() == 2 || config.graphs ? "all" : "off";
+    j["graph_eager"] = graph_eager - initial_eager;
+    j["graph_failed_keys"] = graph_failed.size();
     j["graph_replays"] = graph_replays - initial_replays;
     if (ds41_pdl_mode() > 0) {   // s0ma change 32
       j["pdl_mode"] = ds41_pdl_mode();
@@ -2182,26 +2214,59 @@ private:
       throw;
     }
   }
-  template <class F> void graph(const std::string &key, F body) {
-    if (!config.graphs || !graph_ready || !config.trace_dir.empty()) {
+  template <class F> void graph(const std::string &name, F body) {
+    const int gmode = ds41e::graphs_mode();   // s0ma change 100
+    if (!(config.graphs || gmode > 0) || !graph_ready || !config.trace_dir.empty()) {
       body();
       return;
     }
+    if (gmode == 1 && (!ds41e::fixed_graph_key(name) || graph_failed.count(name))) {
+      ++graph_eager;
+      body();
+      return;
+    }
+    // s0ma change 100: the host flag a body reads (blinear's quantize-again decision) is part of the key, and a replay
+    // leaves it as the captured body did
+    const std::string key = dense_since_quant ? name + "#q" : name;
     auto it = graphs.find(key);
     if (it != graphs.end()) {
       CK(cudaGraphLaunch(it->second->exec, stream));
+      dense_since_quant = it->second->exit_dense_since_quant;
       ++graph_replays;
       return;
     }
     auto recorded = std::make_unique<Graph>();
     CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    const bool entry_flag = dense_since_quant;
+    // s0ma change 100: with DS41_GRAPHS=fixed a body that cannot be captured runs eagerly from then on (nothing it
+    // queued under capture ran); otherwise a failed capture fails the request, as before
+    auto eager_instead = [&](const std::string &why) {
+      cudaGetLastError();
+      if (recorded->graph) { cudaGraphDestroy(recorded->graph); recorded->graph = nullptr; }
+      graph_failed.insert(name);
+      if (graph_failed.size() <= 8)
+        std::cerr << "DS41_GRAPHS=fixed: " << name << " could not be captured (" << why << "); it runs eagerly\n";
+      dense_since_quant = entry_flag;
+      ++graph_eager;
+      body();
+    };
     try {
       body();
+    } catch (const std::exception &e) {
+      cudaStreamEndCapture(stream, &recorded->graph);
+      if (gmode != 1) throw;
+      eager_instead(e.what());
+      return;
     } catch (...) {
       cudaStreamEndCapture(stream, &recorded->graph);
       throw;
     }
-    CK(cudaStreamEndCapture(stream, &recorded->graph));
+    if (const cudaError_t rc = cudaStreamEndCapture(stream, &recorded->graph); rc != cudaSuccess) {
+      if (gmode != 1) CK(rc);
+      eager_instead(cudaGetErrorString(rc));
+      return;
+    }
+    recorded->exit_dense_since_quant = dense_since_quant;
     if (ds41_pdl_mode() < 0) throw std::invalid_argument("DS41_PDL takes 0, 1 or 2");
     if (const int mode = ds41_pdl_mode(); mode > 0 && !pdl_off) {
       // s0ma change 32: the captured graph's edges rewritten in place (cudaGraphClone is refused for captured graphs
@@ -2240,7 +2305,15 @@ private:
         ++pdl_graphs;
       }
     }
-    if (!recorded->exec) CK(cudaGraphInstantiate(&recorded->exec, recorded->graph, 0));
+    if (!recorded->exec) {
+      const cudaError_t rc = cudaGraphInstantiate(&recorded->exec, recorded->graph, 0);
+      if (rc != cudaSuccess && gmode == 1) {   // s0ma change 100: eager instead (the captured work never ran)
+        recorded->exec = nullptr;
+        eager_instead(std::string("instantiate: ") + cudaGetErrorString(rc));
+        return;
+      }
+      CK(rc);
+    }
     CK(cudaGraphLaunch(recorded->exec, stream));
     ++graph_replays;
     graphs.emplace(key, std::move(recorded));
@@ -3010,6 +3083,7 @@ private:
     upload_cursor = 1 << 20;
     in_step = true;
     graph_ready = pos > 0;
+    canonical_buffers();   // s0ma change 100
     auto rowids = hash.rows(token, pos);
     if (async_engram) {
       // The previous one() synchronized this stream before its tickets can

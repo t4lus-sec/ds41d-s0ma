@@ -515,7 +515,12 @@ void bshared(const std::string &p,int m) {
 template<class F> void bgraph(const std::string &key,int m,F f) {
   if(hotpath_capturing) { f(); return; }
   // Lane B owns different scratch addresses, so its graphs never share keys with lane A's.
-  graph(std::string(lane_b_active?"laneB.":"")+"batch."+std::to_string(m)+"."+key,[&]{
+  const std::string full=std::string(lane_b_active?"laneB.":"")+"batch."+std::to_string(m)+"."+key;
+  // s0ma change 100 (DS41_GRAPHS=fixed): a key left eager runs as plain launches, so the fixed keys inside it (the
+  // query projections inside attention's body from position 1024) are still captured and replayed
+  if(graph_ready && config.trace_dir.empty() && ds41e::graphs_mode()==1 &&
+     (!ds41e::fixed_graph_key(full) || graph_failed.count(full))) { ++graph_eager; f(); return; }
+  graph(full,[&]{
     hotpath_capturing=true;
     try { f(); } catch(...) { hotpath_capturing=false; throw; }
     hotpath_capturing=false;
@@ -525,13 +530,13 @@ template<class F> void bgraph(const std::string &key,int m,F f) {
 // shapes can be destroyed without adding a synchronization. Width and modulo8
 // variants remain reusable; rejected-prefix rollback simply recaptures a shape.
 void trim_attention_graphs(int layer,int rows,int scan) {
-  if(!config.graphs || !config.trace_dir.empty()) return;
+  if(!(config.graphs || ds41e::graphs_mode()==2) || !config.trace_dir.empty()) return;   // (fixed: attention is eager)
   int &previous=attention_scan_bucket[rows-1][layer];
   if(previous==scan) return;
   const auto prefix=std::string(lane_b_active?"laneB.":"")+"batch."+std::to_string(rows)+".layers."+
       std::to_string(layer)+".attention."+std::to_string(previous)+".";
-  for(int mod=0;mod<8;++mod)
-    graph_evictions+=graphs.erase(prefix+std::to_string(mod));
+  for(int mod=0;mod<8;++mod)   // (s0ma change 100: and the keys captured with the quantize flag set)
+    graph_evictions+=graphs.erase(prefix+std::to_string(mod))+graphs.erase(prefix+std::to_string(mod)+"#q");
   previous=scan;
 }
 // One verify lane: m consecutive rows starting at pos. The plain path runs a single lane;
@@ -560,6 +565,7 @@ StepMarks step_marks(int64_t pos) {
   phase_index=0; phase_names.clear(); upload_cursor=4<<20;
   route_gap_first.fill(-2);   // s0ma change 83
   in_step=true; graph_ready=pos>0;
+  canonical_buffers();   // s0ma change 100
   return k;
 }
 template<class F> void lane_phase(const std::string &name,F call) {
@@ -863,6 +869,7 @@ std::vector<std::vector<float>> batch_lanes(const std::vector<int> &tokens,int64
   const int m=int(tokens.size());
   ensure_lanes();
   auto marks=step_marks(pos);
+  swap_lane(); canonical_buffers(); swap_lane();   // s0ma change 100: lane B's pairs too
   BatchLane a,b;
   CK(cudaEventRecord(lane_entry,stream));
   batch_begin(tokens.data(),1,pos,a);

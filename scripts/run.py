@@ -126,6 +126,14 @@ ENGINE_ENV = {
     'DS41_SPARK_GPU_DRAW': '1',
     # long prompts split into prefill segments that fit the VRAM the expert cache leaves free
     'DS41_PREFILL_CHUNK_FIT': '1',
+    # s0ma change 85: change 84's staged lanes. A prompt's experts copied from RAM run on 2 side lanes of the greatest
+    # stream priority, so their ring slots free soon after the copies land (exact; Sero 2026-11-03, one seed, tokens
+    # 7/7 identical): sweep 8K 2946 -> 2601 ms, 2.3K 2185 -> 1939 ms; prefill -7 to -8% at every size; ring slot waits
+    # 821 -> 20 ms. =0 off
+    'DS41_PREFILL_STAGED_LANES': '2',
+    # s0ma change 85: change 83's routes picked and planned on the GPU (exact, tokens 7/7 identical): the GPU's wait
+    # for the host's routes 1.18 -> 0.67 ms a step, decode 78.3 -> 78.8 tok/s. =0 off, =check compares with the host
+    'DS41_GPU_ROUTE': '1',
 }
 # GPUDirect Storage: NVMe misses during decode are read straight into their VRAM slot (docs/gds.md).
 GDS_ENV = {'DS41_MOE_GDS': '1', 'CUFILE_USE_PCIP2PDMA': 'true'}

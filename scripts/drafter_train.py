@@ -1004,6 +1004,32 @@ def write_patch(a, model, state, stock, result, anchors):
     (out / 'manifest.json').write_text(json.dumps(manifest, indent=1) + '\n')
 
 
+def identity(a):
+    """the stock drafter written as a patch, exactly as train writes one (an FP8 weight as its exact BF16 dequant): the
+    check that loading a patch leaves the drafter as it was (ds41d with it should score as without it)"""
+    import torch
+    from safetensors.torch import save_file
+    ck = Checkpoint(a.weights)
+    tensors = {}
+    for name, dt, group in TENSORS:
+        if group not in LEVELS[a.train]:
+            continue
+        t = load_dense(ck, name)
+        if name.endswith('attn_sink') or name.endswith('_scale') or name.endswith('_base') or name.endswith('.bias'):
+            t = t.reshape(-1)
+        tensors[name] = t.to(torch.bfloat16 if dt == 'bf16' else torch.float32).contiguous()
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    part = out / 'patch.safetensors.partial'
+    save_file(tensors, str(part))
+    os.replace(part, out / 'patch.safetensors')
+    manifest = {'format': 1, 'identity': True, 'created': time.strftime('%Y-%m-%dT%H:%M:%S'), 'train': a.train,
+                'tensors': len(tensors), 'bytes': sum(t.numel() * t.element_size() for t in tensors.values()),
+                'weights': str(a.weights)}
+    (out / 'manifest.json').write_text(json.dumps(manifest, indent=1) + '\n')
+    say(f'identity patch ({a.train}): {len(tensors)} stock tensors, {manifest["bytes"] / 2**20:,.0f} MiB -> {out}')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -1021,6 +1047,10 @@ def main():
     c.add_argument('--data', required=True)
     c.add_argument('--socket', default='')
     c.add_argument('--topk', type=int, default=32)
+    i = sub.add_parser('identity')
+    i.add_argument('--weights', required=True)
+    i.add_argument('--out', required=True)
+    i.add_argument('--train', choices=sorted(LEVELS), default='medium')
     for name in ('train', 'eval'):
         t = sub.add_parser(name)
         t.add_argument('--data', required=True)
@@ -1042,7 +1072,7 @@ def main():
         else:
             t.add_argument('--patch', default='')
     a = ap.parse_args()
-    {'export': export, 'capture': capture, 'train': train, 'eval': run_eval}[a.cmd](a)
+    {'export': export, 'capture': capture, 'train': train, 'eval': run_eval, 'identity': identity}[a.cmd](a)
 
 
 if __name__ == '__main__':

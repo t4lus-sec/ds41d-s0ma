@@ -289,6 +289,33 @@ class TinyDrafter(unittest.TestCase):
             r = dt.evaluate(model, dt.Docs(d / 'data', 'heldout', 4), e, torch.device('cpu'), e.eval_anchors)
             self.assertAlmostEqual(r['expected_accepted'], manifest['trained']['expected_accepted'], delta=1e-3)
 
+    def test_identity_patch_scores_as_stock(self):
+        dt = self.dt
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            rng = np.random.default_rng(5)
+            (d / 'ck').mkdir()
+            tiny_checkpoint(d / 'ck', rng)
+            tiny_data(d / 'data', rng, docs=3)
+            e = types.SimpleNamespace(data=str(d / 'data'), weights=str(d / 'ck'), batch=16, other_weight=0.2,
+                                      eval_anchors=128, eval_stride=1)
+            rope = torch.from_numpy(np.fromfile(d / 'data' / 'docs' / 'rope.f32', dtype=np.float32).reshape(-1, dt.RD))
+            scores = {}
+            for level in (None, 'small', 'medium'):
+                patch = ''
+                if level:
+                    patch = str(d / f'id-{level}')
+                    dt.identity(types.SimpleNamespace(weights=str(d / 'ck'), out=patch, train=level))
+                    m = json.loads((Path(patch) / 'manifest.json').read_text())
+                    self.assertTrue(m['identity'])
+                model = dt.Drafter(dt.Checkpoint(e.weights), '', torch.device('cpu'), None, patch)
+                model.rope_table = rope
+                scores[level] = dt.evaluate(model, dt.Docs(d / 'data', 'heldout', 4), e, torch.device('cpu'), 128)
+            # the small set keeps every dtype: the drafter is unchanged bit for bit
+            self.assertEqual(scores['small'], scores[None])
+            # medium writes FP8 weights as their exact BF16 values; only the activations' FP8 rounding goes
+            self.assertAlmostEqual(scores['medium']['expected_accepted'], scores[None]['expected_accepted'], delta=0.02)
+
     def test_gradients_reach_every_trainable_tensor(self):
         dt = self.dt
         with tempfile.TemporaryDirectory() as d:

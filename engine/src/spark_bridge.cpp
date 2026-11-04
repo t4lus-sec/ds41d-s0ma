@@ -273,6 +273,9 @@ class SparkTarget final : public Forward, public DraftProvider {
       throw std::runtime_error(why);
     }
   }
+  static const char *dtype_name(int d) {
+    return d == DS41_TARGET_BF16 ? "BF16" : d == DS41_TARGET_F32 ? "F32" : d == DS41_TARGET_FP8 ? "FP8" : "U8/other";
+  }
   void bind(const char *name, const ds41_target_tensor_v1 &view) {
     if (view.abi_version != 1 || view.struct_bytes != sizeof(view) ||
         !view.data)
@@ -283,6 +286,12 @@ class SparkTarget final : public Forward, public DraftProvider {
       if (t.elements != uint64_t(view.rows) * uint64_t(view.columns))
         throw std::runtime_error(std::string("DS41_SPARK_PATCH: ") + name + " has " + std::to_string(t.elements) +
                                  " elements, the drafter's " + std::to_string(view.rows) + "x" + std::to_string(view.columns));
+      // s0ma change 102: the patch's dtype is the bound one's (an FP8 weight's patch is BF16): the kernels take the
+      // binding's bytes as that dtype, and a mismatch of equal element count would read as other numbers
+      const bool fp8 = view.dtype == DS41_TARGET_FP8;
+      if (fp8 ? t.dtype != DS41_TARGET_BF16 : t.dtype != view.dtype)
+        throw std::runtime_error(std::string("DS41_SPARK_PATCH: ") + name + " is " + dtype_name(t.dtype) +
+                                 ", the drafter binds " + (fp8 ? "BF16 for this FP8 weight" : dtype_name(view.dtype)));
       checked(ds41_spark_bind(spark_.get(), name, {t.device.get(), t.dtype, view.rows, view.columns}));
       t.bound = true;
       ++bindings_;

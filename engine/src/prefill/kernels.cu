@@ -205,4 +205,42 @@ int wo_a_rows(void* blas,const void* x,const void* w,void* y,int M,int N,int K,i
       &beta,y,CUDA_R_16BF,G*N,N,G,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
   return status==CUBLAS_STATUS_SUCCESS?0:10000+status;
 }
+// s0ma change 99 (drafter-training captures): per row of logits [M, V], the K largest (descending, lower id first on
+// ties) as log-probabilities, and the log of the probability outside them. One block a row.
+namespace topk_detail {
+constexpr int T=512;
+__device__ void reduce_max(float &v,int &id,float *sv,int *si){
+  const int t=threadIdx.x;sv[t]=v;si[t]=id;__syncthreads();
+  for(int d=T/2;d;d>>=1){if(t<d){float a=sv[t],b=sv[t+d];int ia=si[t],ib=si[t+d];
+    if(ib>=0&&(ia<0||b>a||(b==a&&ib<ia))){sv[t]=b;si[t]=ib;}}__syncthreads();}
+  v=sv[0];id=si[0];__syncthreads();
+}
+__global__ void __launch_bounds__(T) topk_logprobs(const float*logits,int V,int K,int*ids,float*lp,float*rest){
+  __shared__ float sv[T];__shared__ int si[T];__shared__ double sd[T];
+  const float*x=logits+size_t(blockIdx.x)*V;const int t=threadIdx.x;
+  float m=-INFINITY;for(int i=t;i<V;i+=T)m=fmaxf(m,x[i]);
+  int dummy=0;reduce_max(m,dummy,sv,si);
+  double z=0;for(int i=t;i<V;i+=T)z+=exp(double(x[i])-double(m));
+  sd[t]=z;__syncthreads();for(int d=T/2;d;d>>=1){if(t<d)sd[t]+=sd[t+d];__syncthreads();}
+  const double lse=double(m)+log(sd[0]);__syncthreads();
+  float pv=INFINITY;int pid=-1;double mass=0;
+  for(int k=0;k<K;++k){
+    float bv=-INFINITY;int bid=-1;
+    for(int i=t;i<V;i+=T){const float v=x[i];
+      const bool below=pid<0||v<pv||(v==pv&&i>pid);
+      if(below&&(bid<0||v>bv||(v==bv&&i<bid))){bv=v;bid=i;}}
+    reduce_max(bv,bid,sv,si);
+    if(bid<0)bid=0;
+    const double l=double(bv)-lse;mass+=exp(l);
+    if(t==0){ids[size_t(blockIdx.x)*K+k]=bid;lp[size_t(blockIdx.x)*K+k]=float(l);}
+    pv=bv;pid=bid;
+  }
+  if(t==0)rest[blockIdx.x]=float(log(fmax(1.0-mass,1e-30)));
+}
+}
+int topk_logprobs(const float* logits,int M,int V,int K,int* ids,float* lp,float* rest,cudaStream_t s){
+  if(!logits||!ids||!lp||!rest||M<1||V<1||K<1||K>V)return cudaErrorInvalidValue;
+  topk_detail::topk_logprobs<<<M,topk_detail::T,0,s>>>(logits,V,K,ids,lp,rest);
+  return cudaGetLastError();
+}
 }

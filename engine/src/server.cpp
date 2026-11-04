@@ -935,7 +935,9 @@ public:
             break;
           continue;
         }
-        if (verb != "submit" && verb != "score")
+        if (verb == "train_capture" && !train_capture_dir())   // s0ma change 99: lab only
+          throw std::invalid_argument("train_capture needs DS41_TRAIN_CAPTURE_DIR (ds41.sh lab drafter capture)");
+        if (verb != "submit" && verb != "score" && verb != "train_capture")
           throw std::invalid_argument("unknown op");
         J.verb = verb;
         J.op = op;
@@ -945,7 +947,7 @@ public:
           throw std::invalid_argument("prompt exceeds max_context");
         J.images = image_spans(op, J.ids);
         J.keys = position_keys(J.ids, J.images);
-        if (!J.images.empty() && verb == "score")
+        if (!J.images.empty() && (verb == "score" || verb == "train_capture"))
           throw std::invalid_argument("unsupported: score requests with images");
         J.draft_mode = op.value("draft", std::string("auto"));
         if (J.draft_mode != "off" && J.draft_mode != "auto" && J.draft_mode != "on")
@@ -1133,7 +1135,7 @@ public:
               if (j->priority != cls) break;
               if (probe_job(*j)) continue;
               if (probes.size() + starters.size() >= size_t(Forward::kMaxGroups)) break;
-              if (room <= 0 || j->verb == "score" || j->sampling.max_tokens == 0 ||
+              if (room <= 0 || alone(*j) || j->sampling.max_tokens == 0 ||
                   j->ids.size() + 1 > size_t(model->slot_context()) || rows + j->ids.size() > combine_rows()) break;
               rows += j->ids.size();
               starters.push_back(j);
@@ -1166,7 +1168,7 @@ public:
         if (!running.empty() && !batch_lower() && j->priority > best) break;
         if (!starters.empty() && !batch_lower() && j->priority > starters.front()->priority) break;
         if (probe_job(*j)) continue;   // s0ma change 96: probes wait for their own group
-        if (j->verb == "score" || j->sampling.max_tokens == 0 ||
+        if (alone(*j) || j->sampling.max_tokens == 0 ||
             j->ids.size() + 1 > size_t(model->slot_context())) break;
         starters.push_back(j);
         --room;
@@ -1180,10 +1182,15 @@ public:
       if (int(running.size()) >= slots) break;
       if (!running.empty() && !batch_lower() && j->priority > best) break;
       if (probe_job(*j)) continue;   // s0ma change 96: probes wait for their own group
-      if (j->verb == "score" && !running.empty()) break;   // a score request resets slot 0: it runs alone
+      if (alone(*j) && !running.empty()) break;   // a score request resets slot 0: it runs alone
       { std::lock_guard<std::mutex> l(sched_m); queue.erase(std::find(queue.begin(), queue.end(), j)); }
       if (j->verb == "score") {
         run_score(*j);
+        release(*j);
+        return;
+      }
+      if (j->verb == "train_capture") {
+        run_train_capture(*j);
         release(*j);
         return;
       }
@@ -2137,6 +2144,37 @@ public:
     J.started = false;
   }
   // a score request (today's path): it resets slot 0, so it runs only when no job is running
+  // s0ma change 99: drafter-training captures (lab only): DS41_TRAIN_CAPTURE_DIR, an existing directory
+  static const std::string &train_capture_dir_path() {
+    static const std::string v = [] { const char *e = std::getenv("DS41_TRAIN_CAPTURE_DIR"); return e ? std::string(e) : std::string(); }();
+    return v;
+  }
+  static bool train_capture_dir() { return !train_capture_dir_path().empty(); }
+  static bool alone(const Job &j) { return j.verb == "score" || j.verb == "train_capture"; }
+  void run_train_capture(Job &J) {
+    ++active;
+    struct Done { std::atomic<int> &a; ~Done() { --a; } } done{active};
+    try {
+      const std::string name = J.op.value("name", std::string());
+      if (name.empty() || name.size() > 64 ||
+          !std::all_of(name.begin(), name.end(), [](char c) { return std::isalnum((unsigned char)c) || c == '-' || c == '_'; }))
+        throw std::invalid_argument("train_capture: name must be 1..64 of [A-Za-z0-9_-]");
+      const int topk = integer(J.op, "topk", 32, 1, 64);
+      prefix = {};
+      ++model_epoch;
+      PrefillOptions options;
+      options.dense_batch_rows = prefill_dense_batch;
+      Json r = model->train_capture(J.ids, options, train_capture_dir_path() + "/" + name, topk);
+      prefix = {};
+      ++model_epoch;
+      finish(J, "stop", nullptr, r);
+    } catch (const std::exception &e) {
+      prefix = {};
+      ++model_epoch;
+      try { model->reset(); } catch (...) {}
+      fail(J, e.what());
+    }
+  }
   void run_score(Job &J) {
     auto cancelled = [&] { return this->cancelled(J); };
     const auto &ids = J.ids;
@@ -2355,6 +2393,43 @@ public:
   int64_t probe_ctx = 1 << 20;
   size_t probe_prefills = 0, probe_groups = 0, largest_prefill = 0, probe_fit = 1 << 20;
   bool supports_scratch_prefill() const override { return probes; }
+  // (s0ma change 99) a training capture's files: position i's next-token row is rows[i % rows] (as verify gives it),
+  // its top-k as log-probabilities, and zero drafter rows
+  Json train_capture(const std::vector<int> &ids, const PrefillOptions &, const std::string &out, int topk) override {
+    if (pending || ids.empty() || topk < 1 || topk > int(rows.front().size())) throw std::invalid_argument("replay train_capture");
+    reset();
+    const size_t n = ids.size(), K = size_t(topk), V = rows.front().size();
+    std::vector<int32_t> top(n * K);
+    std::vector<float> lp(n * K), rest(n);
+    for (size_t i = 0; i < n; ++i) {
+      const auto &l = rows[i % rows.size()];
+      double m = -INFINITY, z = 0;
+      for (float v : l) m = std::max(m, double(v));
+      for (float v : l) z += std::exp(double(v) - m);
+      const double lse = m + std::log(z);
+      std::vector<int> o(V);
+      std::iota(o.begin(), o.end(), 0);
+      std::partial_sort(o.begin(), o.begin() + long(K), o.end(), [&](int a, int b) { return l[a] > l[b] || (l[a] == l[b] && a < b); });
+      double mass = 0;
+      for (size_t k = 0; k < K; ++k) {
+        top[i * K + k] = o[k];
+        lp[i * K + k] = float(double(l[o[k]]) - lse);
+        mass += std::exp(double(l[o[k]]) - lse);
+      }
+      rest[i] = float(std::log(std::max(1.0 - mass, 1e-30)));
+    }
+    FILE *f = std::fopen((out + ".top").c_str(), "wb");
+    if (!f) throw std::runtime_error("replay train_capture: cannot write");
+    std::fwrite(top.data(), 4, top.size(), f); std::fwrite(lp.data(), 4, lp.size(), f); std::fwrite(rest.data(), 4, n, f);
+    std::fclose(f);
+    std::vector<uint16_t> kv(n * 3 * 512, 0);
+    f = std::fopen((out + ".kv").c_str(), "wb");
+    if (!f) throw std::runtime_error("replay train_capture: cannot write");
+    std::fwrite(kv.data(), 2, kv.size(), f);
+    std::fclose(f);
+    reset();
+    return {{"rows", n}, {"topk", topk}};
+  }
   int64_t scratch_context() const override { return probe_ctx; }
   std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup> &groups,
                                            const std::function<void(size_t, bool)> &around) override {

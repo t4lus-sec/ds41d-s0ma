@@ -110,6 +110,14 @@ struct ds41_spark{
    for(int l=0;l<3;++l){std::string p="mtp."+std::to_string(l)+".attn";linear(p+".wkv",main.p,kv.p,1,512,H);norm(p+".kv_norm",kv.p,kv.p,1,512);rope(kv.p,1,1,512,position);CK(ds41_attn_roundtrip(kv.p,1,512,DS41_SWA_FP8,stream));CK(ds41_attn_ring_write(kv.p,rings[l].p,512*2,position,1,128,stream));}
   });
  }
+ // s0ma change 99: the 3 ring rows ingest would write for captures at start.. (rows 1..8), one row at a time through
+ // ingest's own path (M1 projection, wkv, kv_norm, RoPE, FP8 roundtrip), into out BF16[rows][3][512]; no state changes
+ void kv_rows(const void*captures,int64_t start,int rows,void*out){
+  if(start<0||rows<1||rows>8)throw std::invalid_argument("kv_rows rows1..8");
+  for(int i=0;i<rows;++i){project((const bf16*)captures+size_t(i)*3*H,main.p,1);
+   for(int l=0;l<3;++l){std::string p="mtp."+std::to_string(l)+".attn";linear(p+".wkv",main.p,kv.p,1,512,H);norm(p+".kv_norm",kv.p,kv.p,1,512);rope(kv.p,1,1,512,start+i);CK(ds41_attn_roundtrip(kv.p,1,512,DS41_SWA_FP8,stream));
+    CK(cudaMemcpyAsync((bf16*)out+(size_t(i)*3+l)*512,kv.p,512*2,cudaMemcpyDeviceToDevice,stream));}}
+ }
  void hc(const std::string&p,const std::string&kind,Buf&target){CK(ds41_dense_hc_mixes(blas,h.p,(const float*)ptr(p+".hc_"+kind+"_fn"),(const float*)ptr(p+".hc_"+kind+"_scale"),(const float*)ptr(p+".hc_"+kind+"_base"),target.at<float>(),post.at<float>(),comb.at<float>(),promoted.at<float>(),mix.at<float>(),rstd.at<float>(),B,H,1e-20f,1e-6f,stream));}
  void attention(int l){std::string p="mtp."+std::to_string(l)+".attn";
   linear(p+".wq_a",x.p,qa.p,B,1280,H);norm(p+".q_norm",qa.p,qa.p,B,1280);linear(p+".wq_b",qa.p,q.p,B,32768,1280);rope(q.p,B,64,512,committed);
@@ -162,6 +170,7 @@ extern "C" int ds41_spark_markov(ds41_spark*s,int k,int32_t previous,const float
 extern "C" int ds41_spark_rollback(ds41_spark*s,int64_t committed){SPARK_TRY{if(!s||committed!=s->committed)throw std::invalid_argument("rollback length must match ingested committed prefix");if(s->c.rollback)CK(s->c.rollback(s->c.user,committed,s->c.stream));s->drafted=false;return 0;}SPARK_CATCH}
 extern "C" int ds41_spark_attn_rollback(void*raw,int64_t committed,void*){SPARK_TRY{if(!raw)throw std::invalid_argument("attention state null");auto*s=(ds41::VerifyState*)raw;if(s->pending_width){int64_t rows=committed-s->pending_start;if(rows<0||rows>s->pending_width)throw std::invalid_argument("attention committed prefix");s->finish(int(rows));}else if(s->committed!=committed)throw std::invalid_argument("attention state length mismatch");return 0;}SPARK_CATCH}
 extern "C" int ds41_spark_topk3_gpu(const float*s,int32_t*ids,int rows,void*stream){if(!s||!ids||rows<1)return cudaErrorInvalidValue;select3<<<rows,32,0,(cudaStream_t)stream>>>(s,ids,rows);return cudaGetLastError();}
+extern "C" int ds41_spark_kv_rows(ds41_spark*s,const void*captures,int64_t start,int rows,void*out){SPARK_TRY{if(!s||!captures||!out)throw std::invalid_argument("kv_rows arguments");s->kv_rows(captures,start,rows,out);return 0;}SPARK_CATCH}
 extern "C" int64_t ds41_spark_committed(const ds41_spark*s){return s?s->committed:-1;}
 // s0ma change 73: the rings and the committed length, for a multi-conversation cache
 extern "C" size_t ds41_spark_state_bytes(void){return size_t(3)*128*512*2;}

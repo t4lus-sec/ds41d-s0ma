@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <cmath>
 #include "ds41/engine.hpp"
 #include "ds41/spark.h"
@@ -276,11 +277,73 @@ class SparkTarget final : public Forward, public DraftProvider {
     if (view.abi_version != 1 || view.struct_bytes != sizeof(view) ||
         !view.data)
       throw std::runtime_error("invalid borrowed MTP tensor view");
+    auto it = patch_.find(name);
+    if (it != patch_.end()) {   // s0ma change 99: a trained drafter tensor in place of the checkpoint's
+      auto &t = it->second;
+      if (t.elements != uint64_t(view.rows) * uint64_t(view.columns))
+        throw std::runtime_error(std::string("DS41_SPARK_PATCH: ") + name + " has " + std::to_string(t.elements) +
+                                 " elements, the drafter's " + std::to_string(view.rows) + "x" + std::to_string(view.columns));
+      checked(ds41_spark_bind(spark_.get(), name, {t.device.get(), t.dtype, view.rows, view.columns}));
+      t.bound = true;
+      ++bindings_;
+      return;
+    }
     checked(ds41_spark_bind(spark_.get(), name,
                             {view.data, view.dtype, view.rows, view.columns}));
     ++bindings_;
   }
+  // s0ma change 99: DS41_SPARK_PATCH=DIR (scripts/drafter_train.py): DIR/patch.safetensors holds trained drafter
+  // tensors (BF16 or F32) under their bound names; each is uploaded once and bound in place of the target's view. An
+  // FP8 weight's patch is BF16, so that linear runs in BF16 (its .scale binding goes unused). Drafts are verified by
+  // the target: a patch can change acceptance, never the output distribution.
+  struct PatchTensor {
+    int dtype = 0;
+    uint64_t elements = 0;
+    bool bound = false;
+    std::unique_ptr<void, decltype(&cudaFree)> device{nullptr, cudaFree};
+  };
+  std::map<std::string, PatchTensor> patch_;
+  uint64_t patch_bytes_ = 0;
+  void load_patch() {
+    const char *dir = std::getenv("DS41_SPARK_PATCH");
+    if (!dir || !*dir || std::string(dir) == "0") return;
+    const std::string path = std::string(dir) + "/patch.safetensors";
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("DS41_SPARK_PATCH: cannot read " + path);
+    struct Close { FILE *f; ~Close() { std::fclose(f); } } close{f};
+    uint64_t n = 0;
+    if (std::fread(&n, 8, 1, f) != 1 || n > (64u << 20)) throw std::runtime_error("DS41_SPARK_PATCH: bad header");
+    std::string text(n, '\0');
+    if (std::fread(text.data(), 1, n, f) != n) throw std::runtime_error("DS41_SPARK_PATCH: short header");
+    const Json header = Json::parse(text);
+    std::vector<char> host;
+    for (auto &[name, t] : header.items()) {
+      if (name == "__metadata__") continue;
+      const std::string dt = t.at("dtype").get<std::string>();
+      const int dtype = dt == "BF16" ? DS41_SPARK_BF16 : dt == "F32" ? DS41_SPARK_F32 : -1;
+      if (dtype < 0) throw std::runtime_error("DS41_SPARK_PATCH: " + name + " is " + dt + ", want BF16 or F32");
+      uint64_t elements = 1;
+      for (auto &d : t.at("shape")) elements *= d.get<uint64_t>();
+      const uint64_t a = t.at("data_offsets").at(0).get<uint64_t>(), b = t.at("data_offsets").at(1).get<uint64_t>();
+      if (b - a != elements * (dtype == DS41_SPARK_F32 ? 4 : 2)) throw std::runtime_error("DS41_SPARK_PATCH: " + name + " size");
+      host.resize(b - a);
+      if (std::fseek(f, long(8 + n + a), SEEK_SET) || std::fread(host.data(), 1, b - a, f) != b - a)
+        throw std::runtime_error("DS41_SPARK_PATCH: short read of " + name);
+      PatchTensor p;
+      p.dtype = dtype;
+      p.elements = elements;
+      void *d = nullptr;
+      cuda_checked(cudaMalloc(&d, b - a));
+      p.device.reset(d);
+      cuda_checked(cudaMemcpy(d, host.data(), b - a, cudaMemcpyHostToDevice));
+      patch_bytes_ += b - a;
+      patch_.emplace(name, std::move(p));
+    }
+    std::cerr << "drafter patch: " << patch_.size() << " tensors, " << (patch_bytes_ >> 20) << " MiB from " << path
+              << std::endl;
+  }
   void accept(const ds41_target_capture_v1 &view) {
+    if (train_on_) { train_rows(view); return; }   // s0ma change 99: a training capture's rows, not the drafter's
     if (!cold_seed_pending_ && !append_pending_) {
       checked(ds41_spark_ingest(spark_.get(), view.hidden_bf16,
                                view.begin_position, view.committed_rows));
@@ -368,8 +431,11 @@ public:
     ds41_spark *raw = nullptr;
     checked(ds41_spark_create(&config, &raw));
     spark_.reset(raw);
+    load_patch();   // s0ma change 99
     int count =
         ds41_target_visit_tensors(target_.get(), "mtp.", 1, bind_view, this);
+    for (auto &[name, t] : patch_)
+      if (!t.bound) throw std::runtime_error("DS41_SPARK_PATCH: " + name + " is not one of the drafter's tensors");
     if (count || bindings_ == 0)
       throw std::runtime_error("native Spark needs --load-mtp bindings: " +
                                callback_error_);
@@ -893,11 +959,85 @@ public:
   DemandCounters demand_counters() const override {
     return target_->demand_counters();
   }
+  // s0ma change 99: a drafter-training capture. The target's prefill hands every row's captures to the sink; each
+  // becomes the drafter's three ring rows (ds41_spark_kv_rows: ingest's own path, no state change), kept in order and
+  // written as OUT.kv. The drafter is reset after, as the target is.
+  bool train_on_ = false;
+  int64_t train_next_ = 0;
+  std::vector<uint16_t> train_kv_;
+  std::unique_ptr<void, decltype(&cudaFree)> train_dev_{nullptr, cudaFree};
+  void train_rows(const ds41_target_capture_v1 &view) {
+    if (view.begin_position != train_next_) throw std::runtime_error("training capture rows out of order");
+    const int rows = int(view.committed_rows);
+    if (!train_dev_) {
+      void *p = nullptr;
+      cuda_checked(cudaMalloc(&p, size_t(8) * 3 * 512 * 2));
+      train_dev_.reset(p);
+    }
+    checked(ds41_spark_kv_rows(spark_.get(), view.hidden_bf16, view.begin_position, rows, train_dev_.get()));
+    const size_t at = train_kv_.size();
+    train_kv_.resize(at + size_t(rows) * 3 * 512);
+    cuda_checked(cudaMemcpyAsync(train_kv_.data() + at, train_dev_.get(), size_t(rows) * 3 * 512 * 2,
+                                 cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(weights_.cuda_stream)));
+    cuda_checked(cudaStreamSynchronize(static_cast<cudaStream_t>(weights_.cuda_stream)));
+    train_next_ += rows;
+  }
+  // the drafter's bound RoPE table (F32 [positions, 64], cos/sin pairs), its first 65,536 rows in DIR/rope.f32, once
+  void write_rope(const std::string &out) {
+    const auto slash = out.rfind('/');
+    const std::string path = (slash == std::string::npos ? std::string(".") : out.substr(0, slash)) + "/rope.f32";
+    if (FILE *e = std::fopen(path.c_str(), "rb")) { std::fclose(e); return; }
+    ds41_target_tensor_v1 view{};
+    if (ds41_target_tensor(target_.get(), "rope", 1, &view, sizeof(view)) || view.dtype != DS41_SPARK_F32 || view.columns != 64)
+      throw std::runtime_error("train_capture: the RoPE table");
+    const int64_t rows = std::min<int64_t>(view.rows, 65536);
+    std::vector<float> host(size_t(rows) * 64);
+    cuda_checked(cudaMemcpy(host.data(), view.data, host.size() * 4, cudaMemcpyDeviceToHost));
+    const std::string part = path + ".partial";
+    FILE *f = std::fopen(part.c_str(), "wb");
+    if (!f) throw std::runtime_error("train_capture: cannot write " + part);
+    const bool ok = std::fwrite(host.data(), 4, host.size(), f) == host.size();
+    if (std::fclose(f) != 0 || !ok || std::rename(part.c_str(), path.c_str()) != 0)
+      throw std::runtime_error("train_capture: " + path);
+  }
+  Json train_capture(const std::vector<int> &ids, const PrefillOptions &o, const std::string &out, int topk) override {
+    check();
+    if (prompt_active_ || incomplete_prompt_) throw std::logic_error("train_capture during a prompt");
+    train_kv_.clear();
+    train_kv_.reserve(ids.size() * 3 * 512);
+    train_next_ = 0;
+    train_on_ = true;
+    struct Off { bool &b; ~Off() { b = false; } } off{train_on_};
+    Json r;
+    try {
+      r = target_->train_capture(ids, o, out, topk);
+    } catch (...) {
+      train_kv_.clear();
+      checked(ds41_spark_reset(spark_.get()));
+      throw;
+    }
+    checked(ds41_spark_reset(spark_.get()));
+    seed_mode_ = "unseeded";
+    if (train_next_ != int64_t(ids.size())) throw std::runtime_error("training capture: drafter rows missing");
+    write_rope(out);
+    const std::string path = out + ".kv", part = path + ".partial";
+    FILE *f = std::fopen(part.c_str(), "wb");
+    if (!f) throw std::runtime_error("train_capture: cannot write " + part);
+    const bool ok = std::fwrite(train_kv_.data(), 2, train_kv_.size(), f) == train_kv_.size();
+    if (std::fclose(f) != 0 || !ok) throw std::runtime_error("train_capture: short write " + part);
+    if (std::rename(part.c_str(), path.c_str()) != 0) throw std::runtime_error("train_capture: rename " + part);
+    train_kv_.clear();
+    train_kv_.shrink_to_fit();
+    r["kv_bytes"] = uint64_t(ids.size()) * 3 * 512 * 2;
+    return r;
+  }
   Json counters() const override {
     auto out = target_->counters();
     out["spark_native_candidate"] = true;
     out["spark_committed_inputs"] = ds41_spark_committed(spark_.get());
     out["spark_multi_drafts"] = multi_drafts_;   // s0ma change 93
+    out["spark_patch_tensors"] = patch_.size();   // s0ma change 99
+    out["spark_patch_bytes"] = patch_bytes_;
     out["spark_fixed_width"] = fixed_width_;
     out["spark_sampling_path"] = gpu_verify_on() ? "device-fp64-v2-UNQUALIFIED" : "host-fp64-v2-UNQUALIFIED";
     if (gpu_verify_on()) {   // s0ma change 29

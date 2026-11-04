@@ -17,4 +17,6 @@ void select_routes_rows(const float* biased,const float* unbiased,int* ids,float
 int engram_gate_rows(void* h,const int* rows,int count,const void* kv,const void* qw,const void* kw,int K,float eps,
     cudaStream_t);
 int wo_a_rows(void* blas,const void* x,const void* w,void* y,int M,int N,int K,int G,cudaStream_t);
+// s0ma change 99: top-K next-token log-probabilities per logits row, and the log of the mass outside them
+int topk_logprobs(const float* logits,int M,int V,int K,int* ids,float* lp,float* rest,cudaStream_t);
 }

@@ -192,6 +192,13 @@ public:
   // is discarded after its logits (no live slot, nothing committed, no drafter work, slot 0 untouched). With at
   // least one scratch group, prefill_multi takes 1..kMaxGroups groups (real slots still one group each).
   static constexpr int kScratch = -1, kMaxGroups = 32;
+  // s0ma change 99: a drafter-training capture (lab only). A cold prefill of ids (slot 0, reset before and after) that
+  // writes, for every position: OUT.top, the target's top-k next-token log-probabilities (int32 ids [n, k], float32
+  // log-probs [n, k], float32 log of the mass outside them [n]); and OUT.kv, the drafter's three ring rows for that
+  // position (BF16 [n][3][512], written by the drafter adapter). Returns counts and times.
+  virtual Json train_capture(const std::vector<int> &, const PrefillOptions &, const std::string &, int) {
+    throw std::logic_error("train_capture unsupported");
+  }
   virtual bool supports_scratch_prefill() const { return false; }
   virtual int64_t scratch_context() const { return 0; }   // the longest probe prompt a scratch group takes
   // Diagnostic only: position-addressed, logically live bytes for X3/X3b.

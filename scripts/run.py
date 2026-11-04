@@ -306,6 +306,18 @@ def parked_gib(cfg, env):
     return (slots - 1) * per / 2**30
 
 
+def patch_gib(env):
+    """s0ma change 99: the device memory a trained drafter patch takes (DS41_SPARK_PATCH=DIR, its patch.safetensors),
+    taken from the expert slots like the parked slots' arenas, plus 0.1 GiB of slack."""
+    d = env.get('DS41_SPARK_PATCH', '')
+    if not d or d == '0':
+        return 0.0
+    try:
+        return Path(d, 'patch.safetensors').stat().st_size / 2**30 + 0.1
+    except OSError:
+        return 0.0
+
+
 def environment(cfg, render=True):
     dist = Path(cfg['build']) / 'dist'
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DS41_', 'CUFILE_'))}
@@ -345,7 +357,7 @@ def environment(cfg, render=True):
         # s0ma change 91: the parked conversations' arenas come out of these slots, so prefill keeps the free VRAM it
         # had (1 GiB less free pushed 8K prompts into two segments, change 25)
         extra = float(SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
-        extra = max(0.0, extra - parked_gib(cfg, env))
+        extra = max(0.0, extra - parked_gib(cfg, env) - patch_gib(env))
         env.setdefault('DS41_EXPERT_EXTRA_GIB', f'{extra:.2f}')
     # s0ma change 79: the conversations kept in RAM (change 73) sized to the window: a saved conversation holds ~0.9 KB a
     # token (the four global layers' compressed KV and indexer keys up to its frontier, 890 B, and its ids) and 3 MB

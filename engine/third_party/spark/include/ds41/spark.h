@@ -92,6 +92,9 @@ int ds41_spark_rollback(ds41_spark*, int64_t committed_inputs);
  * rollback callback when user points to that state, or call from your adapter. */
 int ds41_spark_attn_rollback(void *verify_state, int64_t committed_inputs, void *stream);
 int64_t ds41_spark_committed(const ds41_spark*);
+/* s0ma change 99 (drafter training): the ring rows ingest would write for captures BF16[rows,15360] at absolute
+ * positions start.., rows1..8, into out BF16[rows][3][512] (device). Reads bound weights only; no state changes. */
+int ds41_spark_kv_rows(ds41_spark*, const void *captures, int64_t start, int rows, void *out);
 /* s0ma change 73: the committed drafter state (the three KV rings, 3 x 128 x 512 BF16) to and from host memory, for a
  * server that keeps several conversations. Export synchronizes the bound stream; import replaces the rings and the
  * committed length (no draft pending afterwards). bytes must be ds41_spark_state_bytes(). */

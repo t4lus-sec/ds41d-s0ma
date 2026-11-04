@@ -1369,6 +1369,36 @@ void lend_reclaim() {
 // one sweep arena and one expert sweep (pmoe) over all of them, the routed rows copied back; then each group's shared
 // experts and SWA tail. Then each group's logits, commit and drafter captures (around_captures(g, true/false) lets
 // the caller put that conversation's drafter state in place). No images; the chunked path (--prefill-chunk) only.
+// s0ma change 99: a drafter-training capture (Forward::train_capture). The drafter adapter turns the capture rows the
+// prefill hands its sink into the drafter's ring rows (OUT.kv); this writes the target's top-k (OUT.top).
+bool train_all=false;int train_k=0;
+std::vector<int32_t> train_ids;std::vector<float> train_lp,train_rest;
+Json train_capture(const std::vector<int>& ids,const PrefillOptions& base,const std::string& out,int topk) override {
+  if(!config.prefill)throw std::logic_error("train_capture needs --prefill");
+  if(topk<1||topk>64||ids.empty())throw std::invalid_argument("train_capture: 1..64 top entries, a non-empty prompt");
+  if(pending)throw std::logic_error("train_capture during an active verify");
+  reset();
+  PrefillOptions o=base;o.mode=PrefillMode::Cold;o.logits_tail=ids.size();o.warm=false;o.images=nullptr;
+  struct Off{bool &a;int &k;~Off(){a=false;k=0;}} off{train_all,train_k};
+  train_all=true;train_k=topk;
+  lend_prompt=true;++lend_prompts;lend_retry=0;prefill_lend(~size_t(0)>>1);
+  struct EndPrompt{Native &n;~EndPrompt(){try{n.end_prompt(false);}catch(...){}}} end{*this};
+  const double t0=clock_ms();
+  auto r=prefill(ids,o);
+  const size_t n=ids.size(),K=size_t(topk);
+  if(train_ids.size()!=n*K||train_rest.size()!=n)throw std::runtime_error("train_capture: top-k rows missing");
+  {
+    const std::string path=out+".top",part=path+".partial";
+    FILE* f=std::fopen(part.c_str(),"wb");
+    if(!f)throw std::runtime_error("train_capture: cannot write "+part);
+    const bool ok=std::fwrite(train_ids.data(),4,n*K,f)==n*K&&std::fwrite(train_lp.data(),4,n*K,f)==n*K&&
+        std::fwrite(train_rest.data(),4,n,f)==n;
+    if(std::fclose(f)!=0||!ok)throw std::runtime_error("train_capture: short write "+part);
+    if(std::rename(part.c_str(),path.c_str())!=0)throw std::runtime_error("train_capture: rename "+part);
+  }
+  reset();
+  return {{"rows",n},{"topk",topk},{"prefill_ms",r.elapsed_ms},{"ms",clock_ms()-t0}};
+}
 bool supports_prefill_multi() const override {
   return config.prefill && config.prefill_chunk_rows && !live_slots_.empty() && !poisoned;
 }
@@ -1637,7 +1667,8 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
   std::vector<uint8_t> residency_before;
   try{residency_before=p_residency(*experts);}catch(...){poisoned=true;throw;}
   mark("residency");
-  auto plan=ds41e::prefill::plan(committed,int64_t(input.size()),int64_t(options.logits_tail));
+  auto plan=ds41e::prefill::plan(committed,int64_t(input.size()),int64_t(options.logits_tail),
+      train_all?int64_t(input.size()):128);   // s0ma change 99: a training capture keeps every row's captures
   // s0ma change 51: an image's encoder and rows need VRAM begin_prompt did not count: every lendable chunk
   if(options.images&&!options.images->empty())prefill_lend(~size_t(0)>>1);
   // Image rows of this segment. Each image the segment touches is encoded first, before the prefill arena
@@ -1674,6 +1705,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
   pref=std::make_unique<PrefillData>(input.size(),committed,options.mode==PrefillMode::Cold,
       options.logits_tail,config.prefill_budget_bytes);
   auto &pf=*pref;pf.dense_batch=int(options.dense_batch_rows);pf.warm=options.warm;pf.image=std::move(image_rows);
+  if(train_all)pf.capture.resize(input.size()*3*H*2);   // s0ma change 99
   pf.route_host=prefill_pinned(prefill_route_buf,input.size()*6*4);
   prefill_chunk.reset();
   if(config.prefill_chunk_rows) {
@@ -1812,6 +1844,27 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
       std::cerr<<"\n";
     }
     mark("layers");
+    if(train_all) {   // s0ma change 99: every row's head, 8 rows a launch, reduced to its top-k on the device
+      const int K=train_k;Device xb{8*H*2},fb{8*H*4},lb{size_t(8)*V*4},tid{size_t(8)*K*4},tlp{size_t(8)*K*4},trest{8*4};
+      train_ids.resize(input.size()*size_t(K));train_lp.resize(input.size()*size_t(K));train_rest.resize(input.size());
+      for(size_t r0=0;r0<input.size();r0+=8) {
+        const int m=int(std::min<size_t>(8,input.size()-r0));
+        for(int i=0;i<m;++i) {
+          const size_t r=r0+size_t(i);
+          pcopy(h.p,pf.hidden.as<char>(r*HC*H*2),HC*H*2);pcopy(pre.p,pf.previous_pre.as<char>(r*4*4),4*4);
+          CK(ds41_dense_hc_pre(h.p,pre.as<float>(),x.p,1,H,stream));norm("norm",x.p,x.p,H);
+          pcopy(xb.as<char>(size_t(i)*H*2),x.p,H*2);bf16_float(x.p,fb.as<float>(size_t(i)*H),H,stream);
+        }
+        if(sero_head(xb.p,lb.p,m,stream)){}
+        else if(fused_head)fused_head_logits(fb.p,lb.p,m);
+        else for(int i=0;i<m;++i)linear("head",fb.as<float>(size_t(i)*H),lb.as<float>(size_t(i)*V),V,H);
+        CK(ds41e::prefill::topk_logprobs(lb.as<float>(),m,V,K,tid.as<int>(),tlp.as<float>(),trest.as<float>(),stream));
+        CK(cudaMemcpyAsync(train_ids.data()+r0*K,tid.p,size_t(m)*K*4,cudaMemcpyDeviceToHost,stream));
+        CK(cudaMemcpyAsync(train_lp.data()+r0*K,tlp.p,size_t(m)*K*4,cudaMemcpyDeviceToHost,stream));
+        CK(cudaMemcpyAsync(train_rest.data()+r0,trest.p,size_t(m)*4,cudaMemcpyDeviceToHost,stream));
+        CK(cudaStreamSynchronize(stream));
+      }
+    } else
     for(size_t r=input.size()-options.logits_tail;r<input.size();++r) {
       pcopy(h.p,pf.hidden.as<char>(r*HC*H*2),HC*H*2);pcopy(pre.p,pf.previous_pre.as<char>(r*4*4),4*4);
       CK(ds41_dense_hc_pre(h.p,pre.as<float>(),x.p,1,H,stream));norm("norm",x.p,x.p,H);
@@ -1833,7 +1886,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
     prefix.commit(input,input.size());
     committed=pf.end;
     mark("check");
-    size_t capture_count=std::min<size_t>(128,pf.rows);
+    size_t capture_count=train_all?pf.rows:std::min<size_t>(128,pf.rows);   // s0ma change 99
     for(size_t first=0;first<capture_count;first+=6) {
       capture_rows=int(std::min<size_t>(6,capture_count-first));capture_committed=capture_rows;
       capture_begin=pf.end-capture_count+first;

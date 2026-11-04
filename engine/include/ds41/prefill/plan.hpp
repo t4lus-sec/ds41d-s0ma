@@ -16,9 +16,11 @@ struct Layer {
   Span input, query, window, global, capture;
 };
 // Clipping applies only to new rows. Predecessors come from retained live rings.
+// capture_rows (s0ma change 99): rows whose layer-37..39 stream means are kept (the drafter's tail, or every row for a
+// drafter-training capture)
 inline std::vector<Layer> plan(int64_t begin, int64_t rows,
-                               int64_t logits_tail = 1) {
-  if (begin < 0 || rows < 1 || logits_tail < 1 || logits_tail > rows ||
+                               int64_t logits_tail = 1, int64_t capture_rows = 128) {
+  if (begin < 0 || rows < 1 || logits_tail < 1 || logits_tail > rows || capture_rows < 1 ||
       begin > std::numeric_limits<int64_t>::max() - rows)
     throw std::invalid_argument("prefill extent/tail");
   int64_t end = begin + rows;
@@ -30,7 +32,7 @@ inline std::vector<Layer> plan(int64_t begin, int64_t rows,
     auto kv = l<20 ? Span{begin,end} : tail(std::max<int64_t>(128,q.size()+127));
     bool owner=l==2||l==8||l==14||l==20;
     out.push_back({l,l<=20?Span{begin,end}:kv,q,kv,
-        owner?Span{begin,end}:Span{end,end},l>=37?tail(128):Span{end,end}});
+        owner?Span{begin,end}:Span{end,end},l>=37?tail(capture_rows):Span{end,end}});
   }
   return out;
 }

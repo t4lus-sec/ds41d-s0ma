@@ -329,4 +329,44 @@ with tempfile.TemporaryDirectory(prefix="ds41-conc-") as tmp:
             assert not out[f"x{q}"][-1]["stats"]["probe"], q
     finally:
         proc.terminate(); proc.wait(10)
-print("concurrency: same tokens alone and together, multi steps, priority, leaving clients, reuse, combined prefill, drafts in multi steps, probes passed")
+    # s0ma change 99: drafter-training captures, a lab verb: refused without DS41_TRAIN_CAPTURE_DIR, otherwise the
+    # target's top-k log-probabilities and the drafter's ring rows for every position, files named by the request
+    cap = {"op": "train_capture", "request_id": "tc1", "token_ids": [5 + i % 40 for i in range(40)], "name": "doc-1",
+           "topk": 4}
+    proc, path = start(tmp, 2, name="tcoff")
+    try:
+        fin = request(path, cap)[-1]
+        assert fin.get("error") and "DS41_TRAIN_CAPTURE_DIR" in fin["error"], fin
+    finally:
+        proc.terminate(); proc.wait(10)
+    capdir = Path(tmp) / "captures"
+    capdir.mkdir()
+    os.environ["DS41_TRAIN_CAPTURE_DIR"] = str(capdir)
+    try:
+        proc, path = start(tmp, 2, name="tcon")
+    finally:
+        del os.environ["DS41_TRAIN_CAPTURE_DIR"]
+    try:
+        alone = tokens(request(path, submit("tca", "tca", 5, [1, 2, 3])))
+        fin = request(path, cap)[-1]
+        assert fin.get("finish_reason") == "stop" and not fin.get("error"), fin
+        top = (capdir / "doc-1.top").read_bytes()
+        assert len(top) == 40 * 4 * 4 * 2 + 40 * 4, len(top)
+        assert (capdir / "doc-1.kv").stat().st_size == 40 * 3 * 512 * 2
+        import struct
+        ids = struct.unpack(f"<{40 * 4}i", top[:40 * 16])
+        lp = struct.unpack(f"<{40 * 4}f", top[40 * 16:40 * 32])
+        for i in range(40):
+            assert ids[i * 4] == (7 * (i % 29) + 3) % (V - 1) + 1, i
+            assert -1e-3 < lp[i * 4] <= 0 and lp[i * 4 + 1] < -900, (i, lp[i * 4:i * 4 + 2])
+        for bad in ("../x", "", "a" * 65, "a b"):
+            fin = request(path, {**cap, "request_id": "tcb", "name": bad})[-1]
+            assert fin.get("error") and "name" in fin["error"], (bad, fin)
+        assert not (capdir.parent / "x.top").exists()
+        fin = request(path, {**cap, "request_id": "tck", "topk": 99})[-1]
+        assert fin.get("error"), fin
+        # the capture leaves no state behind: the same request decodes the same tokens
+        assert tokens(request(path, submit("tcb2", "tcb2", 5, [1, 2, 3]))) == alone
+    finally:
+        proc.terminate(); proc.wait(10)
+print("concurrency: same tokens alone and together, multi steps, priority, leaving clients, reuse, combined prefill, drafts in multi steps, probes, drafter captures passed")

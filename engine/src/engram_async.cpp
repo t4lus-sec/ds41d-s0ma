@@ -69,6 +69,11 @@ EngramAsync::EngramAsync(const std::string &library, const Config &c)
   cfg.hash_json = c.engram.c_str();
   cfg.integrity_json = c.receipt.c_str();
   cfg.cache_rows = 65536;
+  // s0ma change 97: the store's RAM cache of rows (264 B each, pinned), DS41_ENGRAM_CACHE_ROWS 0..16777216
+  if (const char *v = std::getenv("DS41_ENGRAM_CACHE_ROWS")) {
+    const long long n = std::strtoll(v, nullptr, 10);
+    if (n >= 0 && n <= 16777216) cfg.cache_rows = uint64_t(n);
+  }
   // s0ma change 95: reads in flight (DS41_ENGRAM_QD, 1..1024). 48 kept a fast NVMe
   // under-filled for prefill-sized tickets; what is read, and in what order it lands, is unchanged.
   cfg.queue_depth = 128;

@@ -2,7 +2,9 @@
 #include "direct.hpp"
 #include <nlohmann/json.hpp>
 #include <cuda_runtime_api.h>
+#include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -32,9 +34,12 @@ struct LayerHash {int id;std::array<uint64_t,4> mul;std::array<int64_t,24> prime
 struct HashConfig {std::vector<int64_t> map;int64_t pad;std::array<LayerHash,2> layers;};
 struct Tensor {int fd=-1;uint64_t base=0,rows=0,stride=0,file_bytes=0;};
 struct ds41_engram_state {std::shared_ptr<HashConfig> config;std::vector<int64_t> history;};
+struct ds41_engram_store;
 struct ds41_engram_ticket {
  int layer;std::vector<int64_t> rows;Memory output;std::mutex mutex;std::condition_variable cv;bool done=false;std::string error;
+ ds41_engram_store*store=nullptr;   // s0ma change 97: a pinned output buffer goes back to its pool
  ds41_engram_ticket(int l,const int64_t*r,size_t n,bool pin):layer(l),rows(r,r+n),output(n*264,pin){}
+ ds41_engram_ticket(int l,const int64_t*r,size_t n,void*buf,size_t cap):layer(l),rows(r,r+n){output.p=buf;output.bytes=cap;output.pinned=true;}
 };
 struct ds41_engram_store {
  std::shared_ptr<HashConfig> hash=std::make_shared<HashConfig>();std::array<std::array<Tensor,2>,2> tensors;
@@ -61,7 +66,21 @@ struct ds41_engram_store {
    stats.cache_capacity_rows=capacity;worker=std::thread([this]{run();});
   }catch(...){for(int f:files)close(f);throw;}
  }
- ~ds41_engram_store(){{std::lock_guard<std::mutex>g(mutex);stopping=true;}cv.notify_one();if(worker.joinable())worker.join();for(int f:files)close(f);}
+ ~ds41_engram_store(){{std::lock_guard<std::mutex>g(mutex);stopping=true;}cv.notify_one();if(worker.joinable())worker.join();for(int f:files)close(f);
+  for(auto&b:pool)cudaFreeHost(b.second);}
+ // s0ma change 97: pinned output buffers kept for the next tickets (pinning 50 MB took ~10 ms on the submitting
+ // thread, before the ticket's reads could start), up to DS41_ENGRAM_POOL_MIB (256) in all
+ std::mutex pool_m;std::vector<std::pair<size_t,void*>> pool;size_t pool_bytes=0;
+ static size_t pool_limit(){static const size_t v=[]{const char*e=std::getenv("DS41_ENGRAM_POOL_MIB");long x=e&&*e?std::atol(e):256;return size_t(std::max(0L,x))<<20;}();return v;}
+ void*take(size_t n,size_t&cap){std::lock_guard<std::mutex>g(pool_m);size_t best=pool.size();
+  if(n<(size_t(1)<<20))return nullptr;   // (a decode step's few rows: pinned per ticket, as before)
+  for(size_t i=0;i<pool.size();++i)if(pool[i].first>=n&&pool[i].first/4<=n&&(best==pool.size()||pool[i].first<pool[best].first))best=i;
+  if(best==pool.size())return nullptr;
+  auto b=pool[best];pool.erase(pool.begin()+std::ptrdiff_t(best));pool_bytes-=b.first;cap=b.first;return b.second;}
+ void give(void*p,size_t cap){std::lock_guard<std::mutex>g(pool_m);
+  while(!pool.empty()&&pool_bytes+cap>pool_limit()){   // the smallest go first
+   auto it=std::min_element(pool.begin(),pool.end());if(it->first>=cap)break;pool_bytes-=it->first;cudaFreeHost(it->second);pool.erase(it);}
+  if(pool_bytes+cap<=pool_limit()){pool.emplace_back(cap,p);pool_bytes+=cap;}else cudaFreeHost(p);}
  bool cached(uint64_t key,uint8_t*out){auto i=entries.find(key);if(i==entries.end())return false;memcpy(out,(char*)cache.p+i->second.first*264,264);lru.splice(lru.begin(),lru,i->second.second);return true;}
  void insert(uint64_t key,const uint8_t*row){if(!capacity)return;size_t slot;if(live<capacity){slot=live++;}else{auto old=lru.back();slot=entries.at(old).first;lru.pop_back();entries.erase(old);}memcpy((char*)cache.p+slot*264,row,264);lru.push_front(key);entries.emplace(key,std::make_pair(slot,lru.begin()));}
  void fetch(ds41_engram_ticket&t){auto begin=Clock::now();int li=t.layer==1?0:1;auto*out=(uint8_t*)t.output.p;std::vector<uint32_t> owner(t.rows.size());std::vector<std::pair<int64_t,uint32_t>> misses;std::unordered_map<int64_t,uint32_t> first;first.reserve(t.rows.size());ds41_engram_stats delta{};delta.submitted_rows=t.rows.size();
@@ -88,9 +107,15 @@ extern "C" int ds41_engram_state_clone(const ds41_engram_state*s,ds41_engram_sta
 extern "C" void ds41_engram_state_free(ds41_engram_state*s){delete s;}
 extern "C" int ds41_engram_state_truncate(ds41_engram_state*s,uint64_t pos){return guard([&]{require(s&&pos<=s->history.size(),"truncate position");s->history.resize(pos);});}
 extern "C" int ds41_engram_hash(ds41_engram_state*s,const int32_t*tokens,const uint8_t*mask,uint64_t pos,size_t count,int64_t*out){return guard([&]{require(s&&pos<=s->history.size()&&count<=16777216&&pos<=SIZE_MAX-count,"hash position/size");require(!count||(tokens&&out),"hash buffers");for(size_t i=0;i<count;++i)require(tokens[i]>=0&&tokens[i]<int(s->config->map.size()),"token id");s->history.resize(pos+count);for(size_t i=0;i<count;++i){size_t at=pos+i;s->history[at]=(mask&&!mask[i])?-1:s->config->map[tokens[i]];uint64_t v[4];bool blocked=false;for(int k=0;k<4;++k){blocked=blocked||at<size_t(k)||(at>=size_t(k)&&s->history[at-k]==-1);v[k]=blocked?s->config->pad:s->history[at-k];}for(int l=0;l<2;++l){auto h=s->config->layers[l];uint64_t rolling=v[0]*h.mul[0];for(int k=1;k<4;++k){rolling^=v[k]*h.mul[k];for(int a=0;a<8;++a){int col=(k-1)*8+a;out[(i*2+l)*24+col]=int64_t(rolling%uint64_t(h.primes[col]))+h.offsets[col];}}}}});}
-extern "C" int ds41_engram_submit(ds41_engram_store*s,int layer,const int64_t*rows,size_t count,ds41_engram_ticket**out){return guard([&]{require(s&&out&&(layer==1||layer==14)&&count<=16777216,"submit args");*out=nullptr;require(!count||rows,"null rows");int l=layer==1?0:1;for(size_t i=0;i<count;++i)require(rows[i]>=0&&uint64_t(rows[i])<s->tensors[l][0].rows,"row id");int64_t empty=0;std::unique_ptr<ds41_engram_ticket>t(new ds41_engram_ticket(layer,rows?rows:&empty,count,s->pin));{std::lock_guard<std::mutex>g(s->mutex);require(!s->stopping,"store closing");s->queue.push_back(t.get());}*out=t.release();s->cv.notify_one();});}
+extern "C" int ds41_engram_submit(ds41_engram_store*s,int layer,const int64_t*rows,size_t count,ds41_engram_ticket**out){return guard([&]{require(s&&out&&(layer==1||layer==14)&&count<=16777216,"submit args");*out=nullptr;require(!count||rows,"null rows");int l=layer==1?0:1;for(size_t i=0;i<count;++i)require(rows[i]>=0&&uint64_t(rows[i])<s->tensors[l][0].rows,"row id");int64_t empty=0;std::unique_ptr<ds41_engram_ticket>t;
+  size_t cap=0;void*buf=s->pin&&count?s->take(count*264,cap):nullptr;
+  if(buf)t.reset(new ds41_engram_ticket(layer,rows?rows:&empty,count,buf,cap));
+  else t.reset(new ds41_engram_ticket(layer,rows?rows:&empty,count,s->pin));
+  t->store=s->pin?s:nullptr;{std::lock_guard<std::mutex>g(s->mutex);require(!s->stopping,"store closing");s->queue.push_back(t.get());}*out=t.release();s->cv.notify_one();});}
 extern "C" int ds41_engram_ready(ds41_engram_ticket*t){if(!t){last_error="null ticket";return -1;}std::lock_guard<std::mutex>g(t->mutex);if(!t->done)return 0;if(!t->error.empty()){last_error=t->error;return -1;}return 1;}
 extern "C" int ds41_engram_wait(ds41_engram_ticket*t){return guard([&]{require(t,"null ticket");std::unique_lock<std::mutex>g(t->mutex);t->cv.wait(g,[&]{return t->done;});if(!t->error.empty())throw std::runtime_error(t->error);});}
 extern "C" int ds41_engram_data(ds41_engram_ticket*t,const void**data,size_t*count){return guard([&]{require(t&&data&&count,"data args");std::lock_guard<std::mutex>g(t->mutex);require(t->done,"ticket pending");if(!t->error.empty())throw std::runtime_error(t->error);*data=t->output.p;*count=t->rows.size();});}
-extern "C" void ds41_engram_ticket_free(ds41_engram_ticket*t){if(t){ds41_engram_wait(t);delete t;}}
+extern "C" void ds41_engram_ticket_free(ds41_engram_ticket*t){if(t){ds41_engram_wait(t);
+ if(t->store&&t->output.pinned&&t->output.p&&t->output.bytes){t->store->give(t->output.p,t->output.bytes);t->output.p=nullptr;}
+ delete t;}}
 extern "C" int ds41_engram_copy(ds41_engram_ticket*t,void*fp8,void*scales){return guard([&]{require(t,"copy ticket");std::lock_guard<std::mutex>g(t->mutex);require(t->done,"ticket pending");if(!t->error.empty())throw std::runtime_error(t->error);require(t->rows.empty()||(fp8&&scales),"copy buffers");for(size_t i=0;i<t->rows.size();++i){memcpy((char*)fp8+i*256,(char*)t->output.p+i*264,256);memcpy((char*)scales+i*8,(char*)t->output.p+i*264+256,8);}});}

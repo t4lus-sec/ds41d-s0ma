@@ -1423,7 +1423,10 @@ std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup>& groups
     if(admit_budget||vram_admit_budget)prompt_tail_count.assign(15360,0);
     admit_used=0;vram_admit_used=0;
   }
-  if(lend_chunks_total&&!lend_prompt){lend_prompt=true;++lend_prompts;lend_retry=0;prefill_lend(prefill_lend_need(total));}
+  // s0ma change 97: besides one prompt's arena for all the rows, the sweep arena's rows (its query rows are copies)
+  // and each group's own fixed buffers (expert scratch, capture tail, a probe's scratch state): 24 MB a group
+  const size_t multi_extra=total*(size_t(H)*2+6*4*2+size_t(6)*H*2+size_t(H)+H/32)+(size_t(24)<<20)*(groups.size()+1);
+  if(lend_chunks_total&&!lend_prompt){lend_prompt=true;++lend_prompts;lend_retry=0;prefill_lend(prefill_lend_need(total)+multi_extra);}
   struct Lend{bool &on;~Lend(){on=false;}} lend_off{lend_prompt};
   // ... and then the residency the prompts must leave as they found it
   std::vector<uint8_t> residency_before;

@@ -302,6 +302,20 @@ with tempfile.TemporaryDirectory(prefix="ds41-conc-") as tmp:
         proc.terminate(); proc.wait(10)
     err = proc.stderr.read().decode(errors="replace")
     assert "terminate" not in err and "scheduler:" not in err, err[-2000:]
+    # s0ma change 97: probes whose scratch does not fit all together prefill in halves, still without slots
+    proc, path = start(tmp, 2, name="probefit", probes=True, probe_fit=3)
+    try:
+        out = {}
+        ts = [threading.Thread(target=request, args=(path, probe(f"h{q}", p, 0, 11 + i), out))
+              for i, (q, p) in enumerate(list(questions.items())[:7])]
+        for t in ts: t.start()
+        for t in ts: t.join(60)
+        for q in list(questions)[:7]:
+            st = out[f"h{q}"][-1]["stats"]
+            assert answer(out[f"h{q}"]) == before[q], q
+            assert st["probe"] and st["live_slot"] == -1 and 1 <= st["combined_prefill"] <= 3, (q, st["combined_prefill"])
+    finally:
+        proc.terminate(); proc.wait(10)
     # declined: the probes take the one-by-one path, the same answers
     proc, path = start(tmp, 2, decline=True, name="probedecl", probes=True)
     try:

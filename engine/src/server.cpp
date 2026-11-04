@@ -1093,7 +1093,8 @@ public:
     // s0ma change 96: the best waiting priority's probes, together (and with a waiting prompt of theirs that fits)
     if (!waiting.empty() && !(probe_hold && !running.empty())) {
       const int cls = waiting.front()->priority;
-      if (running.empty() || batch_lower() || cls <= best) {
+      // s0ma change 97: DS41_PROBE_DEFER=1: probes wait while a conversation of their priority or better decodes
+      if ((running.empty() || batch_lower() || cls <= best) && !(probe_defer() && !running.empty() && best <= cls)) {
         std::vector<std::shared_ptr<Job>> probes;
         size_t rows = 0;
         bool other = false;   // a request of that priority that is not a probe waits too (it is not held back)
@@ -1322,6 +1323,10 @@ public:
     }();
     return v;
   }
+  static bool probe_defer() {
+    static const bool v = [] { const char *e = std::getenv("DS41_PROBE_DEFER"); return e && e[0] == '1'; }();
+    return v;
+  }
   static bool probe_save() {
     static const bool v = [] { const char *e = std::getenv("DS41_PROBE_SAVE"); return e && e[0] == '1'; }();
     return v;
@@ -1449,11 +1454,15 @@ public:
         std::cerr << "combined prefill declined (" << e.what() << "): one by one\n";
         single.insert(single.end(), grouped.begin(), grouped.end());
         grouped.clear();
-        {   // probes go back to the queue, in their places, as ordinary requests
+        // s0ma change 97: the probes again on their own, in halves until they fit (one that does not fit alone goes
+        // back to the queue, in its place, as an ordinary request)
+        std::vector<std::shared_ptr<Job>> back, done;
+        if (!probing.empty()) probe_halves(probing, done, back, groups.size() > probing.size());
+        if (!back.empty()) {
           std::lock_guard<std::mutex> l(sched_m);
-          for (auto it = probing.rbegin(); it != probing.rend(); ++it) { (*it)->probe = 0; queue.push_front(*it); }
+          for (auto it = back.rbegin(); it != back.rend(); ++it) { (*it)->probe = 0; queue.push_front(*it); }
         }
-        probing.clear();
+        probing = std::move(done);
       } catch (const std::exception &e) {
         for (auto &j : grouped) { fail(*j, e.what()); release(*j); }
         for (auto &j : probing) { fail(*j, e.what()); release(*j); }
@@ -1484,6 +1493,43 @@ public:
     for (auto &j : grouped) settle(j, false);
     for (auto &j : single) settle(j, true);
     return any || !probes.empty();
+  }
+  // s0ma change 97: probes alone in one prefill; declined (the scratch does not fit), each half on its own. `whole`:
+  // try them all first (false when they were just declined together). Answered ones go to done (logits set), probes
+  // that do not fit even alone to back, and failed ones end here.
+  void probe_halves(const std::vector<std::shared_ptr<Job>> &ps, std::vector<std::shared_ptr<Job>> &done,
+                    std::vector<std::shared_ptr<Job>> &back, bool whole) {
+    if (ps.empty()) return;
+    if (whole) {
+      std::vector<Forward::PrefillGroup> gs;
+      for (auto &j : ps) {
+        Forward::PrefillGroup g;
+        g.slot = Forward::kScratch;
+        g.ids = j->ids;
+        g.options.mode = PrefillMode::Cold;
+        g.options.dense_batch_rows = prefill_dense_batch;
+        g.options.warm = false;
+        gs.push_back(std::move(g));
+      }
+      try {
+        auto results = model->prefill_multi(gs);
+        for (size_t p = 0; p < ps.size(); ++p) {
+          ps[p]->logits = std::move(results[p].logits.back());
+          ps[p]->combined = ps.size();
+          done.push_back(ps[p]);
+        }
+        return;
+      } catch (const PrefillDeclined &e) {
+        std::cerr << "probe prefill of " << ps.size() << " declined (" << e.what() << ")\n";
+      } catch (const std::exception &e) {
+        for (auto &j : ps) { fail(*j, e.what()); release(*j); }
+        return;
+      }
+    }
+    if (ps.size() == 1) { back.push_back(ps[0]); return; }
+    const auto mid = ps.begin() + std::ptrdiff_t(ps.size() / 2);
+    probe_halves({ps.begin(), mid}, done, back, true);
+    probe_halves({mid, ps.end()}, done, back, true);
   }
   // s0ma change 96: a probe's one token from its prefill's logits, as conclude() draws an anchor; then it ends
   void answer_probe(Job &J) {
@@ -2241,6 +2287,7 @@ public:
     has_drafter = j.value("drafter", false);
     probes = j.value("probes", false);   // (the protocol tests of the one-by-one path keep it)
     probe_ctx = j.value("probe_context", int64_t(1) << 20);
+    probe_fit = j.value("probe_fit", size_t(1) << 20);
   }
   int live_slots() const override { return 1 + int(parked_pos.size()); }
   int64_t slot_context() const override { return parked_pos.empty() ? 0 : slot_ctx; }
@@ -2303,7 +2350,7 @@ public:
   // one-by-one path gives it
   bool probes = false;
   int64_t probe_ctx = 1 << 20;
-  size_t probe_prefills = 0, probe_groups = 0, largest_prefill = 0;
+  size_t probe_prefills = 0, probe_groups = 0, largest_prefill = 0, probe_fit = 1 << 20;
   bool supports_scratch_prefill() const override { return probes; }
   int64_t scratch_context() const override { return probe_ctx; }
   std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup> &groups,
@@ -2315,6 +2362,7 @@ public:
       throw std::logic_error("replay prefill_multi");
     if (incomplete && scratch < groups.size()) throw std::logic_error("prefill_multi during a prompt");
     if (decline_multi) throw PrefillDeclined("replay test: declined");
+    if (scratch > probe_fit) throw PrefillDeclined("replay test: the probes' scratch does not fit");
     std::vector<PrefillResult> out;
     for (size_t g = 0; g < groups.size(); ++g) {
       if (groups[g].slot == kScratch) {

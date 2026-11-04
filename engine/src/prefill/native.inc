@@ -421,15 +421,7 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume,const P
   };
   else prefill_lane_staged[0]=misses.size();   // (the early arena's experts are not counted)
   if(!misses.empty()) {
-    if(!prefill_stage){
-      // s0ma change 26: DS41_PREFILL_STAGE_SLOTS=N (2..64; published 8) deepens the prompt sweep's staging ring. Sero's
-      // 1K+ prompts read the drive at 2.8-3.8 GB/s of its 7.2 over their sweeps: each slot's next read waits for the
-      // GEMM behind it. A slot is the largest record in VRAM and pinned RAM (~22 MB with K5 records).
-      size_t n=8;
-      if(const char* v=std::getenv("DS41_PREFILL_STAGE_SLOTS");v&&*v){n=size_t(std::strtoul(v,nullptr,10));
-        if(n<2||n>64)throw std::invalid_argument("DS41_PREFILL_STAGE_SLOTS must be 2..64");}
-      prefill_stage=std::make_unique<ds41e::prefill::Stager>(prefill_records,n);
-    }
+    if(!prefill_stage)build_prefill_stage("the first prompt's sweep");   // (s0ma change 87: normally built at load)
     auto lookup=config.prefill_host_view;
     auto lease=std::make_shared<ds41::OffloadStore::HostLease>(experts->borrow_host(misses));
     if(!prompt_bits.empty())for(const auto &v:lease->views)if(!v.data&&v.id<15360)prompt_bits[v.id]|=1;   // s0ma change 56
@@ -620,6 +612,45 @@ void pattention(int l,int64_t pos,bool output_projection=true) {
 // each a huge-page fault that compacts memory under pressure (a 48 GiB tier: 5,906 compaction stalls, 99% failed).
 // Callers reach these only after the stream has finished with the previous contents.
 std::unique_ptr<ds41::HostBuffer> prefill_route_buf,prefill_desc_buf,prefill_wave_buf;   // (wave: change 76)
+// s0ma change 26: DS41_PREFILL_STAGE_SLOTS=N (2..64; published 8) deepens the prompt sweep's staging ring. Sero's
+// 1K+ prompts read the drive at 2.8-3.8 GB/s of its 7.2 over their sweeps: each slot's next read waits for the
+// GEMM behind it. A slot is the largest record in VRAM and pinned RAM (~22 MB with K5 records).
+size_t prefill_stage_slots() const {
+  size_t n=8;
+  if(const char* v=std::getenv("DS41_PREFILL_STAGE_SLOTS");v&&*v){n=size_t(std::strtoul(v,nullptr,10));
+    if(n<2||n>64)throw std::invalid_argument("DS41_PREFILL_STAGE_SLOTS must be 2..64");}
+  return n;
+}
+size_t prefill_stage_bytes() const {   // its VRAM slots (and as much pinned RAM): n x the largest record, 4 KiB rounded
+  size_t r=0;for(const auto &x:prefill_records)r=std::max(r,(size_t(x.bytes)+4095)&~size_t(4095));
+  return prefill_stage_slots()*r;
+}
+// s0ma change 87: the staging ring (VRAM slots, a pinned staging buffer, the mapped table) was built at the first
+// prompt's first sweep, inside layer 0's timeline: ~0.6 s before that layer's first copy (2026-11-03: first_copy_ms
+// 577.7 at layer 0, under 1.3 at every other layer; the pinned huge-page buffer faults and compacts under memory
+// pressure). Now built at the end of load when it fits (DS41_PREFILL_STAGER_AT_LOAD=0 keeps it lazy); the same ring
+// and the same VRAM, which the first prompt took from the same margin. The log line says where and how long.
+void build_prefill_stage(const char *when) {
+  const double t=clock_ms();
+  prefill_stage=std::make_unique<ds41e::prefill::Stager>(prefill_records,prefill_stage_slots());
+  std::cerr<<"prefill stager: built at "<<when<<" in "<<clock_ms()-t<<" ms ("<<prefill_stage_slots()<<" slots, "
+           <<prefill_stage->device_bytes()/1048576.0<<" MiB of VRAM and as much pinned RAM)\n";
+}
+void prefill_stage_at_load() {
+  static const bool on=[]{const char *v=std::getenv("DS41_PREFILL_STAGER_AT_LOAD");return !(v&&v[0]=='0');}();
+  if(!on||!exl3||prefill_records.empty()||prefill_stage)return;   // (EXL3 banks; MXFP4 keeps the lazy build)
+  try{   // anything that fails here (a bad DS41_PREFILL_STAGE_SLOTS too) is left for the first prompt, as before
+    size_t free=0,total=0;CK(cudaMemGetInfo(&free,&total));
+    const size_t need=prefill_stage_bytes(),margin=size_t(512)<<20;
+    if(free<need+margin){
+      std::cerr<<"prefill stager: left for the first prompt ("<<free/1048576<<" MiB free at load, "<<(need+margin)/1048576
+               <<" MiB wanted)\n";
+      return;
+    }
+    build_prefill_stage("load");
+  }catch(const std::exception &e){prefill_stage.reset();(void)cudaGetLastError();
+    std::cerr<<"prefill stager: not built at load ("<<e.what()<<"); the first prompt builds it\n";}
+}
 ds41::HostBuffer* prefill_pinned(std::unique_ptr<ds41::HostBuffer>& b,size_t n) {
   if(!b||b->size()<n)b=std::make_unique<ds41::HostBuffer>(std::max(n+n/2,size_t(2)<<20),true);
   return b.get();

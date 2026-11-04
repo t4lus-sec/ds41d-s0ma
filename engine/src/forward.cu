@@ -1055,6 +1055,7 @@ public:
       CK(cudaDeviceGraphMemTrim(device));
       vram_checkpoint("native_after_rows_check");
     }
+    if (c.prefill) prefill_stage_at_load();   // s0ma change 87
     vram_checkpoint("native_loaded");
     std::cerr << "ds41d native M1 loaded; UNQUALIFIED; expert slots="
               << c.expert_slots << (exl3_mixed ? " (EXL3 mixed target experts: " + mixed_k3_layers + "; native MTP store)"

@@ -216,6 +216,7 @@ def create_app(
                 images=prepared or None,
                 conversation_id=request.conversation_id,
                 request_id=uuid.uuid4().hex,
+                priority=request.priority,
             )
         except BaseException:
             # The slot belongs to the response only once it exists.

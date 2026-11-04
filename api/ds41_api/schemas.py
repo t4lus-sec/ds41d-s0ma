@@ -68,6 +68,8 @@ class ChatCompletionRequest(BaseModel):
     stream_options: Optional[Dict[str, Any]] = None
     # DS41 extension: hint for engine-side prefix/KV reuse across turns.
     conversation_id: Optional[str] = None
+    # vLLM's: the lowest runs first (s0ma change 91: ds41d schedules by it when it serves several requests at once)
+    priority: Optional[int] = None
 
     def stop_sequences(self) -> List[str]:
         if self.stop is None:

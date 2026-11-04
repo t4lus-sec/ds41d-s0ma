@@ -791,39 +791,127 @@ public:
   std::atomic<int> connections{0};
   Service(std::unique_ptr<Forward> m, int c, bool reuse, bool any = false, size_t dense_batch = 1)
       : model(std::move(m)), context(c), prefix_cache(reuse), prefix_any(any),
-        prefill_dense_batch(dense_batch) { disk_open(); }   // s0ma change 81
+        prefill_dense_batch(dense_batch) {
+    disk_open();   // s0ma change 81
+    parked.resize(size_t(std::max(1, model->live_slots()) - 1));   // s0ma change 91
+    scheduler = std::thread([this] { schedule_loop(); });
+  }
   ~Service() {
+    { std::lock_guard<std::mutex> l(sched_m); sched_stop = true; }   // s0ma change 91: jobs end first
+    sched_cv.notify_all();
+    if (scheduler.joinable()) scheduler.join();
     { std::lock_guard<std::mutex> l(disk_m); disk_stop = true; }
     disk_cv.notify_all();
     if (disk_writer.joinable()) disk_writer.join();   // pending writes finish first
   }
-  void handle(int fd) {
-    std::string id, pending, line;
+  // s0ma change 91: several requests at once. One scheduler thread owns the model; a connection thread parses its
+  // request into a Job, queues it and waits until the scheduler has finished it. The scheduler starts (prefills)
+  // queued jobs while live slots are free, best priority first (the submit op's `priority`, lowest first: s0ma's main
+  // turn asks for a lower number than its workers), and between starts runs decode steps: one job of the best
+  // priority alone takes today's single-stream step (drafting, exact); several take one multi-conversation step
+  // (each one row, verify_multi). Jobs of a worse priority wait while better ones run, unless DS41_BATCH_LOWER=1.
+  // With DS41_LIVE_SLOTS=1 one request runs at a time, as before.
+  struct Job {
+    int fd = -1;
+    std::string id, verb, conversation, draft_mode;
+    Json op;
+    std::vector<int> ids;
+    std::vector<uint64_t> keys;
+    std::vector<ImageSpan> images;
+    Sampling sampling;
+    int priority = 0;
+    uint64_t arrival = 0, last_step = 0;
     std::shared_ptr<Live> state;
-    int prompt = 0, completed = 0;
-    bool finished = false, registered = false;
-    std::unique_lock<std::mutex> run(serial, std::defer_lock);
-    bool counted = false;   // s0ma change 81: this connection holds the engine (the disk writer defers to it)
-    struct Uncount { std::atomic<int> &a; bool &c; ~Uncount() { if (c) --a; } } uncount{active, counted};
-    auto finish = [&](std::string reason, Json error = nullptr,
-                      Json stats = Json::object()) {
-      if (finished)
-        return;
-      finished = true;
-      Json usage = {{"prompt_tokens", prompt}, {"completion_tokens", completed}};
-      for (const auto &field : {
-               std::pair<const char *, const char *>{"reused_prompt_tokens", "cached_prompt_tokens"},
-               {"prefill_ms", "prefill_ms"}, {"generation_ms", "decode_ms"},
-               {"drafted", "draft_tokens"}, {"accepted", "accepted_draft_tokens"}})
-        if (stats.contains(field.first))
-          usage[field.second] = stats.at(field.first);
-      send_json(
-          fd, {{"type", "finish"},
-               {"finish_reason", reason},
-               {"usage", usage},
-               {"error", error},
-               {"stats", stats}});
-    };
+    bool registered = false, finished = false, done = false, started = false;
+    std::mutex m;
+    std::condition_variable cv;
+    int slot = -1, prompt = 0, completed = 0;
+    double t_start = 0, first = 0, last = 0, prefill_end = 0;
+    std::vector<float> logits;
+    size_t reused = 0, consumed_prompt = 0;
+    bool loaded = false, from_file = false;
+    Json prefill_counters;
+    Rng rng{0};
+    std::unique_ptr<AttemptCounter> attempts;
+    DraftProvider *drafter = nullptr;
+    bool copying = false;
+    SuffixIndex suffix;
+    std::vector<int> copy;
+    uint64_t copy_steps = 0, copy_drafted = 0, copy_accepted = 0;
+    std::string reason = "length";
+    uint64_t cycles = 0, drafted = 0, accepted = 0, verified_accepted = 0, multi_steps = 0;
+    double draft_ms = 0, verify_ms = 0, draft_forward_ms = 0, draft_draw_ms = 0;
+    int anchor = -1;
+    uint64_t epoch = 0;    // the model's counter epoch at its prefill's end
+    size_t combined = 0;   // s0ma change 91: the prompts its prefill shared (0: alone)
+  };
+  // the model's slots 1..n-1 (slot 0 is `prefix`, slot0_job and slot0_used)
+  struct Parked { Prefix prefix; Job *job = nullptr; uint64_t used = 0; };
+  std::vector<Parked> parked;
+  Job *slot0_job = nullptr;
+  uint64_t slot0_used = 0, use_clock = 0, arrivals = 0;
+  uint64_t model_epoch = 0;   // bumped by every begin_request/reset/restore/load (they restart the model's counters)
+  std::mutex sched_m;
+  std::condition_variable sched_cv;
+  std::deque<std::shared_ptr<Job>> queue;
+  std::vector<std::shared_ptr<Job>> running;
+  std::thread scheduler;
+  bool sched_stop = false;
+  static bool batch_lower() {
+    static const bool v = [] { const char *e = std::getenv("DS41_BATCH_LOWER"); return e && e[0] == '1'; }();
+    return v;
+  }
+  static bool multi_off() {   // DS41_BATCH_MULTI=0: several jobs take turns at single steps instead
+    static const bool v = [] { const char *e = std::getenv("DS41_BATCH_MULTI"); return e && e[0] == '0'; }();
+    return v;
+  }
+  bool cancelled(Job &J) { return stopping || (J.state && J.state->cancel.load()) || disconnected(J.fd); }
+  Prefix &entry(int k) { return k == 0 ? prefix : parked[size_t(k - 1)].prefix; }
+  Job *&holder(int k) { return k == 0 ? slot0_job : parked[size_t(k - 1)].job; }
+  uint64_t &used(int k) { return k == 0 ? slot0_used : parked[size_t(k - 1)].used; }
+  // a conversation the slot-0 content can move to slot k only if it fits the parked arenas
+  bool parkable() { return model->committed_position() <= model->slot_context(); }
+  // exchange slot 0 and slot k, model and bookkeeping
+  void bring(int k) {
+    if (!slot0_job && prefix.inputs.empty()) {   // a dropped, failed or scored conversation: not one to park
+      ++model_epoch;
+      model->reset();
+    }
+    model->swap_slot(k);
+    auto &P = parked[size_t(k - 1)];
+    std::swap(prefix, P.prefix);
+    std::swap(slot0_job, P.job);
+    std::swap(slot0_used, P.used);
+    if (slot0_job) slot0_job->slot = 0;
+    if (P.job) P.job->slot = k;
+  }
+  // slot 0's content can be replaced: an idle conversation there goes to RAM (it was saved at its prompt's end)
+  void drop_slot0() {
+    if (slot0_job) throw std::logic_error("drop_slot0: a running job");
+    if (!prefix.inputs.empty() && !prefix.boundary) save_live();
+    prefix = {};
+  }
+  void finish(Job &J, std::string reason, Json error = nullptr, Json stats = Json::object()) {
+    if (J.finished) return;
+    J.finished = true;
+    Json usage = {{"prompt_tokens", J.prompt}, {"completion_tokens", J.completed}};
+    for (const auto &field : {
+             std::pair<const char *, const char *>{"reused_prompt_tokens", "cached_prompt_tokens"},
+             {"prefill_ms", "prefill_ms"}, {"generation_ms", "decode_ms"},
+             {"drafted", "draft_tokens"}, {"accepted", "accepted_draft_tokens"}})
+      if (stats.contains(field.first)) usage[field.second] = stats.at(field.first);
+    send_json(J.fd, {{"type", "finish"}, {"finish_reason", reason}, {"usage", usage}, {"error", error},
+                     {"stats", stats}});
+  }
+  void release(Job &J) {   // the connection thread may go on (and close)
+    { std::lock_guard<std::mutex> l(J.m); J.done = true; }
+    J.cv.notify_all();
+  }
+  void handle(int fd) {
+    auto job = std::make_shared<Job>();
+    Job &J = *job;
+    J.fd = fd;
+    std::string pending, line;
     try {
       while (read_line(fd, pending, line)) {
         auto op = Json::parse(line);
@@ -844,32 +932,37 @@ public:
         }
         if (verb != "submit" && verb != "score")
           throw std::invalid_argument("unknown op");
-        auto ids = token_ids(op.at("token_ids"), model->vocab());
-        prompt = int(ids.size());
-        if (prompt > context)
+        J.verb = verb;
+        J.op = op;
+        J.ids = token_ids(op.at("token_ids"), model->vocab());
+        J.prompt = int(J.ids.size());
+        if (J.prompt > context)
           throw std::invalid_argument("prompt exceeds max_context");
-        const auto images = image_spans(op, ids);
-        const auto keys = position_keys(ids, images);
-        if (!images.empty() && verb == "score")
+        J.images = image_spans(op, J.ids);
+        J.keys = position_keys(J.ids, J.images);
+        if (!J.images.empty() && verb == "score")
           throw std::invalid_argument("unsupported: score requests with images");
-        const std::string draft_mode = op.value("draft", std::string("auto"));
-        if (draft_mode != "off" && draft_mode != "auto" && draft_mode != "on")
+        J.draft_mode = op.value("draft", std::string("auto"));
+        if (J.draft_mode != "off" && J.draft_mode != "auto" && J.draft_mode != "on")
           throw std::invalid_argument(
               "unsupported: draft mode must be off/auto/on");
-        if (draft_mode == "on" && !model->drafter())
+        if (J.draft_mode == "on" && !model->drafter())
           throw std::invalid_argument(
               "unsupported: native drafting is not enabled in this build");
-        std::string conversation;
         if (op.contains("conversation_id") &&
             !op.at("conversation_id").is_null()) {
-          conversation = op.at("conversation_id").get<std::string>();
-          if (conversation.size() > 4096)
+          J.conversation = op.at("conversation_id").get<std::string>();
+          if (J.conversation.size() > 4096)
             throw std::invalid_argument("conversation_id exceeds 4096 bytes");
+        }
+        if (op.contains("priority") && !op.at("priority").is_null()) {
+          if (!op.at("priority").is_number_integer()) throw std::invalid_argument("priority must be an integer");
+          J.priority = int(std::clamp<int64_t>(op.at("priority").get<int64_t>(), -1000000000, 1000000000));
         }
         Json s = op.value("sampling", Json::object());
         if (!s.is_object())
           throw std::invalid_argument("sampling must be an object");
-        Sampling sampling;
+        Sampling &sampling = J.sampling;
         sampling.temperature = s.value("temperature", 1.0);
         sampling.top_p = s.value("top_p", 1.0);
         if (!std::isfinite(sampling.temperature) || sampling.temperature < 0 ||
@@ -900,431 +993,845 @@ public:
           }
         }
         if (op.contains("request_id") && !op.at("request_id").is_null())
-          id = op.at("request_id").get<std::string>();
-        if (id.empty())
-          id = "ds41-" + std::to_string(++sequence);
-        if (id.size() > 256)
+          J.id = op.at("request_id").get<std::string>();
+        if (J.id.empty())
+          J.id = "ds41-" + std::to_string(++sequence);
+        if (J.id.size() > 256)
           throw std::invalid_argument("request_id too long");
-        state = std::make_shared<Live>();
+        J.state = std::make_shared<Live>();
         {
           std::lock_guard<std::mutex> lock(registry_mutex);
           if (live.size() >= 8)
             throw std::runtime_error("engine queue full");
-          if (!live.emplace(id, state).second) {
-            state.reset();
+          if (!live.emplace(J.id, J.state).second) {
+            J.state.reset();
             throw std::invalid_argument("request_id already live");
           }
-          registered = true;
+          J.registered = true;
         }
-        auto cancelled = [&] {
-          return stopping || state->cancel.load() || disconnected(fd);
-        };
-        while (!run.try_lock()) {
-          if (cancelled())
-            break;
-          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        {
+          std::lock_guard<std::mutex> l(sched_m);
+          J.arrival = ++arrivals;
+          queue.push_back(job);
         }
-        if (run.owns_lock() && !counted) { counted = true; ++active; }   // s0ma change 81: the disk writer waits
-        if (cancelled()) {
-          finish("cancelled");
-          break;
-        }
-        double started = now(), first = 0, last = 0, prefill_end = 0;
-        std::vector<float> logits;
-        if (verb == "score") {
-          prefix = {};
-          model->reset();
-          int from = integer(op, "score_from", 0, 0, prompt - 1),
-              top = integer(op, "top", 64, 1, std::min(1024, model->vocab()));
-          auto mode = op.value("mode", std::string("verify"));
-          if (mode != "verify" && mode != "prefill")
-            throw std::invalid_argument("unknown score mode");
-          auto widths = verify_widths(op);
-          if (mode != "verify")
-            throw std::invalid_argument(
-                "unsupported: cold prefill score is not implemented");
-          if (op.value("return_routes", false))
-            throw std::invalid_argument(
-                "unsupported: route events are not implemented");
-          size_t cycle = 0;
-          for (int begin = 0; begin < prompt && !cancelled();) {
-            int count =
-                std::min(widths[cycle++ % widths.size()], prompt - begin);
-            std::vector<int> chunk(ids.begin() + begin,
-                                   ids.begin() + begin + count);
-            auto rows = model->verify(chunk);
-            if (rows.size() != size_t(count))
-              throw std::runtime_error(
-                  "target verify returned wrong row count");
-            model->commit(count);
-            bool sent = true;
-            for (int row = 0; row < count && !cancelled(); ++row) {
-              int i = begin + row;
-              if (i < from)
-                continue;
-              auto &l = rows[row];
-              double normalizer = log_normalizer(l);
-              auto top_ids = top_order(l, top);
-              Json logp = Json::array();
-              for (int t : top_ids)
-                logp.push_back(double(l[t]) - normalizer);
-              Json event = {{"type", "score"},
-                            {"position", i},
-                            {"top1", argmax(l)},
-                            {"top_id", top_ids},
-                            {"top_logprob", logp},
-                            {"logsumexp", normalizer},
-                            {"logits_sha256", logits_digest(l)}};
-              if (op.value("return_logits", false))
-                event["logits"] = l;
-              if (i + 1 < prompt) {
-                event["next_token_id"] = ids[i + 1];
-                event["next_logprob"] = double(l[ids[i + 1]]) - normalizer;
-              }
-              if (!send_json(fd, event, cancelled)) {
-                sent = false;
-                break;
-              }
-            }
-            begin += count;
-            if (!sent)
-              break;
-          }
-          auto stats = model->counters();
-          stats["prefill_mode"] = "verify";
-          stats["verify_width"] = widths;
-          finish(cancelled() ? "cancelled" : "stop", nullptr, stats);
-          break;
-        }
-        if (sampling.max_tokens == 0) {
-          finish("length");
-          break;
-        }
-        size_t reused = prefix_cache && prefix.matches(conversation, keys, prefix_any)
-                            ? prefix.inputs.size()
-                            : 0;
-        bool rewound = false;
-        if (!reused && prefix_cache && prefix.boundary && prefix.boundary_len &&
-            prefix.same_conversation(conversation, prefix_any) &&
-            prefix.boundary_len <= ids.size() && prefix.boundary_len <= prefix.inputs.size() &&
-            std::equal(prefix.keys.begin(), prefix.keys.begin() + prefix.boundary_len, keys.begin())) {
-          try {
-            model->restore(*prefix.boundary);
-            prefix.inputs.resize(prefix.boundary_len);
-            prefix.keys.resize(prefix.boundary_len);
-            prefix.logits = prefix.boundary_logits;
-            reused = prefix.boundary_len;
-            rewound = true;
-          } catch (const std::exception &) {
-            reused = 0;
-          }
-        }
-        bool loaded = false, from_file = false;
-        if (!reused && prefix_cache && (!saved.empty() || disk_on())) {   // s0ma change 73 (81: or from disk)
-          auto best = find_saved(conversation, keys);
-          std::optional<Saved> file;
-          if (disk_on()) file = disk_read(conversation, keys, best != saved.end() ? best->keys.size() : 0);
-          const Saved *use = file ? &*file : best != saved.end() ? &*best : nullptr;
-          if (use) {
-            try {
-              model->load_conversation(*use->state);
-              prefix = {};
-              prefix.conversation = use->conversation;
-              prefix.inputs = use->inputs;
-              prefix.keys = use->keys;
-              prefix.logits = use->logits;
-              reused = prefix.inputs.size();
-              rewound = loaded = true;
-              ++conversation_loads;
-              if (file) { from_file = true; remember(std::move(*file)); }
-              else saved.splice(saved.begin(), saved, best);
-            } catch (const std::exception &e) {
-              std::cerr << "conversation load failed: " << e.what() << "\n";
-              reused = 0;
-            }
-          }
-        }
-        if (reused) {
-          // a loaded conversation starts a request too (the drafter's policy-v2 nonces restart with the server's)
-          if (!rewound || loaded) model->begin_request();
-          logits = prefix.logits;
-        } else {
-          prefix = {};
-          model->reset();
-        }
-        prefix.conversation = conversation;
-        model->begin_prompt(prompt, reused != 0);
-        auto consume = [&](int token) {
-          auto next = model->verify({token}).at(0);
-          model->commit(1);
-          prefix.keys.push_back(keys[prefix.inputs.size()]);
-          prefix.inputs.push_back(token);
-          prefix.logits = next;
-          logits = std::move(next);
-        };
-        // Prefill the suffix in the largest segments the model accepts (one activation arena must fit
-        // beside the live decode cache): the first in the prompt's mode, the rest as appends. Prompts or
-        // remainders the model cannot prefill use the sequential consume path.
-        size_t next = reused;
-        while (next < ids.size() && !cancelled()) {
-          const PrefillMode mode = next ? PrefillMode::Append : PrefillMode::Cold;
-          size_t rows = ids.size() - next;
-          if (!model->supports_prefill(mode, rows)) {
-            size_t lo = 0, hi = rows;  // largest supported multiple of 256 below rows
-            while (hi - lo > 256) {
-              size_t mid = (lo + (hi - lo) / 2) / 256 * 256;
-              if (mid <= lo) mid = lo + 256;
-              if (model->supports_prefill(mode, mid)) lo = mid; else hi = mid;
-            }
-            rows = lo;
-          }
-          if (!rows)
-            break;
-          PrefillOptions options;
-          options.mode = mode;
-          options.dense_batch_rows = prefill_dense_batch;
-          options.warm = next + rows == ids.size();
-          options.images = images.empty() ? nullptr : &images;
-          std::vector<int> segment(ids.begin() + next, ids.begin() + next + rows);
-          auto result = model->prefill(segment, options);
-          if (result.begin_position != int64_t(next) ||
-              result.consumed_rows != rows || result.logits.size() != 1 ||
-              result.logits.back().size() != size_t(model->vocab()))
-            throw std::runtime_error("prefill returned inconsistent committed rows");
-          prefix.inputs.insert(prefix.inputs.end(), segment.begin(), segment.end());
-          prefix.keys.insert(prefix.keys.end(), keys.begin() + next, keys.begin() + next + rows);
-          prefix.logits = result.logits.back();
-          logits = std::move(result.logits.back());
-          next += rows;
-        }
-        // The sequential path has no image embeddings: an image the prefill could not take is an error.
-        for (const auto &img : images)
-          if (img.end() > int64_t(next) && !cancelled())
-            throw std::runtime_error("image prompt needs a prefill segment, and it did not fit beside "
-                                     "the expert cache");
-        for (size_t i = next; i < ids.size(); ++i) {
-          if (cancelled())
-            break;
-          consume(ids[i]);
-        }
-        const size_t consumed_prompt = prefix.inputs.size() - reused;
-        const bool prompt_complete = prefix.inputs.size() == ids.size();
-        model->end_prompt(prompt_complete);
-        if (!prompt_complete) {
-          prefix = {};
-        } else if (prefix_cache) {
-          try {
-            prefix.boundary = model->snapshot();
-            prefix.boundary_len = prefix.boundary ? prefix.inputs.size() : 0;
-            prefix.boundary_logits = prefix.boundary ? prefix.logits : std::vector<float>{};
-          } catch (const std::exception &) {
-            prefix.boundary.reset(); prefix.boundary_len = 0;
-          }
-          if (!cancelled()) save_live();   // s0ma change 73
-        }
-        prefill_end = now();
-        const auto prefill_counters = model->counters();
-        Rng rng{sampling.seed};
-        AttemptCounter attempts;
-        DraftProvider *drafter =
-            draft_mode == "off" ? nullptr : model->drafter();
-        const bool copying = drafter && suffix_on();   // s0ma change 72
-        if (copying) suffix.sync(prefix.inputs);
-        std::vector<int> copy;
-        uint64_t copy_steps = 0, copy_drafted = 0, copy_accepted = 0;
-        std::string reason = "length";
-        uint64_t cycles = 0, drafted = 0, accepted = 0, verified_accepted = 0;
-        double draft_ms = 0, verify_ms = 0, draft_forward_ms = 0, draft_draw_ms = 0;
-        auto emit = [&](int token, const std::vector<float> &row) {
-          if (cancelled()) {
-            reason = "cancelled";
-            return false;
-          }
-          if (token == model->eos() ||
-              std::find(sampling.stop.begin(), sampling.stop.end(), token) !=
-                  sampling.stop.end()) {
-            reason = "stop";
-            return false;
-          }
-          Json event = {{"type", "token"}, {"token_id", token}};
-          if (sampling.logprobs) {
-            const double normalizer = log_normalizer(row);
-            event["logsumexp"] = normalizer;
-            event["logits_sha256"] = logits_digest(row);
-            event["logprob"] = double(row[token]) - normalizer;
-            event["top_logprobs"] = Json::array();
-            for (int t : top_order(row, sampling.logprobs))
-              event["top_logprobs"].push_back(
-                  {{"token_id", t}, {"logprob", double(row[t]) - normalizer}});
-          }
-          if (!send_json(fd, event, cancelled)) {
-            reason = "cancelled";
-            return false;
-          }
-          last = now();
-          if (!first)
-            first = last;
-          ++completed;
-          return true;
-        };
-        if (!cancelled()) {
-          // Initial target anchor has its own nonce, including greedy/stops.
-          const uint64_t nonce = attempts.take();
-          ++cycles;
-          int anchor = sampling.temperature == 0
-                           ? argmax(logits)
-                           : sample(probabilities(logits, sampling.temperature,
-                                                  sampling.top_p),
-                                    rng, nonce, 0, Purpose::Target);
-          bool active = emit(anchor, logits);
-          while (active && completed < sampling.max_tokens &&
-                 prefix.inputs.size() < size_t(context)) {
-            if (cancelled()) {
-              reason = "cancelled";
-              break;
-            }
-            const int maximum = std::min({6, sampling.max_tokens - completed,
-                                          context - int(prefix.inputs.size())});
-            // Burn the nonce before width selection, including failed attempts.
-            const uint64_t nonce = attempts.take();
-            ++cycles;
-            int match = 0;
-            const int copy_max = copying ? std::min(maximum, drafter->max_width()) : 0;
-            if (copying && copy_max > 1) {   // s0ma change 72: copy when the copies are expected to beat the drafter
-              match = suffix.lookup(anchor, copy_max - 1, copy);
-              if (!match || copy.empty() ||
-                  (suffix_policy.expected(match, int(copy.size())) < suffix_policy.spark &&
-                   ++suffix_policy.declined % 32 != 0)) {
-                copy.clear();
-                match = 0;
-              }
-            }
-            SpeculativeStep step(*model, drafter, anchor,
-                                 int64_t(prefix.inputs.size()), sampling,
-                                 uint64_t(prompt + completed), nonce, maximum,
-                                 match ? &copy : nullptr);   // (copy holds at most copy_max - 1 tokens)
-            const auto &result = step.result();
-            drafted += step.inputs().size() - 1;
-            verified_accepted += result.accepted;
-            draft_ms += step.observation().draft_ms;
-            verify_ms += step.observation().verify_ms;
-            draft_forward_ms += step.observation().draft_forward_ms;
-            draft_draw_ms += step.observation().draft_draw_ms;
-            size_t delivered = 0;
-            for (size_t k = 0; k < result.emitted.size(); ++k) {
-              if (!emit(result.emitted[k], step.rows()[k])) {
-                active = false;
-                break;
-              }
-              ++delivered;
-            }
-            if (cancelled() && completed < sampling.max_tokens) {
-              reason = "cancelled";
-              active = false;
-            }
-            const bool terminal = !active || completed == sampling.max_tokens;
-            const size_t consumed = step.finish(delivered, terminal,
-                                                 reason == "cancelled");
-            accepted += std::min(delivered, result.accepted);
-            if (copying) {   // s0ma change 72
-              const size_t tested = std::min(delivered, result.accepted) +
-                                    (result.rejected && delivered == result.emitted.size() ? 1 : 0);
-              if (step.copied()) {
-                ++copy_steps; copy_drafted += step.inputs().size() - 1; copy_accepted += std::min(delivered, result.accepted);
-                suffix_policy.observe_copy(match, std::min(delivered, result.accepted), tested);
-              } else if (step.inputs().size() > 1) {
-                suffix_policy.observe_spark(std::min(delivered, result.accepted));
-              }
-            }
-            prefix.inputs.insert(prefix.inputs.end(), step.inputs().begin(),
-                                 step.inputs().begin() + consumed);
-            if (copying)
-              for (size_t i = 0; i < consumed; ++i) suffix.push(step.inputs()[i]);
-            prefix.keys.insert(prefix.keys.end(), step.inputs().begin(),
-                               step.inputs().begin() + consumed);
-            prefix.logits = step.rows()[consumed - 1];
-            anchor = result.emitted.back();
-          }
-        } else
-          reason = "cancelled";
-        auto stats = model->counters();
-        stats["seed"] = sampling.seed;
-        stats["sampling_profile"] = "spark-host-fp64-temperature-floor-1e-5";
-        stats["rng_protocol"] = "spark-v2-monotone-attempt-slot-53bit";
-        stats["score_profile"] = "fp64-logsumexp-from-fp32-logits";
-        stats["prefill_ms"] = (prefill_end - started) * 1000;
-        stats["prefill_mode"] = "verify";
-        stats["reused_prompt_tokens"] = reused;
-        stats["prefix_cache_requested"] = prefix_cache;
-        stats["prefill_input_tokens"] = consumed_prompt;
-        stats["prefill_tier_counters"] =
-            tier_counters(Json::object(), prefill_counters);
-        stats["decode_tier_counters"] = tier_counters(prefill_counters, stats);
-        stats["ttft_ms"] = first ? (first - started) * 1000 : 0;
-        stats["decode_ms"] = first ? (last - first) * 1000 : 0;
-        // The public usage rate divides all completion tokens by this span,
-        // including the initial anchor. The steady-state metric below instead
-        // divides subsequent output intervals by first-to-last elapsed time.
-        stats["generation_ms"] = first ? (last - prefill_end) * 1000 : 0;
-        stats["first_token_time"] = first;
-        stats["last_token_time"] = last;
-        stats["t_first_token"] = first;
-        stats["t_last_token"] = last;
-        stats["cycles"] = cycles;
-        stats["draft_mode"] = drafter ? "native-candidate" : "off";
-        stats["draft_ms"] = draft_ms;
-        stats["target_verify_ms"] = verify_ms;
-        stats["draft_forward_ms"] = draft_forward_ms;   // s0ma: the drafter's forward (begin)
-        stats["draft_draw_ms"] = draft_draw_ms;         // s0ma: Markov heads, q and draws per position
-        stats["draft_gpu_draw"] = [] { const char *v = std::getenv("DS41_SPARK_GPU_DRAW"); return v && v[0] == '1'; }();
-        stats["decode_tps"] = completed > 1 && last > first
-                                  ? (completed - 1) / (last - first)
-                                  : 0;
-        stats["drafted"] = drafted;
-        stats["accepted"] = accepted;
-        stats["verified_accepted"] = verified_accepted;
-        stats["acceptance"] =
-            drafted ? double(accepted) / double(drafted) : 0.0;
-        stats["conversation_loaded"] = loaded;     // s0ma change 73
-        stats["conversation_from_disk"] = from_file;   // s0ma change 81
-        if (disk_on()) {
-          std::lock_guard<std::mutex> l(disk_m);
-          size_t ours = 0;
-          for (auto &d : disk) ours += d.ours;
-          stats["conversations_on_disk"] = ours;
-          stats["conversations_disk_bytes"] = disk_bytes_all;
-          stats["conversation_disk_writes"] = disk_writes;
-          stats["conversation_disk_loads"] = disk_loads;
-          stats["conversation_disk_deletes"] = disk_deletes;
-          stats["conversation_disk_failures"] = disk_failures;
-          stats["conversation_disk_skipped"] = disk_skipped;
-          stats["conversation_disk_write_ms"] = disk_write_ms;
-          stats["conversation_disk_read_ms"] = disk_read_ms;
-        }
-        stats["conversations_saved"] = saved.size();
-        stats["conversations_saved_bytes"] = saved_bytes;
-        stats["conversation_saves"] = conversation_saves;
-        stats["conversation_loads"] = conversation_loads;
-        stats["conversation_evictions"] = conversation_evictions;
-        stats["copy_steps"] = copy_steps;          // s0ma change 72: suffix drafting
-        stats["copy_drafted"] = copy_drafted;
-        stats["copy_accepted"] = copy_accepted;
-        finish(reason, nullptr, stats);
+        sched_cv.notify_all();
+        std::unique_lock<std::mutex> l(J.m);
+        J.cv.wait(l, [&] { return J.done; });
         break;
       }
     } catch (const std::exception &e) {
-      // Error paths cannot promise a reusable native state. Poison checks in
-      // the target still decide whether a subsequent reset is legal.
-      if (run.owns_lock())
-        prefix = {};
-      finish("error", e.what());
+      finish(J, "error", e.what());   // only requests the scheduler never took get here
     }
-    if (registered) {
+    if (J.registered) {
       std::lock_guard<std::mutex> lock(registry_mutex);
-      live.erase(id);
+      live.erase(J.id);
     }
     close(fd);
     --connections;
+  }
+  void schedule_loop() {
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> l(sched_m);
+        sched_cv.wait_for(l, std::chrono::milliseconds(10),
+                          [&] { return sched_stop || !queue.empty() || !running.empty(); });
+        if (sched_stop && queue.empty() && running.empty()) return;
+        if (queue.empty() && running.empty()) continue;
+      }
+      try {
+        tick();
+      } catch (const std::exception &e) {   // never terminate: the running jobs end with the error
+        std::cerr << "scheduler: " << e.what() << "\n";
+        auto all = running;
+        for (auto &j : all) { fail(*j, e.what()); retire(j); }
+      }
+    }
+  }
+  // a job that failed: its slot's state is not reusable (the model poisons itself where it must)
+  void fail(Job &J, const std::string &what) {
+    if (J.slot >= 0) {
+      if (holder(J.slot) == &J) holder(J.slot) = nullptr;
+      entry(J.slot) = {};
+    }
+    finish(J, "error", what);
+    if (J.started) --active;
+    J.started = false;
+  }
+  void retire(const std::shared_ptr<Job> &job) {
+    running.erase(std::remove(running.begin(), running.end(), job), running.end());
+    release(*job);
+  }
+  void tick() {
+    std::vector<std::shared_ptr<Job>> waiting;
+    {
+      std::lock_guard<std::mutex> l(sched_m);
+      waiting.assign(queue.begin(), queue.end());
+    }
+    // queued jobs whose client left or cancelled finish without touching the model
+    for (auto &j : waiting)
+      if (cancelled(*j)) {
+        finish(*j, "cancelled");
+        { std::lock_guard<std::mutex> l(sched_m); queue.erase(std::find(queue.begin(), queue.end(), j)); }
+        release(*j);
+      }
+    {
+      std::lock_guard<std::mutex> l(sched_m);
+      waiting.assign(queue.begin(), queue.end());
+    }
+    std::stable_sort(waiting.begin(), waiting.end(), [](const auto &a, const auto &b) {
+      return a->priority != b->priority ? a->priority < b->priority : a->arrival < b->arrival;
+    });
+    const int slots = model->live_slots();
+    int best = std::numeric_limits<int>::max();
+    for (auto &j : running) best = std::min(best, j->priority);
+    // s0ma change 91: two or more prompts that may start now prefill together (one priority; none longer than a
+    // parked slot holds; not while slot 0 holds a running conversation too long to park)
+    if (combine_on() && model->supports_prefill_multi() && !(slot0_job && !parkable())) {
+      std::vector<std::shared_ptr<Job>> starters;
+      int room = slots - int(running.size());
+      for (auto &j : waiting) {
+        if (room <= 0) break;
+        if (!running.empty() && !batch_lower() && j->priority > best) break;
+        if (!starters.empty() && !batch_lower() && j->priority > starters.front()->priority) break;
+        if (j->verb == "score" || j->sampling.max_tokens == 0 ||
+            j->ids.size() + 1 > size_t(model->slot_context())) break;
+        starters.push_back(j);
+        --room;
+      }
+      if (starters.size() >= 2 && start_many(starters)) {
+        for (auto &j : running) best = std::min(best, j->priority);
+        goto decode;
+      }
+    }
+    for (auto &j : waiting) {
+      if (int(running.size()) >= slots) break;
+      if (!running.empty() && !batch_lower() && j->priority > best) break;
+      if (j->verb == "score" && !running.empty()) break;   // a score request resets slot 0: it runs alone
+      { std::lock_guard<std::mutex> l(sched_m); queue.erase(std::find(queue.begin(), queue.end(), j)); }
+      if (j->verb == "score") {
+        run_score(*j);
+        release(*j);
+        return;
+      }
+      bool started = false;
+      try {
+        started = start(*j);
+      } catch (const std::exception &e) {
+        fail(*j, e.what());
+        release(*j);
+        continue;
+      }
+      if (!started) {   // no slot can take it yet: back to the queue, in its place
+        std::lock_guard<std::mutex> l(sched_m);
+        queue.push_front(j);
+        break;
+      }
+      if (j->finished) { release(*j); continue; }
+      running.push_back(j);
+      best = std::min(best, j->priority);
+    }
+  decode:
+    if (running.empty()) return;
+    {   // running jobs whose client left or cancelled end now, stepping or waiting (their state is consistent)
+      auto all = running;
+      for (auto &j : all)
+        if (cancelled(*j)) { finish_job(*j, "cancelled"); retire(j); }
+      if (running.empty()) return;
+      best = std::numeric_limits<int>::max();
+      for (auto &j : running) best = std::min(best, j->priority);
+    }
+    std::vector<std::shared_ptr<Job>> turn;
+    for (auto &j : running)
+      if (batch_lower() || j->priority == best) turn.push_back(j);
+    std::stable_sort(turn.begin(), turn.end(), [](const auto &a, const auto &b) { return a->last_step < b->last_step; });
+    if (turn.size() > 6) turn.resize(6);
+    const bool multi = turn.size() > 1 && !multi_off() && model->supports_verify_multi();
+    if (multi) step_multi(turn);
+    else step_single(turn.front());
+  }
+  static bool combine_on() {   // DS41_PREFILL_COMBINE=0: prompts prefill one by one
+    static const bool v = [] { const char *e = std::getenv("DS41_PREFILL_COMBINE"); return !(e && e[0] == '0'); }();
+    return v;
+  }
+  static size_t combine_rows() {   // a prompt remainder up to this many rows joins a combined prefill
+    static const size_t v = [] {
+      const char *e = std::getenv("DS41_PREFILL_COMBINE_ROWS");
+      const long x = e && *e ? std::atol(e) : 16384;
+      return size_t(std::max(1L, x));
+    }();
+    return v;
+  }
+  // s0ma change 91: several jobs start at once. Each takes its slot and its cached prefix in turn (slot 0 each time);
+  // the remainders without images prefill together (Forward::prefill_multi); the others, and all of them if the
+  // model declines, take the single path; then each concludes in slot 0
+  bool start_many(const std::vector<std::shared_ptr<Job>> &js) {
+    std::vector<std::shared_ptr<Job>> claimed;
+    bool any = false;
+    for (auto &j : js) {
+      { std::lock_guard<std::mutex> l(sched_m); queue.erase(std::find(queue.begin(), queue.end(), j)); }
+      bool ok = false;
+      try {
+        ok = claim(*j);
+        if (ok) any = true;
+        if (ok && (j->finished || !prepare(*j))) { release(*j); continue; }
+      } catch (const std::exception &e) {
+        any = true;
+        fail(*j, e.what());
+        release(*j);
+        continue;
+      }
+      if (!ok) {
+        std::lock_guard<std::mutex> l(sched_m);
+        queue.push_front(j);
+        break;
+      }
+      claimed.push_back(j);
+    }
+    std::vector<Forward::PrefillGroup> groups;
+    std::vector<std::shared_ptr<Job>> grouped, single;
+    for (auto &j : claimed) {
+      const size_t rest = j->ids.size() - entry(j->slot).inputs.size();
+      const size_t cap = j->slot ? size_t(model->slot_context()) : size_t(context);
+      if (rest && rest <= combine_rows() && j->ids.size() <= cap && j->images.empty() && !cancelled(*j)) {
+        Forward::PrefillGroup g;
+        g.slot = j->slot;
+        g.ids.assign(j->ids.begin() + std::ptrdiff_t(entry(j->slot).inputs.size()), j->ids.end());
+        g.options.mode = entry(j->slot).inputs.empty() ? PrefillMode::Cold : PrefillMode::Append;
+        g.options.dense_batch_rows = prefill_dense_batch;
+        groups.push_back(std::move(g));
+        grouped.push_back(j);
+      } else {
+        single.push_back(j);
+      }
+    }
+    if (groups.size() >= 2) {
+      try {
+        auto results = model->prefill_multi(groups);
+        for (size_t g = 0; g < grouped.size(); ++g) {
+          Job &J = *grouped[g];
+          auto &P = entry(J.slot);
+          const size_t from = P.inputs.size();
+          P.inputs.insert(P.inputs.end(), J.ids.begin() + std::ptrdiff_t(from), J.ids.end());
+          P.keys.insert(P.keys.end(), J.keys.begin() + std::ptrdiff_t(from), J.keys.end());
+          P.logits = results[g].logits.back();
+          J.logits = std::move(results[g].logits.back());
+          J.consumed_prompt = J.ids.size() - J.reused;
+          J.combined = grouped.size();
+        }
+      } catch (const PrefillDeclined &e) {   // nothing changed: one by one
+        std::cerr << "combined prefill declined (" << e.what() << "): one by one\n";
+        single.insert(single.end(), grouped.begin(), grouped.end());
+        grouped.clear();
+      } catch (const std::exception &e) {
+        for (auto &j : grouped) { fail(*j, e.what()); release(*j); }
+        grouped.clear();
+      }
+    } else {
+      single.insert(single.end(), grouped.begin(), grouped.end());
+      grouped.clear();
+    }
+    auto settle = [&](const std::shared_ptr<Job> &j, bool run_segments) {
+      Job &J = *j;
+      try {
+        if (J.slot != 0) {
+          if (slot0_job && !parkable()) throw std::runtime_error("slot 0 holds a conversation too long to park");
+          if (!slot0_job && !prefix.inputs.empty() && !parkable()) drop_slot0();
+          bring(J.slot);
+        }
+        if (run_segments) segments(J);
+        conclude(J);
+      } catch (const std::exception &e) {
+        fail(J, e.what());
+      }
+      if (J.finished) release(J);
+      else running.push_back(j);
+    };
+    for (auto &j : grouped) settle(j, false);
+    for (auto &j : single) settle(j, true);
+    return any;
+  }
+  bool emit(Job &J, int token, const std::vector<float> &row) {
+    if (cancelled(J)) {
+      J.reason = "cancelled";
+      return false;
+    }
+    if (token == model->eos() ||
+        std::find(J.sampling.stop.begin(), J.sampling.stop.end(), token) != J.sampling.stop.end()) {
+      J.reason = "stop";
+      return false;
+    }
+    Json event = {{"type", "token"}, {"token_id", token}};
+    if (J.sampling.logprobs) {
+      const double normalizer = log_normalizer(row);
+      event["logsumexp"] = normalizer;
+      event["logits_sha256"] = logits_digest(row);
+      event["logprob"] = double(row[token]) - normalizer;
+      event["top_logprobs"] = Json::array();
+      for (int t : top_order(row, J.sampling.logprobs))
+        event["top_logprobs"].push_back({{"token_id", t}, {"logprob", double(row[t]) - normalizer}});
+    }
+    if (!send_json(J.fd, event, [&] { return cancelled(J); })) {
+      J.reason = "cancelled";
+      return false;
+    }
+    J.last = now();
+    if (!J.first) J.first = J.last;
+    ++J.completed;
+    return true;
+  }
+  // the slot a starting job takes: the idle slot whose conversation serves the most of its prompt, else a fresh slot 0
+  // (the job's conversation is then in slot 0)
+  bool claim(Job &J) {
+    if (J.sampling.max_tokens == 0) {   // as before: nothing touched
+      finish(J, "length");
+      return true;
+    }
+    const int slots = model->live_slots();
+    int k = -1;
+    size_t served = 0;
+    if (prefix_cache)
+      for (int s = 0; s < slots; ++s) {
+        if (holder(s)) continue;
+        auto &P = entry(s);
+        size_t n = 0;
+        if (P.matches(J.conversation, J.keys, prefix_any)) n = P.inputs.size();
+        else if (P.boundary && P.boundary_len && P.same_conversation(J.conversation, prefix_any) &&
+                 P.boundary_len <= J.ids.size() && P.boundary_len <= P.inputs.size() &&
+                 std::equal(P.keys.begin(), P.keys.begin() + P.boundary_len, J.keys.begin()))
+          n = P.boundary_len;
+        if (n > served) { served = n; k = s; }
+      }
+    const bool movable = slot0_job ? parkable() : prefix.inputs.empty() || parkable();
+    if (k > 0) {
+      if (!movable) {
+        if (slot0_job) return false;
+        drop_slot0();
+      }
+      bring(k);
+    } else if (k < 0 && (slot0_job || !prefix.inputs.empty())) {
+      int v = -1;
+      for (int s = 1; s < slots; ++s) {
+        if (holder(s)) continue;
+        if (entry(s).inputs.empty()) { v = s; break; }
+        if (v < 0 || used(s) < used(v)) v = s;
+      }
+      if (v > 0 && movable) {
+        const bool occupied = !entry(v).inputs.empty();
+        bring(v);
+        if (occupied) drop_slot0();
+      } else {
+        if (slot0_job) return false;
+        drop_slot0();
+      }
+    }
+    if (slot0_job) throw std::logic_error("start: slot 0 is still taken");
+    slot0_job = &J;
+    J.slot = 0;
+    J.started = true;
+    ++active;
+    slot0_used = ++use_clock;
+    J.last_step = use_clock;
+    return true;
+  }
+  bool start(Job &J) {
+    if (!claim(J)) return false;
+    if (!J.finished) prefill(J);
+    return true;
+  }
+  // today's prompt path (reuse, rewind, a saved conversation, else cold; then the prefill and the first token)
+  void prefill(Job &J) {
+    if (!prepare(J)) return;
+    segments(J);
+    conclude(J);
+  }
+  // the job in slot 0: what of its prompt the slot (or a saved conversation) already holds; false when it has ended
+  bool prepare(Job &J) {
+    const auto &ids = J.ids;
+    const auto &keys = J.keys;
+    const auto &sampling = J.sampling;
+    const std::string &conversation = J.conversation;
+    double started = now();
+    J.t_start = started;
+    std::vector<float> &logits = J.logits;
+    if (sampling.max_tokens == 0) {
+      finish_job(J, "length");
+      return false;
+    }
+    size_t reused = prefix_cache && prefix.matches(conversation, keys, prefix_any)
+                        ? prefix.inputs.size()
+                        : 0;
+    bool rewound = false;
+    if (!reused && prefix_cache && prefix.boundary && prefix.boundary_len &&
+        prefix.same_conversation(conversation, prefix_any) &&
+        prefix.boundary_len <= ids.size() && prefix.boundary_len <= prefix.inputs.size() &&
+        std::equal(prefix.keys.begin(), prefix.keys.begin() + prefix.boundary_len, keys.begin())) {
+      try {
+        ++model_epoch;
+        model->restore(*prefix.boundary);
+        prefix.inputs.resize(prefix.boundary_len);
+        prefix.keys.resize(prefix.boundary_len);
+        prefix.logits = prefix.boundary_logits;
+        reused = prefix.boundary_len;
+        rewound = true;
+      } catch (const std::exception &) {
+        reused = 0;
+      }
+    }
+    bool loaded = false, from_file = false;
+    if (!reused && prefix_cache && (!saved.empty() || disk_on())) {   // s0ma change 73 (81: or from disk)
+      auto best = find_saved(conversation, keys);
+      std::optional<Saved> file;
+      if (disk_on()) file = disk_read(conversation, keys, best != saved.end() ? best->keys.size() : 0);
+      const Saved *use = file ? &*file : best != saved.end() ? &*best : nullptr;
+      if (use) {
+        try {
+          ++model_epoch;
+          model->load_conversation(*use->state);
+          prefix = {};
+          prefix.conversation = use->conversation;
+          prefix.inputs = use->inputs;
+          prefix.keys = use->keys;
+          prefix.logits = use->logits;
+          reused = prefix.inputs.size();
+          rewound = loaded = true;
+          ++conversation_loads;
+          if (file) { from_file = true; remember(std::move(*file)); }
+          else saved.splice(saved.begin(), saved, best);
+        } catch (const std::exception &e) {
+          std::cerr << "conversation load failed: " << e.what() << "\n";
+          reused = 0;
+        }
+      }
+    }
+    if (reused) {
+      // a loaded conversation starts a request too (the drafter's policy-v2 nonces restart with the server's)
+      if (!rewound || loaded) { ++model_epoch; model->begin_request(); }
+      logits = prefix.logits;
+    } else {
+      prefix = {};
+      ++model_epoch;
+      model->reset();
+    }
+    prefix.conversation = conversation;
+    J.reused = reused;
+    J.loaded = loaded;
+    J.from_file = from_file;
+    return true;
+  }
+  // the rest of the prompt: prefill segments, then single rows
+  void segments(Job &J) {
+    const auto &ids = J.ids;
+    const auto &keys = J.keys;
+    const auto &images = J.images;
+    const int prompt = J.prompt;
+    const size_t reused = J.reused;
+    auto cancelled = [&] { return this->cancelled(J); };
+    std::vector<float> &logits = J.logits;
+    model->begin_prompt(prompt, reused != 0);
+    auto consume = [&](int token) {
+      auto next = model->verify({token}).at(0);
+      model->commit(1);
+      prefix.keys.push_back(keys[prefix.inputs.size()]);
+      prefix.inputs.push_back(token);
+      prefix.logits = next;
+      logits = std::move(next);
+    };
+    // Prefill the suffix in the largest segments the model accepts (one activation arena must fit
+    // beside the live decode cache): the first in the prompt's mode, the rest as appends. Prompts or
+    // remainders the model cannot prefill use the sequential consume path.
+    size_t next = reused;
+    while (next < ids.size() && !cancelled()) {
+      const PrefillMode mode = next ? PrefillMode::Append : PrefillMode::Cold;
+      size_t rows = ids.size() - next;
+      if (!model->supports_prefill(mode, rows)) {
+        size_t lo = 0, hi = rows;  // largest supported multiple of 256 below rows
+        while (hi - lo > 256) {
+          size_t mid = (lo + (hi - lo) / 2) / 256 * 256;
+          if (mid <= lo) mid = lo + 256;
+          if (model->supports_prefill(mode, mid)) lo = mid; else hi = mid;
+        }
+        rows = lo;
+      }
+      if (!rows)
+        break;
+      PrefillOptions options;
+      options.mode = mode;
+      options.dense_batch_rows = prefill_dense_batch;
+      options.warm = next + rows == ids.size();
+      options.images = images.empty() ? nullptr : &images;
+      std::vector<int> segment(ids.begin() + next, ids.begin() + next + rows);
+      auto result = model->prefill(segment, options);
+      if (result.begin_position != int64_t(next) ||
+          result.consumed_rows != rows || result.logits.size() != 1 ||
+          result.logits.back().size() != size_t(model->vocab()))
+        throw std::runtime_error("prefill returned inconsistent committed rows");
+      prefix.inputs.insert(prefix.inputs.end(), segment.begin(), segment.end());
+      prefix.keys.insert(prefix.keys.end(), keys.begin() + next, keys.begin() + next + rows);
+      prefix.logits = result.logits.back();
+      logits = std::move(result.logits.back());
+      next += rows;
+    }
+    // The sequential path has no image embeddings: an image the prefill could not take is an error.
+    for (const auto &img : images)
+      if (img.end() > int64_t(next) && !cancelled())
+        throw std::runtime_error("image prompt needs a prefill segment, and it did not fit beside "
+                                 "the expert cache");
+    for (size_t i = next; i < ids.size(); ++i) {
+      if (cancelled())
+        break;
+      consume(ids[i]);
+    }
+    J.consumed_prompt = prefix.inputs.size() - reused;
+    model->end_prompt(prefix.inputs.size() == ids.size());
+  }
+  // the job in slot 0 after its prompt: the boundary snapshot, the saved conversation, the first token
+  void conclude(Job &J) {
+    const auto &ids = J.ids;
+    const auto &sampling = J.sampling;
+    auto cancelled = [&] { return this->cancelled(J); };
+    std::vector<float> &logits = J.logits;
+    const bool prompt_complete = prefix.inputs.size() == ids.size();
+    if (!prompt_complete) {
+      prefix = {};
+    } else if (prefix_cache) {
+      try {
+        prefix.boundary = model->snapshot();
+        prefix.boundary_len = prefix.boundary ? prefix.inputs.size() : 0;
+        prefix.boundary_logits = prefix.boundary ? prefix.logits : std::vector<float>{};
+      } catch (const std::exception &) {
+        prefix.boundary.reset(); prefix.boundary_len = 0;
+      }
+      if (!cancelled()) save_live();   // s0ma change 73
+    }
+    J.prefill_end = now();
+    J.prefill_counters = model->counters();
+    J.epoch = model_epoch;
+    J.rng = Rng{sampling.seed};
+    J.attempts = std::make_unique<AttemptCounter>();
+    J.drafter = J.draft_mode == "off" ? nullptr : model->drafter();
+    J.copying = J.drafter && suffix_on();   // s0ma change 72
+    if (J.copying) J.suffix.sync(prefix.inputs);
+    if (cancelled()) {
+      finish_job(J, "cancelled");
+      return;
+    }
+    // Initial target anchor has its own nonce, including greedy/stops.
+    const uint64_t nonce = J.attempts->take();
+    ++J.cycles;
+    J.anchor = sampling.temperature == 0
+                   ? argmax(logits)
+                   : sample(probabilities(logits, sampling.temperature, sampling.top_p),
+                            J.rng, nonce, 0, Purpose::Target);
+    if (!emit(J, J.anchor, logits) || J.completed >= sampling.max_tokens ||
+        prefix.inputs.size() >= size_t(context))
+      finish_job(J, J.reason);
+  }
+  // one single-stream speculative step of the job in slot 0 (today's decode loop body)
+  void decode_step(Job &J) {
+    const Sampling &sampling = J.sampling;
+    DraftProvider *drafter = J.drafter;
+    const int maximum = std::min({6, sampling.max_tokens - J.completed,
+                                  context - int(prefix.inputs.size())});
+    // Burn the nonce before width selection, including failed attempts.
+    const uint64_t nonce = J.attempts->take();
+    ++J.cycles;
+    int match = 0;
+    auto &copy = J.copy;
+    const int copy_max = J.copying ? std::min(maximum, drafter->max_width()) : 0;
+    if (J.copying && copy_max > 1) {   // s0ma change 72: copy when the copies are expected to beat the drafter
+      match = J.suffix.lookup(J.anchor, copy_max - 1, copy);
+      if (!match || copy.empty() ||
+          (suffix_policy.expected(match, int(copy.size())) < suffix_policy.spark &&
+           ++suffix_policy.declined % 32 != 0)) {
+        copy.clear();
+        match = 0;
+      }
+    }
+    SpeculativeStep step(*model, drafter, J.anchor,
+                         int64_t(prefix.inputs.size()), sampling,
+                         uint64_t(J.prompt + J.completed), nonce, maximum,
+                         match ? &copy : nullptr);   // (copy holds at most copy_max - 1 tokens)
+    const auto &result = step.result();
+    J.drafted += step.inputs().size() - 1;
+    J.verified_accepted += result.accepted;
+    J.draft_ms += step.observation().draft_ms;
+    J.verify_ms += step.observation().verify_ms;
+    J.draft_forward_ms += step.observation().draft_forward_ms;
+    J.draft_draw_ms += step.observation().draft_draw_ms;
+    size_t delivered = 0;
+    bool active = true;
+    for (size_t k = 0; k < result.emitted.size(); ++k) {
+      if (!emit(J, result.emitted[k], step.rows()[k])) {
+        active = false;
+        break;
+      }
+      ++delivered;
+    }
+    if (cancelled(J) && J.completed < sampling.max_tokens) {
+      J.reason = "cancelled";
+      active = false;
+    }
+    const bool terminal = !active || J.completed == sampling.max_tokens;
+    const size_t consumed = step.finish(delivered, terminal, J.reason == "cancelled");
+    J.accepted += std::min(delivered, result.accepted);
+    if (J.copying) {   // s0ma change 72
+      const size_t tested = std::min(delivered, result.accepted) +
+                            (result.rejected && delivered == result.emitted.size() ? 1 : 0);
+      if (step.copied()) {
+        ++J.copy_steps; J.copy_drafted += step.inputs().size() - 1; J.copy_accepted += std::min(delivered, result.accepted);
+        suffix_policy.observe_copy(match, std::min(delivered, result.accepted), tested);
+      } else if (step.inputs().size() > 1) {
+        suffix_policy.observe_spark(std::min(delivered, result.accepted));
+      }
+    }
+    prefix.inputs.insert(prefix.inputs.end(), step.inputs().begin(), step.inputs().begin() + consumed);
+    if (J.copying)
+      for (size_t i = 0; i < consumed; ++i) J.suffix.push(step.inputs()[i]);
+    prefix.keys.insert(prefix.keys.end(), step.inputs().begin(), step.inputs().begin() + consumed);
+    prefix.logits = step.rows()[consumed - 1];
+    J.anchor = result.emitted.back();
+    if (!active || J.completed >= sampling.max_tokens || prefix.inputs.size() >= size_t(context))
+      finish_job(J, J.reason);
+  }
+  void J0_step(const std::shared_ptr<Job> &job) {   // the job in slot 0, one single step
+    Job &J = *job;
+    try {
+      J.last_step = slot0_used = ++use_clock;
+      decode_step(J);
+    } catch (const std::exception &e) {
+      fail(J, e.what());
+    }
+    if (J.finished) retire(job);
+  }
+  void step_single(const std::shared_ptr<Job> &job) {
+    Job &J = *job;
+    try {
+      if (J.slot != 0) {
+        if (slot0_job && !parkable()) {   // a running conversation too long to park holds slot 0: step in place
+          step_multi({job}, true);
+          return;
+        }
+        if (!slot0_job && !prefix.inputs.empty() && !parkable()) drop_slot0();
+        bring(J.slot);
+      }
+      J.last_step = slot0_used = ++use_clock;
+      decode_step(J);
+    } catch (const std::exception &e) {
+      fail(J, e.what());
+    }
+    if (J.finished) retire(job);
+  }
+  // one multi-conversation step: each job's anchor as one row, in its own slot
+  void step_multi(const std::vector<std::shared_ptr<Job>> &turn, bool alone = false) {
+    std::vector<Forward::VerifyGroup> groups;
+    std::vector<std::shared_ptr<Job>> members;
+    for (auto &j : turn) {
+      const size_t cap = j->slot == 0 ? size_t(context) : size_t(model->slot_context());
+      if (entry(j->slot).inputs.size() + 1 > cap) continue;
+      groups.push_back({j->slot, {j->anchor}});
+      members.push_back(j);
+    }
+    if (members.empty() || (members.size() < 2 && !alone)) {   // the rest need slot 0
+      auto pick = members.empty() ? turn.front() : *std::find_if(turn.begin(), turn.end(), [&](auto &j) {
+        return std::find(members.begin(), members.end(), j) == members.end(); });
+      if (members.empty() && alone) {
+        // slot 0 holds a running conversation too long to park: step that one (it frees slot 0 when it ends)
+        auto holder0 = std::find_if(running.begin(), running.end(), [&](auto &j) { return j.get() == slot0_job; });
+        if (holder0 != running.end()) { auto h0 = *holder0; J0_step(h0); }
+        return;
+      }
+      step_single(pick);
+      return;
+    }
+    std::vector<int> tokens(members.size(), -1);
+    std::vector<std::vector<std::vector<float>>> rows;
+    try {
+      const double t0 = now();
+      rows = model->verify_multi(groups);
+      const double ms = (now() - t0) * 1000;
+      for (size_t g = 0; g < members.size(); ++g) {
+        Job &J = *members[g];
+        const uint64_t nonce = J.attempts->take();
+        ++J.cycles; ++J.multi_steps;
+        J.verify_ms += ms / double(members.size());
+        Verification v = reject_sample({}, {}, probabilities_rows(rows[g], J.sampling.temperature, J.sampling.top_p),
+                                       J.rng, nonce, J.sampling.temperature);
+        if (v.emitted.empty()) throw std::runtime_error("multi step: no token");
+        tokens[g] = v.emitted.front();
+      }
+      for (size_t g = 0; g < members.size(); ++g) model->commit_group(g, 1);
+    } catch (const std::exception &e) {
+      for (auto &j : members) { fail(*j, e.what()); retire(j); }
+      return;
+    }
+    for (size_t g = 0; g < members.size(); ++g) {
+      Job &J = *members[g];
+      try {
+      auto &P = entry(J.slot);
+      J.last_step = used(J.slot) = ++use_clock;
+      P.inputs.push_back(J.anchor);
+      P.keys.push_back(uint64_t(J.anchor));
+      P.logits = rows[g][0];
+      if (J.copying) J.suffix.push(J.anchor);
+      bool active = emit(J, tokens[g], rows[g][0]);
+      J.anchor = tokens[g];
+      if (cancelled(J) && J.completed < J.sampling.max_tokens) { J.reason = "cancelled"; active = false; }
+      if (!active || J.completed >= J.sampling.max_tokens || P.inputs.size() >= size_t(context))
+        finish_job(J, J.reason);
+      } catch (const std::exception &e) {
+        fail(J, e.what());
+      }
+      if (J.finished) retire(members[g]);
+    }
+  }
+  void finish_job(Job &J, const std::string &reason) {
+    J.reason = reason;
+    auto stats = model->counters();
+    stats["seed"] = J.sampling.seed;
+    stats["sampling_profile"] = "spark-host-fp64-temperature-floor-1e-5";
+    stats["rng_protocol"] = "spark-v2-monotone-attempt-slot-53bit";
+    stats["score_profile"] = "fp64-logsumexp-from-fp32-logits";
+    stats["prefill_ms"] = ((J.prefill_end ? J.prefill_end : now()) - J.t_start) * 1000;
+    stats["prefill_mode"] = "verify";
+    stats["reused_prompt_tokens"] = J.reused;
+    stats["prefix_cache_requested"] = prefix_cache;
+    stats["prefill_input_tokens"] = J.consumed_prompt;
+    const bool same = J.epoch == model_epoch;   // no other request restarted the counters since this one's prefill
+    const Json &pc = J.prefill_counters.is_object() ? J.prefill_counters : stats;
+    stats["prefill_tier_counters"] = tier_counters(Json::object(), pc, false);
+    stats["decode_tier_counters"] = tier_counters(pc, stats, same);
+    if (!same) stats["tier_counters_shared"] = true;
+    stats["ttft_ms"] = J.first ? (J.first - J.t_start) * 1000 : 0;
+    stats["decode_ms"] = J.first ? (J.last - J.first) * 1000 : 0;
+    // The public usage rate divides all completion tokens by this span,
+    // including the initial anchor. The steady-state metric below instead
+    // divides subsequent output intervals by first-to-last elapsed time.
+    stats["generation_ms"] = J.first ? (J.last - J.prefill_end) * 1000 : 0;
+    stats["first_token_time"] = J.first;
+    stats["last_token_time"] = J.last;
+    stats["t_first_token"] = J.first;
+    stats["t_last_token"] = J.last;
+    stats["cycles"] = J.cycles;
+    stats["draft_mode"] = J.drafter ? "native-candidate" : "off";
+    stats["draft_ms"] = J.draft_ms;
+    stats["target_verify_ms"] = J.verify_ms;
+    stats["draft_forward_ms"] = J.draft_forward_ms;   // s0ma: the drafter's forward (begin)
+    stats["draft_draw_ms"] = J.draft_draw_ms;         // s0ma: Markov heads, q and draws per position
+    stats["draft_gpu_draw"] = [] { const char *v = std::getenv("DS41_SPARK_GPU_DRAW"); return v && v[0] == '1'; }();
+    stats["decode_tps"] = J.completed > 1 && J.last > J.first ? (J.completed - 1) / (J.last - J.first) : 0;
+    stats["drafted"] = J.drafted;
+    stats["accepted"] = J.accepted;
+    stats["verified_accepted"] = J.verified_accepted;
+    stats["acceptance"] = J.drafted ? double(J.accepted) / double(J.drafted) : 0.0;
+    stats["conversation_loaded"] = J.loaded;     // s0ma change 73
+    stats["conversation_from_disk"] = J.from_file;   // s0ma change 81
+    stats["priority"] = J.priority;              // s0ma change 91
+    stats["multi_steps"] = J.multi_steps;
+    stats["combined_prefill"] = J.combined;
+    stats["live_slot"] = J.slot;
+    if (disk_on()) {
+      std::lock_guard<std::mutex> l(disk_m);
+      size_t ours = 0;
+      for (auto &d : disk) ours += d.ours;
+      stats["conversations_on_disk"] = ours;
+      stats["conversations_disk_bytes"] = disk_bytes_all;
+      stats["conversation_disk_writes"] = disk_writes;
+      stats["conversation_disk_loads"] = disk_loads;
+      stats["conversation_disk_deletes"] = disk_deletes;
+      stats["conversation_disk_failures"] = disk_failures;
+      stats["conversation_disk_skipped"] = disk_skipped;
+      stats["conversation_disk_write_ms"] = disk_write_ms;
+      stats["conversation_disk_read_ms"] = disk_read_ms;
+    }
+    stats["conversations_saved"] = saved.size();
+    stats["conversations_saved_bytes"] = saved_bytes;
+    stats["conversation_saves"] = conversation_saves;
+    stats["conversation_loads"] = conversation_loads;
+    stats["conversation_evictions"] = conversation_evictions;
+    stats["copy_steps"] = J.copy_steps;          // s0ma change 72: suffix drafting
+    stats["copy_drafted"] = J.copy_drafted;
+    stats["copy_accepted"] = J.copy_accepted;
+    finish(J, reason, nullptr, stats);
+    if (J.slot >= 0 && holder(J.slot) == &J) holder(J.slot) = nullptr;
+    if (J.started) --active;
+    J.started = false;
+  }
+  // a score request (today's path): it resets slot 0, so it runs only when no job is running
+  void run_score(Job &J) {
+    auto cancelled = [&] { return this->cancelled(J); };
+    const auto &ids = J.ids;
+    const int prompt = J.prompt;
+    const Json &op = J.op;
+    ++active;
+    struct Done { std::atomic<int> &a; ~Done() { --a; } } done{active};
+    try {
+      prefix = {};
+      ++model_epoch;
+      model->reset();
+      int from = integer(op, "score_from", 0, 0, prompt - 1),
+          top = integer(op, "top", 64, 1, std::min(1024, model->vocab()));
+      auto mode = op.value("mode", std::string("verify"));
+      if (mode != "verify" && mode != "prefill")
+        throw std::invalid_argument("unknown score mode");
+      auto widths = verify_widths(op);
+      if (mode != "verify")
+        throw std::invalid_argument(
+            "unsupported: cold prefill score is not implemented");
+      if (op.value("return_routes", false))
+        throw std::invalid_argument(
+            "unsupported: route events are not implemented");
+      size_t cycle = 0;
+      for (int begin = 0; begin < prompt && !cancelled();) {
+        int count =
+            std::min(widths[cycle++ % widths.size()], prompt - begin);
+        std::vector<int> chunk(ids.begin() + begin,
+                               ids.begin() + begin + count);
+        auto rows = model->verify(chunk);
+        if (rows.size() != size_t(count))
+          throw std::runtime_error(
+              "target verify returned wrong row count");
+        model->commit(count);
+        bool sent = true;
+        for (int row = 0; row < count && !cancelled(); ++row) {
+          int i = begin + row;
+          if (i < from)
+            continue;
+          auto &l = rows[row];
+          double normalizer = log_normalizer(l);
+          auto top_ids = top_order(l, top);
+          Json logp = Json::array();
+          for (int t : top_ids)
+            logp.push_back(double(l[t]) - normalizer);
+          Json event = {{"type", "score"},
+                        {"position", i},
+                        {"top1", argmax(l)},
+                        {"top_id", top_ids},
+                        {"top_logprob", logp},
+                        {"logsumexp", normalizer},
+                        {"logits_sha256", logits_digest(l)}};
+          if (op.value("return_logits", false))
+            event["logits"] = l;
+          if (i + 1 < prompt) {
+            event["next_token_id"] = ids[i + 1];
+            event["next_logprob"] = double(l[ids[i + 1]]) - normalizer;
+          }
+          if (!send_json(J.fd, event, cancelled)) {
+            sent = false;
+            break;
+          }
+        }
+        begin += count;
+        if (!sent)
+          break;
+      }
+      auto stats = model->counters();
+      stats["prefill_mode"] = "verify";
+      stats["verify_width"] = widths;
+      finish(J, cancelled() ? "cancelled" : "stop", nullptr, stats);
+    } catch (const std::exception &e) {
+      prefix = {};
+      finish(J, "error", e.what());
+    }
   }
   template <class T>
   static std::vector<int> top_order(const std::vector<T> &p, int n) {
@@ -1336,7 +1843,9 @@ public:
     ids.resize(n);
     return ids;
   }
-  static Json tier_counters(const Json &before, const Json &after) {
+  // s0ma change 91: strict=false when the model's counters were restarted (another request's begin_request or
+  // reset) since `before`: a counter that went back is left out instead of failing the request
+  static Json tier_counters(const Json &before, const Json &after, bool strict = true) {
     Json out = Json::object();
     for (const char *key :
          {"expert_vram_hits", "expert_host_hits", "expert_nvme_misses",
@@ -1347,14 +1856,16 @@ public:
         continue;
       uint64_t a = after.at(key).get<uint64_t>(),
                b = before.value(key, uint64_t(0));
-      if (a < b)
+      if (a < b) {
+        if (!strict) continue;
         throw std::runtime_error("request tier counter moved backwards");
+      }
       out[key] = a - b;
     }
     for (auto it = after.begin(); it != after.end(); ++it)   // s0ma change 18: demands by width class
       if (it.key().rfind("expert_class_", 0) == 0 && it->is_number_unsigned()) {
         const uint64_t a = it->get<uint64_t>(), b = before.value(it.key(), uint64_t(0));
-        if (a < b) throw std::runtime_error("request tier counter moved backwards");
+        if (a < b) { if (!strict) continue; throw std::runtime_error("request tier counter moved backwards"); }
         out[it.key()] = a - b;
       }
     for (const char *key :
@@ -1370,6 +1881,14 @@ class Replay final : public Forward {
   int eos_;
   int delay;
   size_t calls = 0;
+  // s0ma change 91 (protocol tests): "live_slots": n parks n-1 more positions; verify_multi steps them together
+  std::vector<size_t> parked_pos;
+  int64_t slot_ctx = 0;
+  std::vector<Forward::VerifyGroup> multi_groups;
+  std::vector<uint8_t> multi_done;
+  size_t multi_calls = 0, swaps = 0;
+  bool multi_pending = false, decline_multi = false;
+  size_t multi_prefills = 0;
 
 public:
   explicit Replay(const std::string &path) {
@@ -1384,6 +1903,77 @@ public:
         throw std::invalid_argument("replay shape");
     eos_ = j.value("eos", -1);
     delay = j.value("delay_ms", 0);
+    parked_pos.assign(size_t(std::max(1, j.value("live_slots", 1)) - 1), 0);
+    slot_ctx = j.value("slot_context", 1 << 20);
+    decline_multi = j.value("decline_multi", false);
+    spark = j.value("spark", false);
+  }
+  int live_slots() const override { return 1 + int(parked_pos.size()); }
+  int64_t slot_context() const override { return parked_pos.empty() ? 0 : slot_ctx; }
+  int64_t committed_position() const override { return int64_t(position); }
+  void swap_slot(int k) override {
+    if (pending || k < 1 || k > int(parked_pos.size())) throw std::logic_error("replay swap_slot");
+    // as Native and the Spark bridge refuse
+    if (incomplete) throw std::logic_error("swap_slot during a prompt");
+    if (int64_t(position) > slot_ctx || int64_t(parked_pos[size_t(k - 1)]) > slot_ctx)
+      throw std::logic_error("swap_slot: a conversation longer than DS41_SLOT_CONTEXT");
+    std::swap(position, parked_pos[size_t(k - 1)]);
+    ++swaps;
+  }
+  // "spark": true models the drafter bridge's prompt lifecycle: an incomplete prompt blocks swaps until a reset
+  bool spark = false, incomplete = false;
+  void end_prompt(bool complete) override { if (spark && !complete) incomplete = true; }
+  bool supports_verify_multi() const override { return !parked_pos.empty(); }
+  std::vector<std::vector<std::vector<float>>> verify_multi(const std::vector<VerifyGroup> &groups) override {
+    if (pending || groups.empty()) throw std::logic_error("replay verify_multi");
+    if (incomplete) throw std::logic_error("verify_multi during a prompt");
+    size_t total = 0;
+    std::vector<std::vector<std::vector<float>>> out;
+    for (auto &g : groups) {
+      if (g.slot < 0 || g.slot > int(parked_pos.size()) || g.tokens.empty()) throw std::logic_error("replay group");
+      const size_t at = g.slot ? parked_pos[size_t(g.slot - 1)] : position;
+      out.emplace_back();
+      for (size_t i = 0; i < g.tokens.size(); ++i) out.back().push_back(rows[(at + i) % rows.size()]);
+      total += g.tokens.size();
+    }
+    if (total > 6) throw std::logic_error("replay verify_multi rows");
+    if (delay) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    multi_groups = groups;
+    multi_done.assign(groups.size(), 0);
+    pending = total;
+    multi_pending = true;
+    ++calls; ++multi_calls;
+    return out;
+  }
+  // (s0ma change 91) the prompts' positions advance together; each gets the row of its last position
+  bool supports_prefill_multi() const override { return !parked_pos.empty(); }
+  std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup> &groups,
+                                           const std::function<void(size_t, bool)> &around) override {
+    if (pending || groups.size() < 2) throw std::logic_error("replay prefill_multi");
+    if (decline_multi) throw PrefillDeclined("replay test: declined");
+    std::vector<PrefillResult> out;
+    for (size_t g = 0; g < groups.size(); ++g) {
+      auto &at = groups[g].slot ? parked_pos.at(size_t(groups[g].slot - 1)) : position;
+      if ((groups[g].options.mode == PrefillMode::Cold) != (at == 0)) throw std::logic_error("replay prefill_multi mode");
+      PrefillResult r;
+      r.begin_position = int64_t(at);
+      r.consumed_rows = groups[g].ids.size();
+      at += groups[g].ids.size();
+      r.logits.push_back(rows[(at - 1) % rows.size()]);
+      if (around) { around(g, true); around(g, false); }
+      out.push_back(std::move(r));
+    }
+    if (delay) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    ++multi_prefills;
+    return out;
+  }
+  void commit_group(size_t g, size_t n) override {
+    if (g >= multi_groups.size() || multi_done[g] || n > multi_groups[g].tokens.size())
+      throw std::logic_error("replay commit_group");
+    multi_done[g] = 1;
+    const int k = multi_groups[g].slot;
+    (k ? parked_pos[size_t(k - 1)] : position) += n;
+    if (std::all_of(multi_done.begin(), multi_done.end(), [](uint8_t d) { return d != 0; })) { pending = 0; multi_pending = false; }
   }
   int vocab() const override { return int(rows[0].size()); }
   int eos() const override { return eos_; }
@@ -1392,6 +1982,7 @@ public:
     begin_request();
     position = 0;
     pending = 0;
+    incomplete = false;
   }
   std::vector<std::vector<float>> verify(const std::vector<int> &ids) override {
     if (pending || ids.empty())
@@ -1406,6 +1997,7 @@ public:
     return out;
   }
   void commit(size_t n) override {
+    if (multi_pending) throw std::logic_error("replay commit during a multi step");
     if (!pending || n > pending)
       throw std::logic_error("invalid commit");
     position += n;
@@ -1414,7 +2006,11 @@ public:
   Json counters() const override {
     return {{"engine_mode", "REPLAY_TEST_ONLY"},
             {"committed", position},
-            {"verify_calls", calls}};
+            {"verify_calls", calls},
+            {"expert_vram_hits", calls},   // like Native's counters: since the last begin_request
+            {"multi_calls", multi_calls},
+            {"multi_prefills", multi_prefills},
+            {"slot_swaps", swaps}};
   }
 };
 } // namespace

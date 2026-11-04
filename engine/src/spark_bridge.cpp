@@ -72,6 +72,15 @@ class SparkTarget final : public Forward, public DraftProvider {
 #endif
   size_t bindings_ = 0;
   bool poisoned_ = false;
+  // s0ma change 91: each parked slot's drafter rings (then swap scratch) in device memory, and its committed length
+  struct ParkedRings {
+    void *p = nullptr;
+    int64_t committed = 0;
+    ~ParkedRings() { if (p) cudaFree(p); }
+  };
+  std::vector<std::unique_ptr<ParkedRings>> parked_;
+  std::vector<int> multi_slots_;   // s0ma change 91: the pending multi step's groups' slots
+  std::vector<uint8_t> multi_done_;
   bool prompt_active_ = false, cold_seed_pending_ = false;
   bool incomplete_prompt_ = false;
   int64_t prompt_rows_ = 0, captures_seen_ = 0, tail_rows_ = 0;
@@ -589,6 +598,191 @@ public:
   }
   std::map<std::string, std::vector<uint8_t>> live_state() override {
     return target_->live_state();
+  }
+  // s0ma change 91: the target's slot and the drafter's rings and committed length move together
+  int live_slots() const override { return target_->live_slots(); }
+  int64_t slot_context() const override { return target_->slot_context(); }
+  int64_t committed_position() const override { return target_->committed_position(); }
+  void swap_slot(int k) override {
+    check();
+    if (prompt_active_ || incomplete_prompt_) throw std::logic_error("swap_slot during a prompt");
+#ifdef DS41_SPARK_POLICY_V2
+    if (policy2_pending_) throw std::logic_error("swap_slot during a policy transaction");
+#endif
+    if (k < 1 || k >= target_->live_slots()) throw std::invalid_argument("swap_slot: no such slot");
+    if (parked_.size() < size_t(k)) parked_.resize(size_t(k));
+    auto &r = parked_[size_t(k - 1)];
+    if (!r) {
+      auto fresh = std::make_unique<ParkedRings>();
+      cuda_checked(cudaMalloc(&fresh->p, 2 * ds41_spark_state_bytes()));
+      cuda_checked(cudaMemsetAsync(fresh->p, 0, 2 * ds41_spark_state_bytes(),
+                                   static_cast<cudaStream_t>(weights_.cuda_stream)));
+      r = std::move(fresh);
+    }
+    target_->swap_slot(k);
+    try {
+      checked(ds41_spark_state_swap_device(spark_.get(), r->p, 2 * ds41_spark_state_bytes(), &r->committed));
+    } catch (...) { poisoned_ = true; throw; }
+    if (ds41_spark_committed(spark_.get()) != target_->committed_position()) {
+      poisoned_ = true;
+      throw std::logic_error("swap_slot: drafter and target committed lengths differ");
+    }
+    seed_mode_ = "live-slot";
+#ifdef DS41_SPARK_POLICY_V2
+    q0_ready_ = false;   // the cached first-draft q was the other conversation's
+#endif
+  }
+  // s0ma change 91: a multi-conversation step. No drafting in it; each group's accepted rows reach the drafter with
+  // that slot's rings and committed length swapped in
+  bool supports_verify_multi() const override { return target_->supports_verify_multi(); }
+  std::vector<std::vector<std::vector<float>>> verify_multi(const std::vector<VerifyGroup> &groups) override {
+    check();
+    if (incomplete_prompt_ || prompt_active_) throw std::logic_error("verify_multi during a prompt");
+#ifdef DS41_SPARK_POLICY_V2
+    if (policy2_pending_) throw std::logic_error("verify_multi during a policy transaction");
+#endif
+    for (auto &g : groups)
+      if (g.slot < 0 || g.slot >= target_->live_slots()) throw std::invalid_argument("verify_multi: slot");
+    auto rows = target_->verify_multi(groups);
+    multi_slots_.clear();
+    for (auto &g : groups) multi_slots_.push_back(g.slot);
+    multi_done_.assign(groups.size(), 0);
+    return rows;
+  }
+  ParkedRings &parked_rings(int k) {
+    if (parked_.size() < size_t(k)) parked_.resize(size_t(k));
+    auto &r = parked_[size_t(k - 1)];
+    if (!r) {
+      auto fresh = std::make_unique<ParkedRings>();
+      cuda_checked(cudaMalloc(&fresh->p, 2 * ds41_spark_state_bytes()));
+      cuda_checked(cudaMemsetAsync(fresh->p, 0, 2 * ds41_spark_state_bytes(),
+                                   static_cast<cudaStream_t>(weights_.cuda_stream)));
+      r = std::move(fresh);
+    }
+    return *r;
+  }
+  void spark_swap(int k) {   // the drafter's rings and committed length <-> slot k's
+    auto &r = parked_rings(k);
+    checked(ds41_spark_state_swap_device(spark_.get(), r.p, 2 * ds41_spark_state_bytes(), &r.committed));
+  }
+  void commit_group(size_t g, size_t accepted) override {
+    check();
+    if (g >= multi_slots_.size() || multi_done_.size() != multi_slots_.size() || multi_done_[g])
+      throw std::logic_error("commit_group: no such pending group");
+    multi_done_[g] = 1;
+    const int k = multi_slots_[g];
+    if (!k) { target_->commit_group(g, accepted); return; }
+    try {
+      spark_swap(k);
+      target_->commit_group(g, accepted);
+      spark_swap(k);
+    } catch (...) { poisoned_ = true; throw; }
+  }
+  // s0ma change 91: a combined prefill. Each conversation's prompt lifecycle (as begin_prompt, prefill and
+  // end_prompt run it for one prompt, the whole remaining prompt in one segment) with its own state and capture tail
+  // and its slot's drafter rings swapped in around its part
+  struct SlotPrompt {
+    bool prompt_active = false, cold_seed_pending = false, incomplete = false, append_pending = false;
+    int64_t prompt_rows = 0, captures_seen = 0, tail_rows = 0, tail_limit = 0, append_old = 0;
+    std::string seed_mode = "unseeded";
+    std::unique_ptr<void, decltype(&cudaFree)> tail{nullptr, cudaFree};
+  };
+  void swap_prompt(SlotPrompt &s) {
+    std::swap(prompt_active_, s.prompt_active); std::swap(cold_seed_pending_, s.cold_seed_pending);
+    std::swap(incomplete_prompt_, s.incomplete); std::swap(append_pending_, s.append_pending);
+    std::swap(prompt_rows_, s.prompt_rows); std::swap(captures_seen_, s.captures_seen);
+    std::swap(tail_rows_, s.tail_rows); std::swap(tail_limit_, s.tail_limit); std::swap(append_old_, s.append_old);
+    std::swap(seed_mode_, s.seed_mode); std::swap(prompt_tail_, s.tail);
+  }
+  bool supports_prefill_multi() const override { return target_->supports_prefill_multi() && append_restore_; }
+  std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup> &groups,
+                                           const std::function<void(size_t, bool)> &) override {
+    check();
+    if (!supports_prefill_multi()) throw std::logic_error("prefill_multi needs DS41_SPARK_APPEND_RESTORE=1");
+    if (prompt_active_ || incomplete_prompt_) throw std::logic_error("prefill_multi during a prompt");
+#ifdef DS41_SPARK_POLICY_V2
+    if (policy2_pending_) throw std::logic_error("prefill_multi during a policy transaction");
+    q0_ready_ = false;
+#endif
+    {   // what the target would refuse anyway, before any swap (nothing changed: the caller goes one by one)
+      std::vector<uint8_t> seen(size_t(std::max(1, target_->live_slots())), 0);
+      for (auto &g : groups)
+        if (g.slot < 0 || g.slot >= target_->live_slots() || seen[size_t(g.slot)]++)
+          throw PrefillDeclined("prefill_multi: slot");
+    }
+    std::vector<SlotPrompt> sp(groups.size());
+    for (auto &s : sp) {
+      void *t = nullptr;
+      cuda_checked(cudaMalloc(&t, size_t(128) * 30720));
+      s.tail.reset(t);
+    }
+    std::vector<uint8_t> restore(groups.size(), 0);
+    auto enter = [&](size_t g) { if (groups[g].slot) spark_swap(groups[g].slot); swap_prompt(sp[g]); };
+    // a failed swap back cannot leave the bridge usable: poisoned (never an exception out of a destructor)
+    auto leave = [&](size_t g) noexcept {
+      swap_prompt(sp[g]);
+      try { if (groups[g].slot) spark_swap(groups[g].slot); } catch (...) { poisoned_ = true; }
+    };
+    struct Leave { std::function<void()> f; ~Leave() { f(); } };
+    bool started = false;
+    try {
+      for (size_t g = 0; g < groups.size(); ++g) {
+        enter(g);
+        Leave out{[&] { leave(g); }};
+        const int64_t old = ds41_spark_committed(spark_.get()), n = int64_t(groups[g].ids.size());
+        const bool cold = groups[g].options.mode == PrefillMode::Cold;
+        if (cold != (old == 0)) throw PrefillDeclined("prefill_multi: drafter and prompt mode differ");
+        prompt_active_ = true; cold_seed_pending_ = cold; prompt_rows_ = old + n;
+        captures_seen_ = tail_rows_ = 0; append_pending_ = false; tail_limit_ = append_old_ = 0;
+        if (cold) {
+          captures_seen_ = std::max<int64_t>(0, n - 128);
+        } else if (n > 128) {
+          restore[g] = 1;
+          append_pending_ = true; append_old_ = old; tail_limit_ = old + n;
+          captures_seen_ = old + n - 128; tail_rows_ = 0;
+        }
+      }
+      started = true;
+      auto results = target_->prefill_multi(groups, [&](size_t g, bool on) { if (on) enter(g); else leave(g); });
+      auto stream = weights_.cuda_stream;
+      for (size_t g = 0; g < groups.size(); ++g) {
+        enter(g);
+        Leave out{[&] { leave(g); }};
+        const int64_t n = int64_t(groups[g].ids.size());
+        if (restore[g]) {
+          if (captures_seen_ != append_old_ + n || tail_rows_ != 128)
+            throw std::logic_error("missing append tail captures");
+          ds41_spark_append_tail_v1 d{};
+          d.abi_version = 1; d.struct_bytes = sizeof(d);
+          d.previous_committed = append_old_; d.committed_end = append_old_ + n;
+          d.capture_begin = append_old_ + n - 128; d.rows = 128; d.columns = 15360;
+          d.row_stride_bytes = 30720; d.captures_bf16 = prompt_tail_.get(); d.cuda_stream = stream;
+          checked(ds41_spark_restore_append_tail_m1(spark_.get(), &d));
+          append_pending_ = false; tail_limit_ = append_old_ = 0; captures_seen_ = tail_rows_ = 0;
+          ++append_restores_;
+          seed_mode_ = "cached-append-restore";
+        } else if (cold_seed_pending_) {
+          if (captures_seen_ != prompt_rows_ || tail_rows_ != std::min<int64_t>(128, prompt_rows_))
+            throw std::logic_error("missing cold prompt captures");
+          checked(ds41_spark_seed(spark_.get(), prompt_tail_.get(), prompt_rows_));
+          seed_mode_ = "full-M-cold";
+        } else {
+          seed_mode_ = "cached-M1-append";
+        }
+        if (ds41_spark_committed(spark_.get()) != prompt_rows_)
+          throw std::logic_error("Spark append length differs from target prompt");
+        prompt_active_ = cold_seed_pending_ = false;
+      }
+      cuda_checked(cudaStreamSynchronize(static_cast<cudaStream_t>(stream)));
+      return results;
+    } catch (const PrefillDeclined &) {
+      if (poisoned_) throw;
+      throw;   // nothing changed (every group's state was left in its own SlotPrompt, the rings swapped back)
+    } catch (...) {
+      if (!started && !poisoned_) throw;   // (refused before the target ran: nothing changed)
+      poisoned_ = true;
+      throw;
+    }
   }
   void commit(size_t count) override {
     check();

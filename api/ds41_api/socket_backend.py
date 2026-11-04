@@ -32,6 +32,7 @@ def _submit_line(
     sampling: SamplingParams,
     images: Optional[Sequence[VisionImage]],
     conversation_id: Optional[str],
+    priority: Optional[int] = None,
 ) -> str:
     payload: Dict[str, Any] = {
         "op": "submit",
@@ -41,6 +42,8 @@ def _submit_line(
         "images": [img.to_dict() for img in (images or [])] or None,
         "conversation_id": conversation_id,
     }
+    if priority is not None:   # s0ma change 91
+        payload["priority"] = int(priority)
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -65,10 +68,11 @@ class SocketBackend(Backend):
         images: Optional[Sequence[VisionImage]] = None,
         conversation_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        priority: Optional[int] = None,
     ) -> BackendStream:
         request_id = request_id or uuid.uuid4().hex
         reader, writer = await asyncio.open_unix_connection(self.socket_path)
-        line = _submit_line(request_id, token_ids, sampling, images, conversation_id)
+        line = _submit_line(request_id, token_ids, sampling, images, conversation_id, priority)
         writer.write(line.encode("utf-8") + b"\n")
         await writer.drain()
 

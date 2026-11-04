@@ -65,6 +65,7 @@ class FakeBackend(Backend):
         images: Optional[Sequence] = None,
         conversation_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        priority: Optional[int] = None,
     ) -> BackendStream:
         request_id = request_id or uuid.uuid4().hex
         script = list(self._next_script())[: max(0, sampling.max_tokens)]
@@ -75,6 +76,7 @@ class FakeBackend(Backend):
                 "sampling": sampling,
                 "images": list(images or []),
                 "conversation_id": conversation_id,
+                **({"priority": priority} if priority is not None else {}),
                 "script": script,
             }
         )

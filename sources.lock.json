@@ -35,8 +35,8 @@
         "src/speculation.cpp",
         "third_party/include/ds41/dense.h"
       ],
-      "files": 78,
-      "tree_sha256": "912b6bd70fb306fee9ab99ccc7902c6cb7afd528981d442287e5e35145dc8bb3"
+      "files": 79,
+      "tree_sha256": "639458fa68a4869c02ceef78e014a08a19c657ca02d4f544ef84b71c056c913c"
     },
     {
       "path": "components/moe",

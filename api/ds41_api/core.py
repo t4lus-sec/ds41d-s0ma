@@ -67,6 +67,7 @@ async def build_submission(
         images=prepared or None,
         conversation_id=request.conversation_id,
         request_id=request_id or uuid.uuid4().hex,
+        priority=request.priority,
     )
     return stream, sampling, token_ids
 

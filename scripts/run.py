@@ -134,6 +134,10 @@ ENGINE_ENV = {
     # s0ma change 85: change 83's routes picked and planned on the GPU (exact, tokens 7/7 identical): the GPU's wait
     # for the host's routes 1.18 -> 0.67 ms a step, decode 78.3 -> 78.8 tok/s. =0 off, =check compares with the host
     'DS41_GPU_ROUTE': '1',
+    # s0ma change 91: 4 conversations live in VRAM (3 parked, each up to DS41_SLOT_CONTEXT = min(max_context, 262,144)
+    # tokens; ~235 MiB each), served at once by the engine's scheduler: one request of the best priority alone runs
+    # the single-stream step, several of the same priority share multi-conversation steps. =1: one at a time
+    'DS41_LIVE_SLOTS': '4',
 }
 # GPUDirect Storage: NVMe misses during decode are read straight into their VRAM slot (docs/gds.md).
 GDS_ENV = {'DS41_MOE_GDS': '1', 'CUFILE_USE_PCIP2PDMA': 'true'}
@@ -290,6 +294,18 @@ def command(cfg, socket):
     return cmd
 
 
+def parked_gib(cfg, env):
+    """s0ma change 91: the VRAM of the parked live slots (DS41_LIVE_SLOTS - 1 of them, each DS41_SLOT_CONTEXT tokens:
+    356 B a token at layer 20, 178 B at layers 2, 8, 14, 2.8 MB of SWA rings)."""
+    try:
+        slots = max(1, min(8, int(env.get('DS41_LIVE_SLOTS', '1'))))
+        cap = int(env.get('DS41_SLOT_CONTEXT') or min(cfg['max_context'], 262144))
+    except ValueError:
+        return 0.0
+    per = cap // 2 * 356 * 3 + cap * 356 + 40 * 134 * 528 + 4 * 2 * 8 * 512 * 4
+    return (slots - 1) * per / 2**30
+
+
 def environment(cfg, render=True):
     dist = Path(cfg['build']) / 'dist'
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DS41_', 'CUFILE_'))}
@@ -326,7 +342,11 @@ def environment(cfg, render=True):
         # A lab --env DS41_PROMPT_ADMIT_GIB=0 turns it off
         env.setdefault('DS41_PROMPT_ADMIT_GIB', '8')
         # change 25: a lab --env DS41_EXPERT_EXTRA_GIB=... (in ENGINE_ENV) wins
-        env.setdefault('DS41_EXPERT_EXTRA_GIB', SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
+        # s0ma change 91: the parked conversations' arenas come out of these slots, so prefill keeps the free VRAM it
+        # had (1 GiB less free pushed 8K prompts into two segments, change 25)
+        extra = float(SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
+        extra = max(0.0, extra - parked_gib(cfg, env))
+        env.setdefault('DS41_EXPERT_EXTRA_GIB', f'{extra:.2f}')
     # s0ma change 79: the conversations kept in RAM (change 73) sized to the window: a saved conversation holds ~0.9 KB a
     # token (the four global layers' compressed KV and indexer keys up to its frontier, 890 B, and its ids) and 3 MB
     # of rings, so s0ma's main turn and its workers at twice max_context in all need 2 KiB a token of it, plus 1 GiB.
@@ -387,10 +407,19 @@ def conversations_tag(cfg, env):
     return hashlib.sha256('\n'.join(p for p in parts if p).encode()).hexdigest()
 
 
+def live_slots(cfg):
+    try:
+        return max(1, min(8, int(environment(cfg, render=False).get('DS41_LIVE_SLOTS', '1'))))
+    except (ValueError, OSError):
+        return 1
+
+
 def api_command(cfg, socket):
     return [str(ROOT / '.venv/bin/python'), '-m', 'ds41_api.server', '--backend', 'socket', '--socket', str(socket),
             '--tokenizer', str(Path(cfg['weights']) / 'tokenizer.json'), '--model', cfg['model_id'],
-            '--host', '127.0.0.1', '--port', str(cfg['port']), '--max-concurrent', '1',
+            '--host', '127.0.0.1', '--port', str(cfg['port']),
+            # s0ma change 91: as many requests reach the engine as it keeps live slots (it queues the rest itself)
+            '--max-concurrent', str(live_slots(cfg)),
             '--max-queue', str(cfg['max_queue']), '--max-tokens-limit', str(cfg['max_tokens_limit'])]
 
 

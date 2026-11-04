@@ -10,6 +10,8 @@
 #include "ds41/hotpath/kernels.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <algorithm>
+#include <cstdint>
 namespace ds41e::hotpath {
 namespace {
 using B = __nv_bfloat16;
@@ -216,6 +218,22 @@ void lengths_aux(const int *v,int *out,int rows,int divisor,int fixed,cudaStream
 }
 void route_plan(const float *biased,int rows,int *ids,int *source,int *slots,int *host,cudaStream_t s) {
   route_plan_rows<<<1,192,0,s>>>(biased,rows,ids,source,slots,host);
+}
+namespace {
+// s0ma change 91: 16-byte words when both ranges allow it, else bytes
+__global__ void swap16(uint4 *a,uint4 *b,size_t n) {
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x){uint4 t=a[i];a[i]=b[i];b[i]=t;}
+}
+__global__ void swap1(uint8_t *a,uint8_t *b,size_t n) {
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x){uint8_t t=a[i];a[i]=b[i];b[i]=t;}
+}
+}
+void swap_bytes(void *a,void *b,size_t bytes,cudaStream_t s) {
+  if(!bytes||a==b) return;
+  const bool wide=(reinterpret_cast<uintptr_t>(a)|reinterpret_cast<uintptr_t>(b))%16==0;
+  const size_t words=wide?bytes/16:0,rest=bytes-words*16;
+  if(words) swap16<<<unsigned(std::min<size_t>((words+255)/256,4096)),256,0,s>>>((uint4*)a,(uint4*)b,words);
+  if(rest) swap1<<<unsigned(std::min<size_t>((rest+255)/256,4096)),256,0,s>>>((uint8_t*)a+words*16,(uint8_t*)b+words*16,rest);
 }
 } // namespace ds41e::hotpath
 extern "C" int ds41_hotpath_rms(const void *x,const void *w,void *out,int rows,

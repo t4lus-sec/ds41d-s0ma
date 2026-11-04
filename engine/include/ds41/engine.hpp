@@ -100,6 +100,8 @@ struct PrefillOptions {
   // are ignored, so the whole list can be passed with every segment.
   const std::vector<ImageSpan> *images = nullptr;
 };
+// s0ma change 91: a combined prefill refused before it changed any state (Forward::prefill_multi)
+struct PrefillDeclined : std::runtime_error { using std::runtime_error::runtime_error; };
 struct PrefillResult {
   int64_t begin_position = 0;
   size_t consumed_rows = 0;
@@ -159,6 +161,33 @@ public:
   virtual bool write_conversation(const Snapshot &, std::ostream &) const { return false; }
   virtual std::shared_ptr<Snapshot> read_conversation(std::istream &) const { return nullptr; }
   virtual std::vector<int> cached_prefix() const { return {}; }
+  // s0ma change 91: live conversation slots. Slot 0 is the conversation every other call works on; slots 1..n-1
+  // hold parked conversations in VRAM. swap_slot(k) exchanges slot 0 and slot k (exact: bytes are moved, never
+  // recomputed). A conversation longer than slot_context() tokens cannot be parked.
+  virtual int live_slots() const { return 1; }
+  virtual int64_t slot_context() const { return 0; }
+  virtual int64_t committed_position() const { return -1; }
+  virtual void swap_slot(int) { throw std::logic_error("swap_slot unsupported"); }
+  // s0ma change 91: one verify step over several conversations' rows. Each group is a live slot and the tokens that
+  // follow its committed position; at most 6 rows in all (the six-row verify arena), one group a slot. The result is
+  // each group's rows' logits. Every group is then committed with commit_group (its accepted prefix), in any order,
+  // before any other model call.
+  struct VerifyGroup { int slot = 0; std::vector<int> tokens; };
+  virtual bool supports_verify_multi() const { return false; }
+  virtual std::vector<std::vector<std::vector<float>>> verify_multi(const std::vector<VerifyGroup> &) {
+    throw std::logic_error("verify_multi unsupported");
+  }
+  virtual void commit_group(size_t, size_t) { throw std::logic_error("commit_group unsupported"); }
+  // s0ma change 91: one prefill for several conversations' prompts (each a live slot's whole remaining prompt, no
+  // images): per layer each conversation's attention and dense work, then one expert sweep over all their rows.
+  // The drafter's lifecycle (begin_prompt..end_prompt) runs inside, per conversation. Results in group order.
+  struct PrefillGroup { int slot = 0; std::vector<int> ids; PrefillOptions options; };
+  // thrown before any state changed (scratch that does not fit, for one): the caller prefills one by one
+  virtual bool supports_prefill_multi() const { return false; }
+  virtual std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup> &,
+                                                   const std::function<void(size_t, bool)> & = {}) {
+    throw std::logic_error("prefill_multi unsupported");
+  }
   // Diagnostic only: position-addressed, logically live bytes for X3/X3b.
   virtual std::map<std::string,std::vector<uint8_t>> live_state() {
     throw std::logic_error("live state inspection unsupported");

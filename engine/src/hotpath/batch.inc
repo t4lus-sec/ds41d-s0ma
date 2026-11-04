@@ -89,7 +89,27 @@ void brope(Device &data, int heads, int dim, int l, int64_t pos, int m,
   CK(ds41_dense_rope(data.p, batch_frequencies.as<float>((l>=2?6:0)*64*4),
       m, heads, dim, 64, inverse, stream));
 }
+// s0ma change 91: the attention core (RoPE, KV ring and global stores, indexer, gather, sparse attention) and the
+// output projection apart, so a multi-conversation step runs the core per conversation and the projection once
 void battention(int l, int64_t pos, int m) {
+  battention_core(l,pos,m);
+  battention_output(l,m);
+}
+void battention_output(int l,int m) {
+  std::string p = "layers." + std::to_string(l) + ".attn";
+  bgraph(p+".output",m,[&]{
+    if(dense_wo_a(p,o.p,wo.p,m)) {}   // s0ma change 34: Sero's wo_a slices when loaded
+    else if(config.compact_woa)
+      CK(ds41_dense_wo_a_compact(o.p,w(p+".wo_a.weight").data.p,w(p+".wo_a.scale").data.p,wo.p,m,1024,4096,8,stream));
+    else {
+      const void *woa=woa_weight(p+".wo_a");
+      for(int r=0;r<m;++r) CK(ds41_dense_cublas(blas,o.as<char>(r*32768*2),
+          woa,wo.as<char>(r*8192*2),1,1024,4096,0,8,stream));
+    }
+    blinear(p+".wo_b",wo.p,y.p,H,8192,m);
+  });
+}
+void battention_core(int l, int64_t pos, int m) {
   std::string p = "layers." + std::to_string(l) + ".attn";
   brope(q,64,512,l,pos,m);
   if(fused) CK(fused->rms_rope(kv.p,w(p+".kv_norm.weight").data.p,kv.p,
@@ -201,17 +221,18 @@ void battention(int l, int64_t pos, int m) {
   }
   brope(o,64,512,l,pos,m,true);
   CK(ds41_attn_roundtrip(o.p,m,32768,DS41_SWA_FP8,stream));
-  bgraph(p+".output",m,[&]{
-    if(dense_wo_a(p,o.p,wo.p,m)) {}   // s0ma change 34: Sero's wo_a slices when loaded
-    else if(config.compact_woa)
-      CK(ds41_dense_wo_a_compact(o.p,w(p+".wo_a.weight").data.p,w(p+".wo_a.scale").data.p,wo.p,m,1024,4096,8,stream));
-    else {
-      const void *woa=woa_weight(p+".wo_a");
-      for(int r=0;r<m;++r) CK(ds41_dense_cublas(blas,o.as<char>(r*32768*2),
-          woa,wo.as<char>(r*8192*2),1,1024,4096,0,8,stream));
-    }
-    blinear(p+".wo_b",wo.p,y.p,H,8192,m);
-  });
+}
+// s0ma change 91: a multi-conversation step's attention at layer l. Each group's core runs on its own rows of the
+// step's q, kv, x, qa and o (row views), with its slot's rings and global arenas and its own positions, lengths,
+// RoPE rows and layer-20 candidates swapped in; the output projection then runs once over every row.
+void battention_multi(int l) {
+  for(size_t g=0;g<multi.groups.size();++g) {
+    const int r0=multi.row0[g], m=int(multi.groups[g].tokens.size());
+    RowView vq(q,size_t(r0)*64*512*2), vkv(kv,size_t(r0)*512*2), vx(x,size_t(r0)*H*2),
+        vqa(qa,size_t(r0)*1280*2), vo(o,size_t(r0)*64*512*2);
+    multi_set(g,[&]{ with_slot(multi.groups[g].slot,[&]{ battention_core(l,multi.pos[g],m); }); });
+  }
+  battention_output(l,multi.rows);
 }
 // Route scores land in a per-lane slice of the pinned step buffer: lane A at 0, lane B below the
 // 4 MiB upload staging (lane A's logits copy may run while lane B still routes).
@@ -577,7 +598,7 @@ void batch_front(int l,BatchLane &lane) {
     int n=l<2?0:int((pos+m)/ratio);
     int scan=n>=512?std::min(config.max_context/ratio,(n+255)/256*256):n;
     auto key=p+".attention."+std::to_string(scan)+"."+std::to_string(pos%8);
-    if(l==20) candidate_count=std::min(2048,(scan+7)/8)*8;
+    if(l==20 && !multi.active) candidate_count=std::min(2048,(scan+7)/8)*8;
     auto attention_body=[&]{
     bgraph(p+".query",m,[&]{
       size_t base=size_t(l)*hotpath::GateLayout::LayerBytes;
@@ -605,11 +626,11 @@ void batch_front(int l,BatchLane &lane) {
       bgate(base+hotpath::GateLayout::AttnComb,comb.p,64,m);
     });
     btrace(pos,m,l,"attn_input",x,H);
-    battention(l,pos,m);
+    if(multi.active) battention_multi(l); else battention(l,pos,m);   // s0ma change 91
     btrace(pos,m,l,"attn_output",y,H);
     CK(ds41_dense_hc_post(y.p,h.p,post.as<float>(),comb.as<float>(),next_h.p,m,H,stream));
     };
-    if(pos>=1024) {
+    if(pos>=1024 && !multi.active) {   // (s0ma change 91: a multi step's attention runs eagerly)
       trim_attention_graphs(l,m,scan);
       bgraph(key,m,attention_body);
     }
@@ -747,6 +768,47 @@ std::vector<std::vector<float>> batch(const std::vector<int> &tokens,int64_t pos
   batch_head(lane,0);
   CK(cudaStreamSynchronize(stream));
   return batch_finish(pos,lane.m,marks);
+}
+// s0ma change 91: the multi-conversation step's prologue: every row's token and embedding, each group's positions,
+// lengths and RoPE rows (in its own set), and each row's Engram n-grams from its own conversation's history
+void batch_begin_multi(BatchLane &lane) {
+  std::vector<int> tokens;
+  for(auto &g:multi.groups) tokens.insert(tokens.end(),g.tokens.begin(),g.tokens.end());
+  const int m=int(tokens.size());
+  lane.pos=multi.pos[0]; lane.m=m; lane.rowids={};
+  upload(batch_tokens,tokens.data(),size_t(m)*4);
+  for(size_t g=0;g<multi.groups.size();++g) {
+    const int mg=int(multi.groups[g].tokens.size());
+    const int64_t pos=multi.pos[g];
+    multi_set(g,[&]{
+      upload(position_device,&pos,8);
+      CK(ds41_attn_lengths(position_device.as<int64_t>(),lengths1.as<int32_t>(),
+          lengths2.as<int32_t>(),mg,config.max_context,stream));
+      hotpath::stage_frequencies(rope.as<float>(),batch_frequencies.as<float>(),
+          compressed_frequencies.as<float>(),position_device.as<int64_t>(),mg,config.max_context,stream);
+    });
+    with_slot(multi.groups[g].slot,[&]{
+      for(int r=0;r<mg;++r) {
+        auto ids=hash.rows(multi.groups[g].tokens[size_t(r)],pos+r);
+        for(int e=0;e<2;++e) lane.rowids[e].insert(lane.rowids[e].end(),ids[e].begin(),ids[e].end());
+      }
+    });
+  }
+  if(async_engram) {
+    engram_tickets[0]=async_engram->submit(1,lane.rowids[0]);
+    engram_tickets[1]=async_engram->submit(14,lane.rowids[1]);
+  }
+  hotpath::embedding(w("embed.weight").data.p,batch_tokens.as<int>(),h.p,pre.as<float>(),m,stream);
+}
+std::vector<std::vector<float>> batch_multi() {
+  auto marks=step_marks(multi.pos[0]);
+  h1_spent.fill(0); h1_snap.clear();
+  BatchLane lane;
+  batch_begin_multi(lane);
+  for(int l=0;l<40;++l) { batch_front(l,lane); batch_back(l,lane); }
+  batch_head(lane,0);
+  CK(cudaStreamSynchronize(stream));
+  return batch_finish(multi.pos[0],lane.m,marks);
 }
 // Lane B runs on swapped-in spare scratch, its own stream and cuBLAS handle. Captured graphs and
 // enqueued work hold raw pointers, so swapping the owning members between enqueues is safe.

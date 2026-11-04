@@ -36,4 +36,6 @@ void lengths_aux(const int *visible,int *out,int rows,int divisor,int fixed,
 // partial_sort and plan_routes make them: ids [rows*6], source and slots [rows*6]; host (mapped, may be null) gets
 // ids at [0], sources at [36] and slots at [72].
 void route_plan(const float *biased,int rows,int *ids,int *source,int *slots,int *host,cudaStream_t);
+// s0ma change 91: exchange the bytes of two device ranges (a parked conversation and the live one; exact)
+void swap_bytes(void *a,void *b,size_t bytes,cudaStream_t);
 } // namespace ds41e::hotpath

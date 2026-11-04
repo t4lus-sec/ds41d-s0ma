@@ -709,6 +709,75 @@ class Native final : public Forward, public hotpath::GateEvidence {
   // over the process): the device is synchronized before cudaProfilerStart and again before cudaProfilerStop, so the
   // range holds that prefill's launches only. It takes the place of DS41_PROFILE_STEPS when both are set.
   long profile_prefill = -1, prefill_calls = 0;
+  // s0ma change 91: parked conversations (live slots 1..n-1): their own SWA rings and global arenas (capacity
+  // slot_context_ tokens), Engram n-gram history, committed ids and position. Slot 0 is the members themselves.
+  struct LiveSlot {
+    std::vector<Device> windows;
+    std::map<int, std::unique_ptr<Global>> globals;
+    std::vector<int64_t> hash;
+    ds41e::prefill::Prefix prefix;
+    int64_t committed = 0;
+  };
+  std::vector<std::unique_ptr<LiveSlot>> live_slots_;
+  // s0ma change 91: a multi-conversation verify step (see Forward::verify_multi)
+  struct Multi {
+    bool active = false, pending = false;
+    std::vector<VerifyGroup> groups;
+    std::vector<int> row0;
+    std::vector<int64_t> pos;
+    std::vector<uint8_t> committed;
+    int rows = 0;
+  } multi;
+  // each group past the first: its own positions, lengths, RoPE rows and layer-20 candidates
+  struct AttnSet {
+    Device position_device{8}, lengths1{6 * 4}, lengths2{6 * 4}, batch_frequencies{12 * 64 * 4},
+        compressed_frequencies{6 * 64 * 4}, candidate_ids{16384 * 4 * 6},
+        top{512 * 4 * 6};   // an indexer layer's picks, read by the layers after it
+    int candidate_count = 0;
+  };
+  std::vector<std::unique_ptr<AttnSet>> attn_sets;
+  int capture_row0 = 0;   // the committed group's first row in the step's capture slab
+  uint64_t multi_steps = 0, multi_rows = 0, multi_prefills = 0, multi_prefill_rows = 0;
+  // a Device seen from a row offset for the life of the view (the owner's pointer comes back on every exit)
+  struct RowView {
+    Device &d; void *saved; size_t bytes;
+    RowView(Device &dv, size_t off) : d(dv), saved(dv.p), bytes(dv.bytes) {
+      if (off > dv.bytes) throw std::logic_error("row view past its arena");
+      d.p = static_cast<char *>(d.p) + off; d.bytes -= off;
+    }
+    ~RowView() { d.p = saved; d.bytes = bytes; }
+  };
+  template <class F> void multi_set(size_t g, F f) {
+    if (!g) { f(); return; }
+    auto &A = *attn_sets.at(g - 1);
+    auto sw = [&] {
+      std::swap(position_device, A.position_device); std::swap(lengths1, A.lengths1); std::swap(lengths2, A.lengths2);
+      std::swap(batch_frequencies, A.batch_frequencies); std::swap(compressed_frequencies, A.compressed_frequencies);
+      std::swap(candidate_ids, A.candidate_ids); std::swap(candidate_count, A.candidate_count);
+      std::swap(top, A.top);
+    };
+    sw();
+    try { f(); } catch (...) { sw(); throw; }
+    sw();
+  }
+  // slot k's rings, global arenas, n-gram history, committed ids and position in the members for f (pointers only)
+  template <class F> void with_slot(int k, F f) {
+    if (!k) { f(); return; }
+    auto &S = *live_slots_.at(size_t(k - 1));
+    auto sw = [&] {
+      for (size_t i = 0; i < windows.size(); ++i) std::swap(windows[i], S.windows[i]);
+      for (auto &[l, g] : globals) std::swap(g, S.globals.at(l));
+      hash.swap_history(S.hash);
+      std::swap(prefix, S.prefix);
+      std::swap(committed, S.committed);
+    };
+    sw();
+    try { f(); } catch (...) { sw(); throw; }
+    sw();
+  }
+  int64_t slot_context_ = 0;
+  uint64_t slot_swaps = 0;
+  double slot_swap_ms = 0;
   // s0ma change 63: full residency's plan (mixed_store_classes), applied to the placement
   bool full_residency = false;
   std::vector<ds41::ExpertId> full_preload, full_seeds;
@@ -921,6 +990,28 @@ public:
     for (int l : {2, 8, 14, 20})
       globals.emplace(
           l, std::make_unique<Global>(config.max_context, l == 20 ? 1 : 2));
+    {   // s0ma change 91: DS41_LIVE_SLOTS=n (1..8) keeps n-1 more conversations in VRAM, each up to DS41_SLOT_CONTEXT
+      const char *n = std::getenv("DS41_LIVE_SLOTS"), *c = std::getenv("DS41_SLOT_CONTEXT");
+      const long slots = n && *n ? std::strtol(n, nullptr, 10) : 1;
+      if (slots < 1 || slots > 8) throw std::invalid_argument("DS41_LIVE_SLOTS must be 1..8");
+      const long long cap = c && *c ? std::strtoll(c, nullptr, 10) : std::min<long long>(config.max_context, 262144);
+      if (slots > 1 && (cap < 4096 || cap > config.max_context || cap % 8))
+        throw std::invalid_argument("DS41_SLOT_CONTEXT must be 4096..max_context, a multiple of 8");
+      slot_context_ = slots > 1 ? int64_t(cap) : 0;
+      for (long k = 1; k < slots; ++k) {
+        auto s = std::make_unique<LiveSlot>();
+        for (int l = 0; l < 40; ++l) { s->windows.emplace_back(RING * 528); CK(cudaMemset(s->windows.back().p, 0, s->windows.back().bytes)); }
+        for (int l : {2, 8, 14, 20}) s->globals.emplace(l, std::make_unique<Global>(int(cap), l == 20 ? 1 : 2));
+        live_slots_.push_back(std::move(s));
+      }
+      if (slots > 1) {
+        size_t bytes = 0;
+        for (auto &[l, g] : live_slots_[0]->globals) bytes += g->kv.bytes + g->key.bytes + g->raw_kv.bytes + g->raw_score.bytes;
+        bytes += 40 * RING * 528;
+        std::cerr << "live slots: " << slots << " (" << slots - 1 << " parked, " << cap << " tokens each, "
+                  << (bytes * size_t(slots - 1)) / 1048576 << " MiB)\n";
+      }
+    }
     scores.resize(size_t(std::max(16384, config.max_context + 8)) * 2 * 6);
     blocks.resize(size_t((config.max_context + 7) / 8) * 2 * 6);
     top_scratch.resize(
@@ -1204,7 +1295,7 @@ public:
             capture_committed,
             capture_begin,
             size_t(3 * H * 2),
-            capture_slab.p,
+            capture_slab.as<char>(size_t(capture_row0) * 3 * H * 2),   // s0ma change 91
             stream};
   }
   void set_capture_sink(ds41_target_capture_sink sink, void *user) override {
@@ -1312,6 +1403,9 @@ public:
     if (!s || s->windows.size() != windows.size() || s->position > committed ||
         int64_t(s->prefix_ids.size()) != s->position)
       throw std::invalid_argument("restore: incompatible snapshot");
+    // s0ma change 91: only onto the conversation it was taken from (slots move conversations around)
+    if (!std::equal(s->prefix_ids.begin(), s->prefix_ids.end(), prefix.ids().begin()))
+      throw std::invalid_argument("restore: a snapshot of another conversation");
     begin_request();
     for (size_t i = 0; i < windows.size(); ++i)
       CK(cudaMemcpyAsync(windows[i].p, s->windows[i].p, windows[i].bytes, cudaMemcpyDeviceToDevice, stream));
@@ -1486,6 +1580,128 @@ public:
     // completed compression groups prevent any future record from being read.
     CK(cudaStreamSynchronize(stream));
   }
+  // s0ma change 91: live slots (see Forward::swap_slot)
+  int live_slots() const override { return 1 + int(live_slots_.size()); }
+  int64_t slot_context() const override { return slot_context_; }
+  int64_t committed_position() const override { return committed; }
+  void swap_slot(int k) override {
+    if (poisoned) throw std::runtime_error("native forward/store poisoned; restart ds41d");
+    if (pending) throw std::logic_error("swap_slot during an active verify");
+    if (k < 1 || k > int(live_slots_.size())) throw std::invalid_argument("swap_slot: no such slot");
+    auto &S = *live_slots_[size_t(k - 1)];
+    if (committed > slot_context_ || S.committed > slot_context_)
+      throw std::logic_error("swap_slot: a conversation longer than DS41_SLOT_CONTEXT");
+    const double t0 = clock_ms();
+    try {
+      for (size_t i = 0; i < windows.size(); ++i)
+        hotpath::swap_bytes(windows[i].p, S.windows[i].p, windows[i].bytes, stream);
+      for (auto &[l, g] : globals) {
+        auto &p = *S.globals.at(l);
+        // entries past both frontiers are written before they are read: only the committed ones move
+        auto entries = [&](int64_t c) { return std::min<int64_t>(p.capacity, (c + g->ratio - 1) / g->ratio); };
+        const size_t n = size_t(std::max(entries(committed), entries(S.committed)));
+        hotpath::swap_bytes(g->raw_kv.p, p.raw_kv.p, g->raw_kv.bytes, stream);
+        hotpath::swap_bytes(g->raw_score.p, p.raw_score.p, g->raw_score.bytes, stream);
+        hotpath::swap_bytes(g->kv.p, p.kv.p, n * 288, stream);
+        hotpath::swap_bytes(g->key.p, p.key.p, n * 68, stream);
+      }
+      CK(cudaGetLastError());
+      std::vector<int64_t> h = hash.history();
+      hash.assign(S.hash);
+      S.hash = std::move(h);
+      std::swap(prefix, S.prefix);
+      std::swap(committed, S.committed);
+      gate_rows.clear();
+      for (auto &ticket : prefetch_tickets) experts->cancel(ticket);
+      prefetch_tickets.clear();
+      for (auto &routes : previous_routes) routes.clear();
+      pending_ids.clear();
+      capture_rows = capture_committed = 0; capture_begin = 0;
+      CK(cudaStreamSynchronize(stream));
+    } catch (...) { poisoned = true; throw; }
+    ++slot_swaps; slot_swap_ms += clock_ms() - t0;
+  }
+  // s0ma change 91: see Forward::verify_multi
+  bool supports_verify_multi() const override {
+    return config.batched_verify && !config.hotpath_gate && config.trace_dir.empty() && live_slots_.size() > 0;
+  }
+  std::vector<std::vector<std::vector<float>>> verify_multi(const std::vector<VerifyGroup> &groups) override {
+    if (poisoned) throw std::runtime_error("native forward/store poisoned; restart ds41d");
+    if (!supports_verify_multi()) throw std::logic_error("verify_multi needs --batched-verify, live slots, no gate or trace");
+    if (pending || multi.pending) throw std::logic_error("verify_multi during an active verify");
+    if (groups.empty() || groups.size() > 6) throw std::invalid_argument("verify_multi: 1..6 groups");
+    std::vector<uint8_t> seen(live_slots_.size() + 1, 0);
+    int rows = 0;
+    std::vector<int> row0;
+    std::vector<int64_t> pos;
+    for (auto &g : groups) {
+      if (g.slot < 0 || g.slot > int(live_slots_.size()) || seen[size_t(g.slot)]++)
+        throw std::invalid_argument("verify_multi: slot");
+      if (g.tokens.empty() || g.tokens.size() > 6) throw std::invalid_argument("verify_multi: group width");
+      for (int t : g.tokens) if (t < 0 || t >= V) throw std::invalid_argument("input id");
+      const int64_t c = g.slot ? live_slots_[size_t(g.slot - 1)]->committed : committed;
+      const int64_t cap = g.slot ? slot_context_ : config.max_context;
+      if (c + int64_t(g.tokens.size()) > cap) throw std::invalid_argument("verify_multi: a group past its slot's context");
+      row0.push_back(rows); pos.push_back(c);
+      rows += int(g.tokens.size());
+    }
+    if (rows > 6) throw std::invalid_argument("verify_multi: more than 6 rows");
+    if (lent_chunks && !lend_prompt && (lend_retry++ % 64) == 0) lend_reclaim();
+    if (!lend_prompt) overlap_drain(true);
+    while (attn_sets.size() + 1 < groups.size()) attn_sets.push_back(std::make_unique<AttnSet>());
+    multi.groups = groups; multi.row0 = row0; multi.pos = pos; multi.rows = rows;
+    multi.committed.assign(groups.size(), 0);
+    vlogits_rows = 0;
+    std::vector<std::vector<float>> out;
+    try {
+      check_moe_retirement(false);
+      multi.active = true;
+      out = batch_multi();
+      multi.active = false;
+      check_moe_retirement(true);
+    } catch (...) {
+      multi.active = false;
+      poisoned = true;
+      throw;
+    }
+    if (out.size() != size_t(rows)) { poisoned = true; throw std::logic_error("verify_multi: rows"); }
+    pending = rows;
+    multi.pending = true;
+    ++multi_steps; multi_rows += size_t(rows);
+    std::vector<std::vector<std::vector<float>>> result(groups.size());
+    for (size_t g = 0; g < groups.size(); ++g)
+      for (size_t r = 0; r < groups[g].tokens.size(); ++r) result[g].push_back(std::move(out[size_t(row0[g]) + r]));
+    return result;
+  }
+  void commit_group(size_t g, size_t accepted) override {
+    if (poisoned) throw std::runtime_error("native forward/store poisoned; restart ds41d");
+    if (!multi.pending || g >= multi.groups.size() || multi.committed[g])
+      throw std::logic_error("commit_group: no such pending group");
+    auto &G = multi.groups[g];
+    if (accepted > G.tokens.size()) throw std::invalid_argument("accepted input prefix");
+    multi.committed[g] = 1;
+    try {
+      with_slot(G.slot, [&] {
+        const int64_t begin = committed;
+        prefix.commit(G.tokens, accepted);
+        committed += int64_t(accepted);
+        if (accepted && capture_sink) {
+          capture_begin = begin; capture_rows = int(G.tokens.size()); capture_committed = int(accepted);
+          capture_row0 = multi.row0[g];
+          struct Back { int &r; ~Back() { r = 0; } } back{capture_row0};
+          auto view = captures();
+          if (int rc = capture_sink(capture_user, &view))
+            throw std::runtime_error("DSpark capture sink failed: " + std::to_string(rc));
+        }
+      });
+    } catch (...) { poisoned = true; throw; }
+    capture_rows = capture_committed = 0;
+    if (std::all_of(multi.committed.begin(), multi.committed.end(), [](uint8_t c) { return c != 0; })) {
+      pending = 0;
+      multi.pending = false;
+      pending_ids.clear();
+    }
+  }
   std::vector<std::vector<float>>
   verify(const std::vector<int> &input) override {
     if (poisoned)
@@ -1549,6 +1765,7 @@ public:
   void commit(size_t accepted) override {
     if (poisoned)
       throw std::runtime_error("native forward/store poisoned; restart ds41d");
+    if (multi.pending) throw std::logic_error("commit during a multi-conversation step (commit_group)");
     if (!pending || accepted > size_t(pending))
       throw std::invalid_argument("accepted input prefix");
     prefix.commit(pending_ids,accepted);pending_ids.clear();
@@ -1586,6 +1803,13 @@ public:
               {"committed", committed},
               {"cache_epoch", prefix.epoch()},
               {"cache_committed_tokens", prefix.size()},
+              {"live_slots", 1 + live_slots_.size()},   // s0ma change 91
+              {"slot_swaps", slot_swaps},
+              {"slot_swap_ms", slot_swap_ms},
+              {"multi_steps", multi_steps},   // s0ma change 91
+              {"multi_rows", multi_rows},
+              {"multi_prefills", multi_prefills},   // s0ma change 91
+              {"multi_prefill_rows", multi_prefill_rows},
               {"expert_vram_hits", s.hits - initial_stats.hits},
               {"expert_host_hits", s.host_hits - initial_stats.host_hits},
               {"expert_nvme_misses", s.nvme_misses - initial_stats.nvme_misses},

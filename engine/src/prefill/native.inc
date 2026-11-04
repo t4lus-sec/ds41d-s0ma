@@ -94,6 +94,13 @@ struct PrefillData {
         +(n+128)*528+size_t(end-candidate_begin)*candidate_width*4
         +std::min<size_t>(128,n)*3*H*2+(256<<20);
   }
+  // s0ma change 91: a combined prefill's sweep arena (every group's query rows of a layer): only what pmoe reads/writes
+  struct SweepOnly {};
+  PrefillData(SweepOnly,size_t n):rows(n),begin(0),end(int64_t(n)),cold(true),candidate_width(8),candidate_begin(0) {
+    warm=false;
+    ffn_input.resize(n*H*2);ids.resize(n*6*4);weights.resize(n*6*4);routed.resize(n*6*H*2);
+    quant.resize(n*H);scales.resize(n*H/32);
+  }
   PrefillData(size_t n,int64_t b,bool c,size_t tail,size_t budget):rows(n),begin(b),end(b+n),cold(c),
       candidate_width(std::min<int64_t>(2048,(end+7)/8)*8),
       candidate_begin(ds41e::prefill::plan(b,n,tail)[20].query.begin) {
@@ -504,9 +511,17 @@ template<class F> void pstream(std::vector<ds41::ExpertId> ids,F consume,const P
   else run_residents();
   join();
 }
+// s0ma change 91: a combined prefill's groups (their tickets, when the sweep arena is pref)
+std::vector<PrefillData*> multi_pfs;
 void p_engram_barrier() {
   if(!async_engram)return;
   double start=clock_ms();
+  if(!multi_pfs.empty()&&pref&&!pref->engram[0]&&!pref->engram[1]) {   // the sweep arena: every group's tickets
+    for(auto *pf:multi_pfs)for(int j=0;j<2;++j)if(!pf->engram_raw[j]&&pf->engram[j])
+      pf->engram_raw[j]=static_cast<const char*>(pf->engram[j]->wait(pf->rows*24));
+    pref->engram_barrier_ms+=clock_ms()-start;
+    return;
+  }
   for(int j=0;j<2;++j)if(!pref->engram_raw[j])
     pref->engram_raw[j]=static_cast<const char*>(pref->engram[j]->wait(pref->rows*24));
   pref->engram_barrier_ms+=clock_ms()-start;
@@ -1295,6 +1310,229 @@ void lend_reclaim() {
              <<x.settle_ms<<", sync "<<x.sync_ms<<", moves "<<x.move_ms<<", cudaFree "<<x.free_ms<<" ms in all), reclaim "
              <<lend_reclaim_ms<<" ms in all (cudaMalloc "<<x.malloc_ms<<")\n";
   }
+}
+// s0ma change 91: one prefill for several conversations' prompts (see Forward::prefill_multi). Each group is a live
+// slot's whole remaining prompt. Per layer: each group's project phase (attention, dense, router) with its slot's
+// state and its own PrefillData in place, as prefill() runs it; then every group's query rows of the layer copied into
+// one sweep arena and one expert sweep (pmoe) over all of them, the routed rows copied back; then each group's shared
+// experts and SWA tail. Then each group's logits, commit and drafter captures (around_captures(g, true/false) lets
+// the caller put that conversation's drafter state in place). No images; the chunked path (--prefill-chunk) only.
+bool supports_prefill_multi() const override {
+  return config.prefill && config.prefill_chunk_rows && !live_slots_.empty() && !poisoned;
+}
+std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup>& groups,
+                                         const std::function<void(size_t,bool)>& around_captures) override {
+  if(!supports_prefill_multi())throw std::logic_error("prefill_multi needs --prefill, --prefill-chunk and live slots");
+  if(pending||multi.pending)throw std::logic_error("prefill_multi during an active verify");
+  if(groups.size()<2||groups.size()>live_slots_.size()+1)throw PrefillDeclined("prefill_multi: 2..slots groups");
+  std::vector<uint8_t> seen(live_slots_.size()+1,0);
+  size_t total=0;
+  for(auto &g:groups) {
+    if(g.slot<0||g.slot>int(live_slots_.size())||seen[size_t(g.slot)]++)throw PrefillDeclined("prefill_multi: slot");
+    const auto &o=g.options;
+    if(g.ids.empty()||(o.images&&!o.images->empty())||o.logits_tail!=1||o.chunk_rows<1||o.chunk_rows>4096||
+       o.dense_batch_rows<1||o.dense_batch_rows>8)throw PrefillDeclined("prefill_multi: group options");
+    for(int id:g.ids)if(id<0||id>=V)throw PrefillDeclined("prefill token id");
+    const int64_t c=g.slot?live_slots_[size_t(g.slot-1)]->committed:committed;
+    const int64_t cap=g.slot?slot_context_:config.max_context;
+    if((o.mode==PrefillMode::Cold)!=(c==0)||(o.mode!=PrefillMode::Cold&&o.mode!=PrefillMode::Append)||
+       c+int64_t(g.ids.size())>cap)throw PrefillDeclined("prefill_multi: group mode/context");
+    total+=g.ids.size();
+  }
+  const double begin_ms=clock_ms();
+  const void* initial_h=h.p;
+  prefill_warm_counts.clear();
+  // as begin_prompt does for one prompt: the overlap counts opened, the VRAM lent (here for all their rows) ...
+  tier_census();
+  if(overlap_on&&experts) {
+    overlap_report();
+    if(prompt_bits.empty())experts->log_nvme_misses(true);
+    prompt_bits.assign(15360,0);steps_after_prompt=0;
+    if(admit_budget||vram_admit_budget)prompt_tail_count.assign(15360,0);
+    admit_used=0;vram_admit_used=0;
+  }
+  if(lend_chunks_total&&!lend_prompt){lend_prompt=true;++lend_prompts;lend_retry=0;prefill_lend(prefill_lend_need(total));}
+  struct Lend{bool &on;~Lend(){on=false;}} lend_off{lend_prompt};
+  // ... and then the residency the prompts must leave as they found it
+  std::vector<uint8_t> residency_before;
+  try{residency_before=p_residency(*experts);}catch(...){poisoned=true;throw;}
+  prefetch.reset();
+  struct Ctx {
+    int slot; const PrefillGroup *g; std::unique_ptr<PrefillData> pf; std::vector<ds41e::prefill::Layer> plan;
+    PrefillResult result; size_t q0=0, qn=0;
+  };
+  std::vector<Ctx> ctx(groups.size());
+  int64_t end_max=0;int width_max=8;
+  std::unique_ptr<PrefillData> sweep;
+  try {   // scratch first: a failure here changes nothing (PrefillDeclined: the caller prefills one by one)
+  for(size_t i=0;i<groups.size();++i) {
+    auto &C=ctx[i];C.slot=groups[i].slot;C.g=&groups[i];
+    const auto &o=groups[i].options;const size_t n=groups[i].ids.size();
+    with_slot(C.slot,[&]{
+      C.plan=ds41e::prefill::plan(committed,int64_t(n),int64_t(o.logits_tail));
+      C.pf=std::make_unique<PrefillData>(n,committed,o.mode==PrefillMode::Cold,o.logits_tail,config.prefill_budget_bytes);
+      C.result.begin_position=committed;C.result.consumed_rows=n;
+    });
+    C.pf->dense_batch=int(o.dense_batch_rows);C.pf->warm=o.warm;C.pf->image.assign(n,0);
+    end_max=std::max(end_max,C.pf->end);width_max=std::max(width_max,C.pf->candidate_width);
+  }
+  sweep=std::make_unique<PrefillData>(PrefillData::SweepOnly{},total);
+  sweep->route_host=prefill_pinned(prefill_route_buf,total*6*4);
+  prefill_chunk.reset();
+  {
+    const int R=int(config.prefill_chunk_rows);const size_t fp8=prefill_fp8_elements();
+    auto sizes=PrefillChunk::sizes(R,end_max,width_max,fp8);
+    size_t need=0;for(auto b:sizes)need+=b;
+    size_t free_b=0,total_b=0;CK(cudaMemGetInfo(&free_b,&total_b));
+    if(need+(size_t(256)<<20)>free_b)throw std::runtime_error("the chunk scratch does not fit");
+    prefill_chunk=std::make_unique<PrefillChunk>(R,end_max,width_max,fp8);
+  }
+  }catch(const std::exception &e){(void)cudaGetLastError();prefill_chunk.reset();throw PrefillDeclined(e.what());}
+  auto in=[&](Ctx &C,auto f){std::swap(pref,C.pf);struct Back{std::unique_ptr<PrefillData>&a,&b;~Back(){std::swap(a,b);}}
+      back{pref,C.pf};with_slot(C.slot,f);};
+  multi_pfs.clear();for(auto &C:ctx)multi_pfs.push_back(C.pf.get());
+  struct Pfs{std::vector<PrefillData*>&v;~Pfs(){v.clear();}} pfs_off{multi_pfs};
+  try {
+    in_step=true;graph_ready=false;
+    for(auto &C:ctx) in(C,[&]{
+      auto &pf=*pref;const auto &input=C.g->ids;
+      for(size_t r=0;r<input.size();++r) {
+        auto ids=hash.rows(input[r],committed+r,true);
+        for(int j=0;j<2;++j)pf.rowids[j].insert(pf.rowids[j].end(),ids[j].begin(),ids[j].end());
+      }
+      if(async_engram)for(int j=0;j<2;++j)pf.engram[j]=async_engram->submit(j==0?1:14,pf.rowids[j]);
+      for(size_t r=0;r<input.size();++r) {
+        expand_embedding(w("embed.weight").data.as<Bf16>(size_t(input[r])*H*2),h.p,pre.as<float>(),H,stream);
+        pcopy(pf.hidden.as<char>(r*HC*H*2),h.p,HC*H*2);
+        pcopy(pf.previous_pre.as<char>(r*4*4),pre.p,4*4);
+      }
+      CK(cudaStreamSynchronize(stream));
+    });
+    for(int l=0;l<40;++l) {
+      float project_ms=0;
+      for(auto &C:ctx) in(C,[&]{
+        auto &pf=*pref;const auto &work=C.plan[size_t(l)];const auto &options=C.g->options;
+        pf.query=work.query;
+        upload_cursor=1<<20;
+        CK(cudaMemsetAsync(pf.window.p,0,pf.window.bytes,stream));
+        if(!pf.cold) {
+          int64_t old=std::max<int64_t>(0,pf.begin-128);
+          upload(position_device,&old,8);
+          for(int64_t pos=old;pos<pf.begin;++pos)
+            pcopy(pf.window.as<char>(size_t(pos%int64_t(pf.rows+128))*528),windows[l].as<char>(size_t(pos%RING)*528),528);
+        }
+        Phase project;CK(cudaEventRecord(project.start,stream));
+        auto projection=work.global.size()?work.global:work.window;
+        for(int64_t first=projection.begin;first<projection.end;first+=int64_t(options.chunk_rows)) {
+          int64_t end=std::min(projection.end,first+int64_t(options.chunk_rows));
+          upload_cursor=1<<20;
+          const char* raw=nullptr;
+          if((l==1||l==14)&&async_engram) {
+            int j=l==1?0:1;
+            if(!pf.engram_raw[j])pf.engram_raw[j]=static_cast<const char*>(pf.engram[j]->wait(pf.rows*24));
+            raw=pf.engram_raw[j]+size_t(first-pf.begin)*24*264;
+          }
+          const int64_t R=prefill_chunk->R;
+          for(int64_t pos=first;pos<end;pos+=R)
+            cproject(work,pos,int(std::min<int64_t>(R,end-pos)),raw?raw+size_t(pos-first)*24*264:nullptr);
+          CK(cudaStreamSynchronize(stream)); // metadata and Engram ticket lifetime
+        }
+        CK(cudaEventRecord(project.end,stream));CK(cudaStreamSynchronize(stream));
+        float ms;CK(cudaEventElapsedTime(&ms,project.start,project.end));project_ms+=ms;
+      });
+      // every group's query rows of this layer into the sweep arena
+      size_t Q=0;
+      for(auto &C:ctx) {
+        auto &pf=*C.pf;const auto &q=C.plan[size_t(l)].query;
+        C.q0=Q;C.qn=size_t(q.size());
+        const size_t at=size_t(q.begin-pf.begin);
+        if(C.qn) {
+          pcopy(sweep->ids.as<char>(Q*6*4),pf.ids.as<char>(at*6*4),C.qn*6*4);
+          pcopy(sweep->weights.as<char>(Q*6*4),pf.weights.as<char>(at*6*4),C.qn*6*4);
+          pcopy(sweep->ffn_input.as<char>(Q*H*2),pf.ffn_input.as<char>(at*H*2),C.qn*H*2);
+        }
+        Q+=C.qn;
+      }
+      Json timings;
+      if(Q) {
+        std::swap(pref,sweep);
+        struct Back{std::unique_ptr<PrefillData>&a,&b;~Back(){std::swap(a,b);}} back{pref,sweep};
+        timings=pmoe(l,ds41e::prefill::Span{0,int64_t(Q)});
+      }
+      for(auto &C:ctx) if(C.qn) {
+        auto &pf=*C.pf;const size_t at=size_t(C.plan[size_t(l)].query.begin-pf.begin);
+        pcopy(pf.routed.as<char>(at*6*H*2),sweep->routed.as<char>(C.q0*6*H*2),C.qn*6*H*2);
+      }
+      Phase epilogue;CK(cudaEventRecord(epilogue.start,stream));
+      for(auto &C:ctx) in(C,[&]{
+        auto &pf=*pref;const auto &work=C.plan[size_t(l)];
+        const int64_t R=prefill_chunk->R;
+        for(int64_t pos=work.query.begin;pos<work.query.end;pos+=R)
+          cshared(l,pos,int(std::min<int64_t>(R,work.query.end-pos)));
+        int64_t tail=std::max<int64_t>(0,pf.end-128);
+        for(int64_t pos=tail;pos<pf.end;++pos)
+          pcopy(windows[l].as<char>(size_t(pos%RING)*528),pf.window.as<char>(size_t(pos%int64_t(pf.rows+128))*528),528);
+      });
+      CK(cudaEventRecord(epilogue.end,stream));CK(cudaStreamSynchronize(stream));
+      float epilogue_ms;CK(cudaEventElapsedTime(&epilogue_ms,epilogue.start,epilogue.end));
+      if(timings.is_object()) {
+        timings["layer"]=l;timings["query_rows"]=Q;timings["project_route_stream_ms"]=project_ms;
+        timings["shared_reduce_hc_stream_ms"]=epilogue_ms;timings["groups"]=ctx.size();
+        for(auto &C:ctx)C.pf->layers.push_back(timings);
+        std::cerr<<"prefill multi layer="<<l<<" groups="<<ctx.size()<<" rows="<<Q<<" project_ms="<<project_ms
+                 <<" expert_ms="<<timings.value("expert_sweep_stream_ms",0.0)<<" epilogue_ms="<<epilogue_ms<<"\n";
+      }
+    }
+    for(auto &C:ctx) {
+      auto &pf=*C.pf;const auto &input=C.g->ids;
+      for(size_t r=input.size()-C.g->options.logits_tail;r<input.size();++r) {
+        pcopy(h.p,pf.hidden.as<char>(r*HC*H*2),HC*H*2);pcopy(pre.p,pf.previous_pre.as<char>(r*4*4),4*4);
+        CK(ds41_dense_hc_pre(h.p,pre.as<float>(),x.p,1,H,stream));norm("norm",x.p,x.p,H);
+        bf16_float(x.p,f32.as<float>(),H,stream);if(sero_head(x.p,logits.p,1,stream)){}else if(fused_head)fused_head_logits(f32.p,logits.p,1);else linear("head",f32.p,logits.p,V,H);
+        C.result.logits.emplace_back(V);
+        CK(cudaMemcpyAsync(C.result.logits.back().data(),logits.p,V*4,cudaMemcpyDeviceToHost,stream));
+        CK(cudaStreamSynchronize(stream));
+      }
+    }
+    if(!residency_before.empty()&&vram_admit_used) {
+    } else if(!residency_before.empty()&&admit_used) {
+      const auto after=p_residency(*experts);
+      for(size_t i=0;i<after.size()&&i<residency_before.size();++i)
+        if((after[i]&1)!=(residency_before[i]&1))throw std::runtime_error("prefill changed decode VRAM membership");
+    } else if(!residency_before.empty()&&p_residency(*experts)!=residency_before)
+      throw std::runtime_error("prefill changed decode tier membership; quiesce competing admissions");
+    for(size_t i=0;i<ctx.size();++i) {
+      auto &C=ctx[i];
+      in(C,[&]{
+        auto &pf=*pref;
+        prefix.commit(C.g->ids,C.g->ids.size());
+        committed=pf.end;
+        if(around_captures)around_captures(i,true);
+        struct Out{const std::function<void(size_t,bool)>&f;size_t i;bool on;
+          ~Out(){if(on&&f)try{f(i,false);}catch(...){}}} out{around_captures,i,true};
+        size_t capture_count=std::min<size_t>(128,pf.rows);
+        for(size_t first=0;first<capture_count;first+=6) {
+          capture_rows=int(std::min<size_t>(6,capture_count-first));capture_committed=capture_rows;
+          capture_begin=pf.end-capture_count+first;
+          pcopy(capture_slab.p,pf.capture.as<char>(first*3*H*2),capture_rows*3*H*2);
+          if(capture_sink){auto view=captures();int rc=capture_sink(capture_user,&view);if(rc)throw std::runtime_error("prefill capture sink failed");}
+          CK(cudaStreamSynchronize(stream));
+        }
+        capture_rows=capture_committed=0;
+      });
+      C.result.layers=C.pf->layers;
+    }
+    if(h.p!=initial_h)std::swap(h,next_h);
+    in_step=false;
+    prefill_chunk.reset();
+    const double elapsed=clock_ms()-begin_ms;total_ms+=elapsed;
+    std::vector<PrefillResult> out;
+    for(auto &C:ctx){C.result.elapsed_ms=elapsed;out.push_back(std::move(C.result));}
+    ++multi_prefills;multi_prefill_rows+=total;
+    std::cerr<<"prefill multi: "<<ctx.size()<<" prompts, "<<total<<" rows, "<<elapsed<<" ms\n";
+    prefill_warm_counts.clear();
+    return out;
+  }catch(...){cudaStreamSynchronize(stream);prefill_chunk.reset();poisoned=true;in_step=false;throw;}
 }
 PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& options) override {
   if(!config.prefill)throw std::logic_error("native prefill requires Config::prefill opt-in");

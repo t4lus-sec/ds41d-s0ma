@@ -174,6 +174,15 @@ extern "C" int ds41_spark_state_import(ds41_spark*s,const void*host,size_t bytes
  if(!s||!host||bytes!=ds41_spark_state_bytes()||committed<0)throw std::invalid_argument("state import arguments");
  for(int l=0;l<3;++l)CK(cudaMemcpyAsync(s->rings[l].p,(const char*)host+size_t(l)*128*512*2,128*512*2,cudaMemcpyHostToDevice,s->stream));
  CK(cudaStreamSynchronize(s->stream));s->committed=committed;s->drafted=false;s->poisoned=false;return 0;}SPARK_CATCH}
+extern "C" int ds41_spark_state_swap_device(ds41_spark*s,void*device,size_t bytes,int64_t*committed){SPARK_TRY{
+ if(!s||!device||!committed||bytes!=2*ds41_spark_state_bytes()||*committed<0)throw std::invalid_argument("state swap arguments");
+ if(s->poisoned)throw std::runtime_error("state poisoned; reset required");
+ char*park=(char*)device,*tmp=park+ds41_spark_state_bytes();const size_t n=size_t(128)*512*2;
+ for(int l=0;l<3;++l){char*p=park+size_t(l)*n,*t=tmp+size_t(l)*n;
+  CK(cudaMemcpyAsync(t,s->rings[l].p,n,cudaMemcpyDeviceToDevice,s->stream));
+  CK(cudaMemcpyAsync(s->rings[l].p,p,n,cudaMemcpyDeviceToDevice,s->stream));
+  CK(cudaMemcpyAsync(p,t,n,cudaMemcpyDeviceToDevice,s->stream));}
+ std::swap(s->committed,*committed);s->drafted=false;return 0;}SPARK_CATCH}
 extern "C" int ds41_spark_restore_append_tail_m1(ds41_spark*s,const ds41_spark_append_tail_v1*d){SPARK_TRY{if(!s)throw std::invalid_argument("append restore: null context");s->restore_append_tail_m1(d);return 0;}SPARK_CATCH}
 extern "C" int ds41_spark_debug_view(ds41_spark*s,const char*name,const void**out,size_t*bytes){SPARK_TRY{if(!s||!name||!out||!bytes)throw std::invalid_argument("debug view arguments");Buf*b=nullptr;std::string n=name;if(n=="main")b=&s->main;else if(n=="hidden")b=&s->h;else if(n=="pre")b=&s->pre;else if(n=="U")b=&s->U;else if(n.size()==5&&n.compare(0,4,"ring")==0&&n[4]>='0'&&n[4]<='2')b=&s->rings[n[4]-'0'];if(!b)throw std::invalid_argument("unknown debug view");*out=b->p;*bytes=b->n;return 0;}SPARK_CATCH}
 extern "C" int ds41_spark_reset(ds41_spark*s){SPARK_TRY{if(!s)throw std::invalid_argument("reset null");for(int i=0;i<3;++i)CK(cudaMemsetAsync(s->rings[i].p,0,s->rings[i].n,s->stream));s->committed=0;s->drafted=false;s->poisoned=false;return 0;}SPARK_CATCH}

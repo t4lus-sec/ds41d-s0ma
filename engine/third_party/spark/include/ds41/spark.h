@@ -98,6 +98,9 @@ int64_t ds41_spark_committed(const ds41_spark*);
 size_t ds41_spark_state_bytes(void);
 int ds41_spark_state_export(ds41_spark*, void *host, size_t bytes, int64_t *committed);
 int ds41_spark_state_import(ds41_spark*, const void *host, size_t bytes, int64_t committed);
+/* s0ma change 91: exchange the rings and committed length with a parked conversation's, in device memory:
+ * `device` holds 2 * ds41_spark_state_bytes() (the parked rings, then scratch); stream-ordered, no sync. */
+int ds41_spark_state_swap_device(ds41_spark*, void *device, size_t bytes, int64_t *committed);
 /* Fixture inspection only: names main,ring0,ring1,ring2,hidden,pre,U.
  * No copy/sync. main is the retained128-row cold projection or latest M1. */
 int ds41_spark_debug_view(ds41_spark*,const char*,const void**,size_t*);

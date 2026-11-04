@@ -217,6 +217,7 @@ class Backend(ABC):
         images: Optional[Sequence[Any]] = None,  # ds41_api.vision.VisionImage
         conversation_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        priority: Optional[int] = None,
     ) -> BackendStream: ...
 
     async def cancel(self, request_id: str) -> bool:

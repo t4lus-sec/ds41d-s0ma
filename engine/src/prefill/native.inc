@@ -628,7 +628,8 @@ size_t prefill_stage_bytes() const {   // its VRAM slots (and as much pinned RAM
 // s0ma change 87: the staging ring (VRAM slots, a pinned staging buffer, the mapped table) was built at the first
 // prompt's first sweep, inside layer 0's timeline: ~0.6 s before that layer's first copy (2026-11-03: first_copy_ms
 // 577.7 at layer 0, under 1.3 at every other layer; the pinned huge-page buffer faults and compacts under memory
-// pressure). Now built at the end of load when it fits (DS41_PREFILL_STAGER_AT_LOAD=0 keeps it lazy); the same ring
+// pressure). Now built at the end of load when free VRAM covers it plus 256 MiB (DS41_PREFILL_STAGER_AT_LOAD=0 keeps it
+// lazy); the same ring
 // and the same VRAM, which the first prompt took from the same margin. The log line says where and how long.
 void build_prefill_stage(const char *when) {
   const double t=clock_ms();
@@ -641,7 +642,7 @@ void prefill_stage_at_load() {
   if(!on||!exl3||prefill_records.empty()||prefill_stage)return;   // (EXL3 banks; MXFP4 keeps the lazy build)
   try{   // anything that fails here (a bad DS41_PREFILL_STAGE_SLOTS too) is left for the first prompt, as before
     size_t free=0,total=0;CK(cudaMemGetInfo(&free,&total));
-    const size_t need=prefill_stage_bytes(),margin=size_t(512)<<20;
+    const size_t need=prefill_stage_bytes(),margin=size_t(256)<<20;   // (change 88: 512 -> 256, decode's own floor)
     if(free<need+margin){
       std::cerr<<"prefill stager: left for the first prompt ("<<free/1048576<<" MiB free at load, "<<(need+margin)/1048576
                <<" MiB wanted)\n";

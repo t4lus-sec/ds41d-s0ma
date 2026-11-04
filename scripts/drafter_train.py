@@ -1004,6 +1004,85 @@ def write_patch(a, model, state, stock, result, anchors):
     (out / 'manifest.json').write_text(json.dumps(manifest, indent=1) + '\n')
 
 
+def wsp_scan(model, docs, a, device, limit, us, ms):
+    """s0ma change 104 (weight-space edits, forward passes only): the drafter's held-out acceptance with its logits
+    recalibrated by two scalars, each one weight tensor scaled: mtp.2.norm.weight x u (the hidden fed to the shared
+    head, so U x u: a temperature on the main draft logits) and mtp.2.markov_head.head.weight x m (the Markov head's
+    bias). One forward pass a batch; every (u, m) pair is scored from the same hidden states."""
+    torch = model.torch
+    items = docs.anchors(a.other_weight, stride=a.eval_stride)
+    random.Random(7).shuffle(items)
+    items = items[:limit]
+    grid = [(u, m) for u in us for m in ms]
+    sums = torch.zeros(len(grid), BLOCK, dtype=torch.float64, device=device)
+    expected = torch.zeros(len(grid), dtype=torch.float64, device=device)
+    counts = torch.zeros(BLOCK, dtype=torch.float64, device=device)
+    with torch.no_grad():
+        for s0 in range(0, len(items), a.batch):
+            b = docs.batch(items[s0:s0 + a.batch], device)
+            U, _ = model.forward(b['anchor'], b['ring'], b['mask'], b['pos'])
+            M = model.markov(b['prev'])
+            p = torch.exp(b['tlp'])
+            valid = b['valid'].to(torch.float64)
+            counts += valid.sum(0)
+            for g, (u, m) in enumerate(grid):
+                lq = torch.gather(torch.log_softmax(U * u + M * m, -1), -1, b['tid'])
+                alpha = torch.minimum(p, torch.exp(lq)).sum(-1).to(torch.float64) * valid
+                sums[g] += alpha.sum(0)
+                expected[g] += torch.cumprod(alpha, 1).sum()
+    n = max(1, len(items))
+    out = []
+    for g, (u, m) in enumerate(grid):
+        acc = (sums[g] / counts.clamp(min=1)).tolist()
+        out.append({'u': u, 'm': m, 'anchors': len(items), 'acceptance': [round(x, 4) for x in acc],
+                    'expected_accepted': round(float(expected[g]) / n, 4)})
+    return out
+
+
+def wsp(a):
+    """scan the two calibration scalars on the held-out calls; write the best as a patch (two tensors, their own dtypes)
+    when it beats the stock drafter by --min-gain"""
+    torch, device, data, meta, ck, rope = build(a)
+    model = Drafter(ck, a.mtp_bank, device, None)
+    model.rope_table = torch.from_numpy(rope).to(device)
+    held = Docs(data, 'heldout', meta['topk'])
+    us = [round(0.7 + 0.05 * i, 2) for i in range(13)]          # 0.70 .. 1.30
+    ms = [round(0.25 * i, 2) for i in range(9)]                  # 0 .. 2
+    t0 = time.time()
+    res = wsp_scan(model, held, a, device, a.eval_anchors, us, ms)
+    stock = next(r for r in res if r['u'] == 1.0 and r['m'] == 1.0)
+    best = max(res, key=lambda r: r['expected_accepted'])
+    say(f"held out: {stock['anchors']:,} anchors, {len(res)} settings in {time.time() - t0:.0f} s")
+    say(f"  stock (u 1.00, m 1.00): acceptance {stock['acceptance']}, expected accepted {stock['expected_accepted']}")
+    say(f"  best  (u {best['u']:.2f}, m {best['m']:.2f}): acceptance {best['acceptance']}, expected accepted "
+        f"{best['expected_accepted']}")
+    say('  expected accepted drafts by u (rows) and m (columns):')
+    say('        ' + ''.join(f'{m:>7.2f}' for m in ms))
+    for u in us:
+        say(f'  {u:5.2f} ' + ''.join(f"{next(r for r in res if r['u'] == u and r['m'] == m)['expected_accepted']:7.3f}"
+                                     for m in ms))
+    if best['expected_accepted'] < stock['expected_accepted'] * (1 + a.min_gain):
+        say(f'no setting beats the stock drafter by {a.min_gain:.1%}: no patch written')
+        return res
+    from safetensors.torch import save_file
+    norm = load_dense(ck, 'mtp.2.norm.weight') * best['u']
+    head = load_dense(ck, 'mtp.2.markov_head.head.weight') * best['m']
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    tensors = {'mtp.2.norm.weight': norm.to(torch.bfloat16).contiguous(),
+               'mtp.2.markov_head.head.weight': head.to(torch.float32).contiguous()}
+    part = out / 'patch.safetensors.partial'
+    save_file(tensors, str(part))
+    os.replace(part, out / 'patch.safetensors')
+    trained = {k: best[k] for k in ('anchors', 'acceptance', 'expected_accepted')}
+    manifest = {'format': 1, 'created': time.strftime('%Y-%m-%dT%H:%M:%S'), 'train': f"wsp u={best['u']} m={best['m']}",
+                'tensors': len(tensors), 'weights': str(a.weights),
+                'stock': {k: stock[k] for k in ('anchors', 'acceptance', 'expected_accepted')}, 'trained': trained}
+    (out / 'manifest.json').write_text(json.dumps(manifest, indent=1) + '\n')
+    say(f'patch: {out}/patch.safetensors (u {best["u"]}, m {best["m"]})')
+    return res
+
+
 def identity(a):
     """the stock drafter written as a patch, exactly as train writes one (an FP8 weight as its exact BF16 dequant): the
     check that loading a patch leaves the drafter as it was (ds41d with it should score as without it)"""
@@ -1047,6 +1126,17 @@ def main():
     c.add_argument('--data', required=True)
     c.add_argument('--socket', default='')
     c.add_argument('--topk', type=int, default=32)
+    w = sub.add_parser('wsp')
+    w.add_argument('--data', required=True)
+    w.add_argument('--weights', required=True)
+    w.add_argument('--out', required=True)
+    w.add_argument('--mtp-bank', default='')
+    w.add_argument('--device', default='cuda:0')
+    w.add_argument('--batch', type=int, default=32)
+    w.add_argument('--other-weight', type=float, default=0.2)
+    w.add_argument('--eval-anchors', type=int, default=4096)
+    w.add_argument('--eval-stride', type=int, default=7)
+    w.add_argument('--min-gain', type=float, default=0.005)
     i = sub.add_parser('identity')
     i.add_argument('--weights', required=True)
     i.add_argument('--out', required=True)
@@ -1072,7 +1162,7 @@ def main():
         else:
             t.add_argument('--patch', default='')
     a = ap.parse_args()
-    {'export': export, 'capture': capture, 'train': train, 'eval': run_eval, 'identity': identity}[a.cmd](a)
+    {'export': export, 'capture': capture, 'train': train, 'eval': run_eval, 'identity': identity, 'wsp': wsp}[a.cmd](a)
 
 
 if __name__ == '__main__':

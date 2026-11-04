@@ -316,6 +316,34 @@ class TinyDrafter(unittest.TestCase):
             # medium writes FP8 weights as their exact BF16 values; only the activations' FP8 rounding goes
             self.assertAlmostEqual(scores['medium']['expected_accepted'], scores[None]['expected_accepted'], delta=0.02)
 
+    def test_wsp_scan_matches_eval_at_the_stock_setting(self):
+        dt = self.dt
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            rng = np.random.default_rng(6)
+            (d / 'ck').mkdir()
+            tiny_checkpoint(d / 'ck', rng)
+            tiny_data(d / 'data', rng, docs=3)
+            a = types.SimpleNamespace(data=str(d / 'data'), weights=str(d / 'ck'), mtp_bank='', device='cpu',
+                                      batch=16, other_weight=0.2, eval_anchors=128, eval_stride=1, min_gain=0.0,
+                                      out=str(d / 'wsp'))
+            res = dt.wsp(a)
+            model = dt.Drafter(dt.Checkpoint(a.weights), '', torch.device('cpu'), None)
+            model.rope_table = torch.from_numpy(np.fromfile(d / 'data' / 'docs' / 'rope.f32', dtype=np.float32)
+                                                .reshape(-1, dt.RD))
+            stock = dt.evaluate(model, dt.Docs(d / 'data', 'heldout', 4), a, torch.device('cpu'), 128)
+            at1 = next(r for r in res if r['u'] == 1.0 and r['m'] == 1.0)
+            self.assertAlmostEqual(at1['expected_accepted'], stock['expected_accepted'], delta=1e-3)
+            self.assertEqual(len(res), 13 * 9)
+            best = max(res, key=lambda r: r['expected_accepted'])
+            if best['expected_accepted'] > at1['expected_accepted']:
+                # the written patch, loaded back, scores what the scan said (within the BF16 rounding of the norm)
+                model = dt.Drafter(dt.Checkpoint(a.weights), '', torch.device('cpu'), None, a.out)
+                model.rope_table = torch.from_numpy(np.fromfile(d / 'data' / 'docs' / 'rope.f32', dtype=np.float32)
+                                                    .reshape(-1, dt.RD))
+                got = dt.evaluate(model, dt.Docs(d / 'data', 'heldout', 4), a, torch.device('cpu'), 128)
+                self.assertAlmostEqual(got['expected_accepted'], best['expected_accepted'], delta=0.02)
+
     def test_gradients_reach_every_trainable_tensor(self):
         dt = self.dt
         with tempfile.TemporaryDirectory() as d:

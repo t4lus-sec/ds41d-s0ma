@@ -318,6 +318,13 @@ def patch_gib(env):
         return 0.0
 
 
+def graphs_gib(env):
+    """s0ma change 103: the device memory DS41_GRAPHS=fixed|all takes (the cuBLAS handles' fixed 32 MiB workspace and
+    ~400 instantiated graphs: 176 MiB less free at the first prefill, measured 2026-11-04), taken from the expert slots
+    so the prompts' scratch keeps what it had (without it an 8K prompt was prefilled in two pieces, +1.2 s)"""
+    return 0.25 if env.get('DS41_GRAPHS', '') in ('fixed', 'all') else 0.0
+
+
 def environment(cfg, render=True):
     dist = Path(cfg['build']) / 'dist'
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DS41_', 'CUFILE_'))}
@@ -357,7 +364,7 @@ def environment(cfg, render=True):
         # s0ma change 91: the parked conversations' arenas come out of these slots, so prefill keeps the free VRAM it
         # had (1 GiB less free pushed 8K prompts into two segments, change 25)
         extra = float(SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
-        extra = max(0.0, extra - parked_gib(cfg, env) - patch_gib(env))
+        extra = max(0.0, extra - parked_gib(cfg, env) - patch_gib(env) - graphs_gib(env))
         env.setdefault('DS41_EXPERT_EXTRA_GIB', f'{extra:.2f}')
     # s0ma change 79: the conversations kept in RAM (change 73) sized to the window: a saved conversation holds ~0.9 KB a
     # token (the four global layers' compressed KV and indexer keys up to its frontier, 890 B, and its ids) and 3 MB

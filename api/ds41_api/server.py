@@ -58,6 +58,9 @@ class ServerConfig:
     # The engine (ds41d) is single-stream: one generation at a time, others
     # queue. 429 when the queue is full or a request waits too long.
     max_concurrent: int = 1
+    # s0ma change 96: one-token requests (max_tokens 1: probes) are admitted beside those, up to max_probes at once
+    # (ds41d prefills them together in scratch, without live slots); 0: they share max_concurrent
+    max_probes: int = 0
     max_queue: int = 64
     queue_timeout: float = 120.0
     max_tokens_limit: int = 32768
@@ -73,9 +76,13 @@ class RequestGate:
     def __init__(self, config: ServerConfig):
         self.config = config
         self._sem = asyncio.Semaphore(config.max_concurrent)
+        self._probe_sem = asyncio.Semaphore(config.max_probes) if config.max_probes > 0 else None
         self._waiting = 0
 
-    async def acquire(self):
+    def is_probe(self, max_tokens: int) -> bool:
+        return self._probe_sem is not None and max_tokens <= 1
+
+    async def acquire(self, probe: bool = False):
         """Wait for a generation slot. Returns (slot, waited_seconds).
 
         Raises QueueFullError when the queue is at capacity or the wait
@@ -86,11 +93,12 @@ class RequestGate:
                 f"request queue full ({self.config.max_queue} waiting); "
                 "engine is single-stream, retry later"
             )
+        sem = self._probe_sem if probe and self._probe_sem is not None else self._sem
         self._waiting += 1
         start = time.perf_counter()
         try:
             await asyncio.wait_for(
-                self._sem.acquire(), timeout=self.config.queue_timeout
+                sem.acquire(), timeout=self.config.queue_timeout
             )
         except asyncio.TimeoutError:
             raise QueueFullError(
@@ -99,7 +107,7 @@ class RequestGate:
         finally:
             self._waiting -= 1
         waited = time.perf_counter() - start
-        return self._sem, waited
+        return sem, waited
 
 
 def _error_body(status: int, message: str, err_type: str) -> Dict[str, Any]:
@@ -192,7 +200,7 @@ def create_app(
         except (ValueError, AssertionError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        slot, waited = await gate.acquire()
+        slot, waited = await gate.acquire(gate.is_probe(request.resolved_max_tokens()))
         try:
             collector = TimingCollector()
             collector.waited_in_queue(waited)
@@ -566,6 +574,8 @@ def main() -> None:
         help="explicitly allow non-loopback bind (default refuses)",
     )
     parser.add_argument("--max-concurrent", type=int, default=1)
+    parser.add_argument("--max-probes", type=int, default=0,
+                        help="one-token requests admitted beside --max-concurrent (ds41d's probes); 0: they share it")
     parser.add_argument("--max-queue", type=int, default=64)
     parser.add_argument("--max-tokens-limit", type=int, default=32768,
                         help="hard cap on max_tokens per request (400 above)")
@@ -611,6 +621,7 @@ def main() -> None:
 
     config = ServerConfig(
         max_concurrent=max(1, args.max_concurrent),
+        max_probes=max(0, args.max_probes),
         max_queue=max(0, args.max_queue),
         max_tokens_limit=max(1, args.max_tokens_limit),
     )

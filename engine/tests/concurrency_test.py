@@ -3,6 +3,7 @@
 Several requests at once: each one's greedy tokens equal its tokens alone; same-priority requests share multi steps;
 a better priority runs alone while worse ones wait; cancellation and disconnects free their slots."""
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -211,4 +212,107 @@ with tempfile.TemporaryDirectory(prefix="ds41-conc-") as tmp:
         assert drafted > 0, "no drafts in multi steps"
     finally:
         proc.terminate(); proc.wait(10)
-print("concurrency: same tokens alone and together, multi steps, priority, leaving clients, reuse, combined prefill, drafts in multi steps passed")
+    # s0ma change 96: probes (max_tokens 1) prefill together in scratch, without live slots
+    def probe(rid, prompt, priority=0, seed=7):
+        return {"op": "submit", "request_id": rid, "conversation_id": None, "token_ids": prompt,
+                "sampling": {"temperature": 1.0, "top_p": 1.0, "max_tokens": 1, "logprobs": 20, "seed": seed},
+                "priority": priority}
+
+    def answer(ev):
+        toks = [e for e in ev if e.get("type") == "token"]
+        assert len(toks) == 1 and ev[-1]["type"] == "finish", ev[-1]
+        return toks[0]["token_id"], [(t["token_id"], t["logprob"]) for t in toks[0]["top_logprobs"]]
+
+    shared = [9] * 12
+    questions = {f"q{i}": shared + [10 + i] * (2 + i) for i in range(9)}   # different last positions: different rows
+    # the old path (probes off): each alone takes a slot
+    proc, path = start(tmp, 2, name="noprobe", probes=False)
+    try:
+        before = {q: answer(request(path, probe("o" + q, p, seed=11 + i))) for i, (q, p) in enumerate(questions.items())}
+        st = request(path, probe("ox", questions["q0"]))[-1]["stats"]
+        assert not st["probe"] and st["live_slot"] == 0, st
+    finally:
+        proc.terminate(); proc.wait(10)
+    os.environ["DS41_PROBE_GATHER_MS"] = "15"   # (a loaded test machine starts threads slowly)
+    proc, path = start(tmp, 2, delay=5, name="probe", probes=True)
+    try:
+        # alone (scratch): the same token and top-20 as the old path
+        for i, (q, p) in enumerate(questions.items()):
+            ev = request(path, probe("a" + q, p, seed=11 + i))
+            assert answer(ev) == before[q], (q, answer(ev), before[q])
+            st = ev[-1]["stats"]
+            assert st["probe"] and st["live_slot"] == -1 and st["combined_prefill"] == 1, st
+        saves = st["conversation_saves"]
+        # six at once, 0-2 ms apart: one prefill of six groups, the same answers
+        for n in (6, 9):
+            out = {}
+            ts = []
+            for i, (q, p) in enumerate(list(questions.items())[:n]):
+                ts.append(threading.Thread(target=request, args=(path, probe(f"t{n}{q}", p, seed=11 + i), out)))
+                ts[-1].start(); time.sleep(0.001 * (i % 3))
+            for t in ts: t.join(60)
+            for q in list(questions)[:n]:
+                ev = out[f"t{n}{q}"]
+                assert answer(ev) == before[q], (q, answer(ev), before[q])
+                assert ev[-1]["stats"]["combined_prefill"] == n, (q, n, ev[-1]["stats"]["combined_prefill"])
+        st = out[f"t9q0"][-1]["stats"]
+        assert st["largest_prefill"] == 9 and st["conversation_saves"] == saves, st   # probes are not saved
+        # probes during a main decode: same-priority probes answer between its steps; worse-priority ones wait
+        out = {}
+        main = threading.Thread(target=request, args=(path, submit("M", "mc", 60, prompts["c1"], 0), out))
+        main.start(); time.sleep(0.1)
+        ts = [threading.Thread(target=request, args=(path, probe(f"d{q}", p, 0, 11 + i), out))
+              for i, (q, p) in enumerate(list(questions.items())[:6])]
+        ts += [threading.Thread(target=request, args=(path, probe(f"w{q}", p, 1, 11 + i), out))
+               for i, (q, p) in enumerate(list(questions.items())[:2])]
+        for t in ts: t.start()
+        for t in ts + [main]: t.join(60)
+        m_tokens = [e for e in out["M"] if e.get("type") == "token"]
+        assert [e["token_id"] for e in m_tokens] == alone["c1"][:60] if len(alone["c1"]) >= 60 else len(m_tokens) == 60
+        m_last = m_tokens[-1]["_t"]
+        for i, q in enumerate(list(questions)[:6]):
+            assert answer(out[f"d{q}"]) == before[q], q
+            assert out[f"d{q}"][-1]["_t"] < m_last, f"probe d{q} waited for the main request"
+        for q in list(questions)[:2]:
+            assert answer(out[f"w{q}"]) == before[q], q
+            assert out[f"w{q}"][-1]["_t"] >= m_last, f"worse-priority probe w{q} ran before the main request ended"
+        # a one-token request that continues a kept conversation is not a probe: it reuses its slot
+        ev = request(path, {**probe("C", prompts["c1"] + [e["token_id"] for e in m_tokens]), "conversation_id": "mc"})
+        assert not ev[-1]["stats"]["probe"] and ev[-1]["stats"]["reused_prompt_tokens"] > 0, ev[-1]["stats"]
+        # 16 probes beside two long jobs holding both slots and a worker waiting for one: none dropped or starved
+        out = {}
+        longs = [threading.Thread(target=request, args=(path, submit(f"L{i}", f"lc{i}", 50, prompts["c2"], 5), out))
+                 for i in range(2)]
+        for t in longs: t.start()
+        time.sleep(0.1)
+        waiter = threading.Thread(target=request, args=(path, submit("W", "wc", 5, prompts["c3"], 5), out))
+        waiter.start(); time.sleep(0.02)
+        qs = list(questions.items())
+        ps = [threading.Thread(target=request, args=(path, probe(f"s{k}", qs[k % 9][1], 5, 11 + k % 9), out))
+              for k in range(16)]
+        for t in ps: t.start()
+        for t in ps + longs + [waiter]: t.join(60)
+        long_end = min(out[f"L{i}"][-1]["_t"] for i in range(2))
+        for k in range(16):
+            ev = out[f"s{k}"]
+            assert answer(ev) == before[qs[k % 9][0]], k
+            assert ev[-1]["stats"]["live_slot"] == -1 and ev[-1]["_t"] < long_end, (k, ev[-1]["stats"]["live_slot"])
+        assert len(tokens(out["W"])) == 5 and all(len(tokens(out[f"L{i}"])) == 50 for i in range(2))
+    finally:
+        proc.terminate(); proc.wait(10)
+    err = proc.stderr.read().decode(errors="replace")
+    assert "terminate" not in err and "scheduler:" not in err, err[-2000:]
+    # declined: the probes take the one-by-one path, the same answers
+    proc, path = start(tmp, 2, decline=True, name="probedecl", probes=True)
+    try:
+        out = {}
+        ts = [threading.Thread(target=request, args=(path, probe(f"x{q}", p, 0, 11 + i), out))
+              for i, (q, p) in enumerate(list(questions.items())[:4])]
+        for t in ts: t.start()
+        for t in ts: t.join(60)
+        for q in list(questions)[:4]:
+            assert answer(out[f"x{q}"]) == before[q], q
+            assert not out[f"x{q}"][-1]["stats"]["probe"], q
+    finally:
+        proc.terminate(); proc.wait(10)
+print("concurrency: same tokens alone and together, multi steps, priority, leaving clients, reuse, combined prefill, drafts in multi steps, probes passed")

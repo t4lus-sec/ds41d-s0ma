@@ -188,6 +188,12 @@ public:
                                                    const std::function<void(size_t, bool)> & = {}) {
     throw std::logic_error("prefill_multi unsupported");
   }
+  // s0ma change 96: a group with slot = kScratch is a probe: a whole prompt (Cold) prefilled in scratch state that
+  // is discarded after its logits (no live slot, nothing committed, no drafter work, slot 0 untouched). With at
+  // least one scratch group, prefill_multi takes 1..kMaxGroups groups (real slots still one group each).
+  static constexpr int kScratch = -1, kMaxGroups = 32;
+  virtual bool supports_scratch_prefill() const { return false; }
+  virtual int64_t scratch_context() const { return 0; }   // the longest probe prompt a scratch group takes
   // Diagnostic only: position-addressed, logically live bytes for X3/X3b.
   virtual std::map<std::string,std::vector<uint8_t>> live_state() {
     throw std::logic_error("live state inspection unsupported");

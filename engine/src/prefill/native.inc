@@ -1372,14 +1372,34 @@ void lend_reclaim() {
 bool supports_prefill_multi() const override {
   return config.prefill && config.prefill_chunk_rows && !live_slots_.empty() && !poisoned;
 }
+// s0ma change 96: probes (Forward::kScratch groups) need the chunked path only, not parked slots
+bool supports_scratch_prefill() const override {
+  static const bool on=[]{const char* v=std::getenv("DS41_PROBES");return !(v&&v[0]=='0');}();
+  return on && config.prefill && config.prefill_chunk_rows && !poisoned;
+}
+int64_t scratch_context() const override {return scratch_context_;}
 std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup>& groups,
                                          const std::function<void(size_t,bool)>& around_captures) override {
-  if(!supports_prefill_multi())throw std::logic_error("prefill_multi needs --prefill, --prefill-chunk and live slots");
+  if(!supports_scratch_prefill()&&!supports_prefill_multi())
+    throw std::logic_error("prefill_multi needs --prefill, --prefill-chunk and live slots");
   if(pending||multi.pending)throw std::logic_error("prefill_multi during an active verify");
-  if(groups.size()<2||groups.size()>live_slots_.size()+1)throw PrefillDeclined("prefill_multi: 2..slots groups");
+  size_t scratch_groups=0,scratch_rows=0;   // s0ma change 96: probes
+  for(auto &g:groups)if(g.slot==kScratch){++scratch_groups;scratch_rows+=g.ids.size();}
+  if(scratch_groups&&!supports_scratch_prefill())throw PrefillDeclined("prefill_multi: probes are off");
+  if(groups.empty()||groups.size()>size_t(kMaxGroups)||groups.size()-scratch_groups>live_slots_.size()+1||
+     (groups.size()<2&&!scratch_groups))throw PrefillDeclined("prefill_multi: 2..slots groups (1..32 with probes)");
   std::vector<uint8_t> seen(live_slots_.size()+1,0);
   size_t total=0;
   for(auto &g:groups) {
+    if(g.slot==kScratch) {   // a probe: a whole prompt, cold, in scratch state
+      const auto &o=g.options;
+      if(g.ids.empty()||int64_t(g.ids.size())>scratch_context_||o.mode!=PrefillMode::Cold||(o.images&&!o.images->empty())||
+         o.logits_tail!=1||o.chunk_rows<1||o.chunk_rows>4096||o.dense_batch_rows<1||o.dense_batch_rows>8)
+        throw PrefillDeclined("prefill_multi: probe group");
+      for(int id:g.ids)if(id<0||id>=V)throw PrefillDeclined("prefill token id");
+      total+=g.ids.size();
+      continue;
+    }
     if(g.slot<0||g.slot>int(live_slots_.size())||seen[size_t(g.slot)]++)throw PrefillDeclined("prefill_multi: slot");
     const auto &o=g.options;
     if(g.ids.empty()||(o.images&&!o.images->empty())||o.logits_tail!=1||o.chunk_rows<1||o.chunk_rows>4096||
@@ -1396,7 +1416,7 @@ std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup>& groups
   prefill_warm_counts.clear();
   // as begin_prompt does for one prompt: the overlap counts opened, the VRAM lent (here for all their rows) ...
   tier_census();
-  if(overlap_on&&experts) {
+  if(overlap_on&&experts&&scratch_groups<groups.size()) {   // (s0ma change 96: probes alone leave a running prompt's counts)
     overlap_report();
     if(prompt_bits.empty())experts->log_nvme_misses(true);
     prompt_bits.assign(15360,0);steps_after_prompt=0;
@@ -1412,6 +1432,7 @@ std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup>& groups
   struct Ctx {
     int slot; const PrefillGroup *g; std::unique_ptr<PrefillData> pf; std::vector<ds41e::prefill::Layer> plan;
     PrefillResult result; size_t q0=0, qn=0;
+    LiveSlot *state=nullptr; std::unique_ptr<LiveSlot> own;   // s0ma change 96: the slot's state, or a probe's scratch
   };
   std::vector<Ctx> ctx(groups.size());
   int64_t end_max=0;int width_max=8;
@@ -1420,7 +1441,9 @@ std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup>& groups
   for(size_t i=0;i<groups.size();++i) {
     auto &C=ctx[i];C.slot=groups[i].slot;C.g=&groups[i];
     const auto &o=groups[i].options;const size_t n=groups[i].ids.size();
-    with_slot(C.slot,[&]{
+    if(C.slot==kScratch){C.own=scratch_state(int64_t(n));C.state=C.own.get();}
+    else if(C.slot>0)C.state=live_slots_.at(size_t(C.slot-1)).get();
+    with_state(C.state,[&]{
       C.plan=ds41e::prefill::plan(committed,int64_t(n),int64_t(o.logits_tail));
       C.pf=std::make_unique<PrefillData>(n,committed,o.mode==PrefillMode::Cold,o.logits_tail,config.prefill_budget_bytes);
       C.result.begin_position=committed;C.result.consumed_rows=n;
@@ -1441,7 +1464,7 @@ std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup>& groups
   }
   }catch(const std::exception &e){(void)cudaGetLastError();prefill_chunk.reset();throw PrefillDeclined(e.what());}
   auto in=[&](Ctx &C,auto f){std::swap(pref,C.pf);struct Back{std::unique_ptr<PrefillData>&a,&b;~Back(){std::swap(a,b);}}
-      back{pref,C.pf};with_slot(C.slot,f);};
+      back{pref,C.pf};with_state(C.state,f);};
   multi_pfs.clear();for(auto &C:ctx)multi_pfs.push_back(C.pf.get());
   struct Pfs{std::vector<PrefillData*>&v;~Pfs(){v.clear();}} pfs_off{multi_pfs};
   try {
@@ -1549,6 +1572,7 @@ std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup>& groups
       throw std::runtime_error("prefill changed decode tier membership; quiesce competing admissions");
     for(size_t i=0;i<ctx.size();++i) {
       auto &C=ctx[i];
+      if(C.slot==kScratch){C.result.layers=C.pf->layers;continue;}   // s0ma change 96: a probe commits nothing
       in(C,[&]{
         auto &pf=*pref;
         prefix.commit(C.g->ids,C.g->ids.size());
@@ -1574,8 +1598,9 @@ std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup>& groups
     const double elapsed=clock_ms()-begin_ms;total_ms+=elapsed;
     std::vector<PrefillResult> out;
     for(auto &C:ctx){C.result.elapsed_ms=elapsed;out.push_back(std::move(C.result));}
-    ++multi_prefills;multi_prefill_rows+=total;
-    std::cerr<<"prefill multi: "<<ctx.size()<<" prompts, "<<total<<" rows, "<<elapsed<<" ms\n";
+    if(ctx.size()>scratch_groups||ctx.size()>1){++multi_prefills;multi_prefill_rows+=total;}
+    if(scratch_groups){++probe_prefills;probe_groups+=scratch_groups;probe_rows+=scratch_rows;}
+    std::cerr<<"prefill multi: "<<ctx.size()<<" prompts ("<<scratch_groups<<" probes), "<<total<<" rows, "<<elapsed<<" ms\n";
     prefill_warm_counts.clear();
     return out;
   }catch(...){cudaStreamSynchronize(stream);prefill_chunk.reset();poisoned=true;in_step=false;throw;}

@@ -402,7 +402,7 @@ def register_responses(
         chat_request = parse_responses_request(body, cfg.max_tokens_limit)
         thinking_mode = resolve_thinking_mode(chat_request.thinking)
 
-        slot, waited = await gate.acquire()
+        slot, waited = await gate.acquire(gate.is_probe(chat_request.resolved_max_tokens()))
         try:
             stream, _, token_ids = await build_submission(backend, encoder, chat_request)
         except (ValueError, AssertionError) as exc:

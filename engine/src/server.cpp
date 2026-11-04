@@ -844,6 +844,8 @@ public:
     int anchor = -1;
     uint64_t epoch = 0;    // the model's counter epoch at its prefill's end
     uint64_t multi_drafted = 0, multi_accepted = 0;   // s0ma change 93: drafts in multi steps
+    double queued = 0;      // s0ma change 96: when it was queued (a probe's gather window)
+    int probe = -1;         // a probe (max_tokens 1, prefilled in scratch, no live slot): -1 not decided yet
     double draft_p = -1;   // its first draft's acceptance in multi steps (EWMA; -1: none yet)
     size_t combined = 0;   // s0ma change 91: the prompts its prefill shared (0: alone)
   };
@@ -1004,7 +1006,7 @@ public:
         J.state = std::make_shared<Live>();
         {
           std::lock_guard<std::mutex> lock(registry_mutex);
-          if (live.size() >= 8)
+          if (live.size() >= 8 + probes_max())   // s0ma change 96: room for a probe group beside them
             throw std::runtime_error("engine queue full");
           if (!live.emplace(J.id, J.state).second) {
             J.state.reset();
@@ -1015,6 +1017,7 @@ public:
         {
           std::lock_guard<std::mutex> l(sched_m);
           J.arrival = ++arrivals;
+          J.queued = now();
           queue.push_back(job);
         }
         sched_cv.notify_all();
@@ -1087,6 +1090,68 @@ public:
     const int slots = model->live_slots();
     int best = std::numeric_limits<int>::max();
     for (auto &j : running) best = std::min(best, j->priority);
+    // s0ma change 96: the best waiting priority's probes, together (and with a waiting prompt of theirs that fits)
+    if (!waiting.empty() && !(probe_hold && !running.empty())) {
+      const int cls = waiting.front()->priority;
+      if (running.empty() || batch_lower() || cls <= best) {
+        std::vector<std::shared_ptr<Job>> probes;
+        size_t rows = 0;
+        bool other = false;   // a request of that priority that is not a probe waits too (it is not held back)
+        double oldest = std::numeric_limits<double>::max(), newest = 0;
+        for (auto &j : waiting) {
+          if (j->priority != cls) break;
+          if (!probe_job(*j)) { other = true; continue; }
+          if (probes.size() >= probes_max() || (!probes.empty() && rows + j->ids.size() > combine_rows())) continue;
+          rows += j->ids.size();
+          oldest = std::min(oldest, j->queued);
+          newest = std::max(newest, j->queued);
+          probes.push_back(j);
+        }
+        if (!probes.empty() && !other && probes.size() < probes_max()) {
+          // the window: DS41_PROBE_GATHER_MS without a new probe, at most DS41_PROBE_GATHER_MAX_MS after the first
+          const double t = now();
+          const double left = std::min(probe_gather_ms() - (t - newest) * 1000, probe_gather_max_ms() - (t - oldest) * 1000);
+          if (left > 0) {
+            bool idle = true;   // nothing of this priority or better runs: wait out the window here
+            for (auto &j : running) idle = idle && j->priority > cls;
+            if (idle) {
+              std::this_thread::sleep_for(std::chrono::microseconds(int64_t(left * 1000) + 1));
+              return;
+            }
+            probes.clear();   // the running ones step meanwhile
+          }
+        }
+        if (!probes.empty()) {
+          std::vector<std::shared_ptr<Job>> starters;
+          if (combine_on() && model->supports_prefill_multi() && !(slot0_job && !parkable())) {
+            int room = slots - int(running.size());
+            for (auto &j : waiting) {
+              if (j->priority != cls) break;
+              if (probe_job(*j)) continue;
+              if (probes.size() + starters.size() >= size_t(Forward::kMaxGroups)) break;
+              if (room <= 0 || j->verb == "score" || j->sampling.max_tokens == 0 ||
+                  j->ids.size() + 1 > size_t(model->slot_context()) || rows + j->ids.size() > combine_rows()) break;
+              rows += j->ids.size();
+              starters.push_back(j);
+              --room;
+            }
+          }
+          ++probe_batches;
+          start_many(starters, probes);
+          probe_hold = true;
+          // nothing runs yet: the requests that could not join (no room to combine, too long, a score) start now,
+          // in their order, rather than behind the next probes
+          if (!running.empty()) goto decode;
+          {
+            std::lock_guard<std::mutex> l(sched_m);
+            waiting.assign(queue.begin(), queue.end());
+          }
+          std::stable_sort(waiting.begin(), waiting.end(), [](const auto &a, const auto &b) {
+            return a->priority != b->priority ? a->priority < b->priority : a->arrival < b->arrival;
+          });
+        }
+      }
+    }
     // s0ma change 91: two or more prompts that may start now prefill together (one priority; none longer than a
     // parked slot holds; not while slot 0 holds a running conversation too long to park)
     if (combine_on() && model->supports_prefill_multi() && !(slot0_job && !parkable())) {
@@ -1096,6 +1161,7 @@ public:
         if (room <= 0) break;
         if (!running.empty() && !batch_lower() && j->priority > best) break;
         if (!starters.empty() && !batch_lower() && j->priority > starters.front()->priority) break;
+        if (probe_job(*j)) continue;   // s0ma change 96: probes wait for their own group
         if (j->verb == "score" || j->sampling.max_tokens == 0 ||
             j->ids.size() + 1 > size_t(model->slot_context())) break;
         starters.push_back(j);
@@ -1109,6 +1175,7 @@ public:
     for (auto &j : waiting) {
       if (int(running.size()) >= slots) break;
       if (!running.empty() && !batch_lower() && j->priority > best) break;
+      if (probe_job(*j)) continue;   // s0ma change 96: probes wait for their own group
       if (j->verb == "score" && !running.empty()) break;   // a score request resets slot 0: it runs alone
       { std::lock_guard<std::mutex> l(sched_m); queue.erase(std::find(queue.begin(), queue.end(), j)); }
       if (j->verb == "score") {
@@ -1149,6 +1216,7 @@ public:
     std::stable_sort(turn.begin(), turn.end(), [](const auto &a, const auto &b) { return a->last_step < b->last_step; });
     if (turn.size() > 6) turn.resize(6);
     const bool multi = turn.size() > 1 && !multi_off() && model->supports_verify_multi();
+    probe_hold = false;
     if (multi) step_multi(turn);
     else step_single(turn.front());
   }
@@ -1222,6 +1290,70 @@ public:
     }
     void accepted(Job &j, size_t a) { j.draft_p = j.draft_p < 0 ? double(a) : j.draft_p + 0.1 * (double(a) - j.draft_p); }
   } draft_plan;
+  // s0ma change 96: probes. A request for one token (max_tokens 1, no images, a prompt up to the model's scratch
+  // context) needs no live slot: its token comes from its prefill's last logits. Probes waiting at the best priority
+  // prefill together in scratch (Forward::kScratch groups, up to DS41_PROBES_MAX and DS41_PREFILL_COMBINE_ROWS rows),
+  // with a waiting prompt of theirs when one fits, and answer and end there: never parked, decoded or saved.
+  // DS41_PROBE_GATHER_MS: when the engine is idle (or runs only worse priorities), probes wait until none has arrived
+  // for that long (5 ms; at most DS41_PROBE_GATHER_MAX_MS, 4x it, after the first) for the others of their group: s0ma's
+  // six reach ds41d a few ms apart, each tokenized in turn by the adapter and the API. A running better-or-equal priority takes a step between two probe prefills.
+  // DS41_PROBES=0 (or DS41_PROBE_SAVE=1, which keeps their saves): one-token requests take live slots as before.
+  static size_t probes_max() {
+    static const size_t v = [] {
+      const char *e = std::getenv("DS41_PROBES_MAX");
+      const long x = e && *e ? std::atol(e) : 16;
+      return size_t(std::clamp(x, 1L, long(Forward::kMaxGroups)));
+    }();
+    return v;
+  }
+  static double probe_gather_ms() {
+    static const double v = [] {
+      const char *e = std::getenv("DS41_PROBE_GATHER_MS");
+      const double x = e && *e ? std::atof(e) : 5.0;
+      return std::clamp(x, 0.0, 50.0);
+    }();
+    return v;
+  }
+  static double probe_gather_max_ms() {
+    static const double v = [] {
+      const char *e = std::getenv("DS41_PROBE_GATHER_MAX_MS");
+      const double x = e && *e ? std::atof(e) : 4 * probe_gather_ms();
+      return std::clamp(x, probe_gather_ms(), 200.0);
+    }();
+    return v;
+  }
+  static bool probe_save() {
+    static const bool v = [] { const char *e = std::getenv("DS41_PROBE_SAVE"); return e && e[0] == '1'; }();
+    return v;
+  }
+  // decided once, when the scheduler first sees it: not a probe when an idle slot or a saved conversation already
+  // holds part of its prompt (it continues that conversation: its one-by-one path reuses it, as before)
+  bool probe_job(Job &J) {
+    if (J.probe >= 0) return J.probe == 1;
+    J.probe = 0;
+    if (probe_save() || !model->supports_scratch_prefill() || J.verb != "submit" || J.sampling.max_tokens != 1 ||
+        !J.images.empty() || J.ids.empty() || int64_t(J.ids.size()) > model->scratch_context())
+      return false;
+    if (prefix_cache) {
+      size_t served = 0;
+      for (int k = 0; k < model->live_slots(); ++k)
+        if (!holder(k)) served = std::max(served, served_by(entry(k), J));
+      auto best = find_saved(J.conversation, J.keys);
+      if (best != saved.end()) served = std::max(served, best->keys.size());
+      if (!served && disk_on()) {   // a file of a saved conversation (matched as disk_read does; not read here)
+        std::lock_guard<std::mutex> l(disk_m);
+        for (auto &d : disk)
+          if (d.ours && (prefix_any || (!J.conversation.empty() && d.conversation == J.conversation)) &&
+              !d.keys.empty() && d.keys.size() <= J.keys.size() && std::equal(d.keys.begin(), d.keys.end(), J.keys.begin()))
+            served = std::max(served, d.keys.size());
+      }
+      if (served) return false;
+    }
+    J.probe = 1;
+    return true;
+  }
+  bool probe_hold = false;   // a probe prefill ran between two steps of running jobs: they step first
+  uint64_t probe_batches = 0;
   static bool combine_on() {   // DS41_PREFILL_COMBINE=0: prompts prefill one by one
     static const bool v = [] { const char *e = std::getenv("DS41_PREFILL_COMBINE"); return !(e && e[0] == '0'); }();
     return v;
@@ -1237,9 +1369,14 @@ public:
   // s0ma change 91: several jobs start at once. Each takes its slot and its cached prefix in turn (slot 0 each time);
   // the remainders without images prefill together (Forward::prefill_multi); the others, and all of them if the
   // model declines, take the single path; then each concludes in slot 0
-  bool start_many(const std::vector<std::shared_ptr<Job>> &js) {
+  bool start_many(const std::vector<std::shared_ptr<Job>> &js, const std::vector<std::shared_ptr<Job>> &probes = {}) {
     std::vector<std::shared_ptr<Job>> claimed;
     bool any = false;
+    const double t0 = now();
+    for (auto &j : probes) {   // s0ma change 96: out of the queue; no slot
+      { std::lock_guard<std::mutex> l(sched_m); queue.erase(std::find(queue.begin(), queue.end(), j)); }
+      j->t_start = t0;
+    }
     for (auto &j : js) {
       { std::lock_guard<std::mutex> l(sched_m); queue.erase(std::find(queue.begin(), queue.end(), j)); }
       bool ok = false;
@@ -1277,9 +1414,26 @@ public:
         single.push_back(j);
       }
     }
-    if (groups.size() >= 2) {
+    std::vector<std::shared_ptr<Job>> probing;   // s0ma change 96: scratch groups, after the slots' groups
+    for (auto &j : probes) {
+      if (cancelled(*j)) { finish(*j, "cancelled"); release(*j); continue; }
+      Forward::PrefillGroup g;
+      g.slot = Forward::kScratch;
+      g.ids = j->ids;
+      g.options.mode = PrefillMode::Cold;
+      g.options.dense_batch_rows = prefill_dense_batch;
+      g.options.warm = false;   // its experts are not the running conversations'
+      groups.push_back(std::move(g));
+      probing.push_back(j);
+    }
+    if (groups.size() >= 2 || !probing.empty()) {
       try {
         auto results = model->prefill_multi(groups);
+        for (size_t p = 0; p < probing.size(); ++p) {
+          Job &J = *probing[p];
+          J.logits = std::move(results[grouped.size() + p].logits.back());
+          J.combined = groups.size();
+        }
         for (size_t g = 0; g < grouped.size(); ++g) {
           Job &J = *grouped[g];
           auto &P = entry(J.slot);
@@ -1295,9 +1449,16 @@ public:
         std::cerr << "combined prefill declined (" << e.what() << "): one by one\n";
         single.insert(single.end(), grouped.begin(), grouped.end());
         grouped.clear();
+        {   // probes go back to the queue, in their places, as ordinary requests
+          std::lock_guard<std::mutex> l(sched_m);
+          for (auto it = probing.rbegin(); it != probing.rend(); ++it) { (*it)->probe = 0; queue.push_front(*it); }
+        }
+        probing.clear();
       } catch (const std::exception &e) {
         for (auto &j : grouped) { fail(*j, e.what()); release(*j); }
+        for (auto &j : probing) { fail(*j, e.what()); release(*j); }
         grouped.clear();
+        probing.clear();
       }
     } else {
       single.insert(single.end(), grouped.begin(), grouped.end());
@@ -1319,9 +1480,42 @@ public:
       if (J.finished) release(J);
       else running.push_back(j);
     };
+    for (auto &j : probing) answer_probe(*j);
     for (auto &j : grouped) settle(j, false);
     for (auto &j : single) settle(j, true);
-    return any;
+    return any || !probes.empty();
+  }
+  // s0ma change 96: a probe's one token from its prefill's logits, as conclude() draws an anchor; then it ends
+  void answer_probe(Job &J) {
+    J.prefill_end = now();
+    J.reused = 0;
+    J.consumed_prompt = J.ids.size();
+    J.epoch = ~uint64_t(0);   // its counters are shared with whatever else ran: reported as such
+    J.started = true;
+    ++active;
+    try {
+      J.prefill_counters = model->counters();
+      J.rng = Rng{J.sampling.seed};
+      J.attempts = std::make_unique<AttemptCounter>();
+      J.drafter = nullptr;
+      if (cancelled(J)) {
+        finish_job(J, "cancelled");
+      } else {
+        const uint64_t nonce = J.attempts->take();
+        ++J.cycles;
+        J.anchor = J.sampling.temperature == 0
+                       ? argmax(J.logits)
+                       : sample(probabilities(J.logits, J.sampling.temperature, J.sampling.top_p),
+                                J.rng, nonce, 0, Purpose::Target);
+        emit(J, J.anchor, J.logits);
+        finish_job(J, J.reason);
+      }
+    } catch (const std::exception &e) {
+      fail(J, e.what());
+    } catch (...) {
+      fail(J, "unknown error answering a probe");
+    }
+    release(J);
   }
   bool emit(Job &J, int token, const std::vector<float> &row) {
     if (cancelled(J)) {
@@ -1352,6 +1546,15 @@ public:
     ++J.completed;
     return true;
   }
+  // what of J's prompt a slot's conversation serves (its whole prompt, or its boundary snapshot)
+  size_t served_by(const Prefix &P, const Job &J) const {
+    if (P.matches(J.conversation, J.keys, prefix_any)) return P.inputs.size();
+    if (P.boundary && P.boundary_len && P.same_conversation(J.conversation, prefix_any) &&
+        P.boundary_len <= J.ids.size() && P.boundary_len <= P.inputs.size() &&
+        std::equal(P.keys.begin(), P.keys.begin() + P.boundary_len, J.keys.begin()))
+      return P.boundary_len;
+    return 0;
+  }
   // the slot a starting job takes: the idle slot whose conversation serves the most of its prompt, else a fresh slot 0
   // (the job's conversation is then in slot 0)
   bool claim(Job &J) {
@@ -1365,13 +1568,7 @@ public:
     if (prefix_cache)
       for (int s = 0; s < slots; ++s) {
         if (holder(s)) continue;
-        auto &P = entry(s);
-        size_t n = 0;
-        if (P.matches(J.conversation, J.keys, prefix_any)) n = P.inputs.size();
-        else if (P.boundary && P.boundary_len && P.same_conversation(J.conversation, prefix_any) &&
-                 P.boundary_len <= J.ids.size() && P.boundary_len <= P.inputs.size() &&
-                 std::equal(P.keys.begin(), P.keys.begin() + P.boundary_len, J.keys.begin()))
-          n = P.boundary_len;
+        const size_t n = served_by(entry(s), J);
         if (n > served) { served = n; k = s; }
       }
     const bool movable = slot0_job ? parkable() : prefix.inputs.empty() || parkable();
@@ -1574,7 +1771,8 @@ public:
       } catch (const std::exception &) {
         prefix.boundary.reset(); prefix.boundary_len = 0;
       }
-      if (!cancelled()) save_live();   // s0ma change 73
+      // s0ma change 73 (96: not a one-token answer's, unless DS41_PROBE_SAVE=1: its prompt is not extended)
+      if (!cancelled() && (sampling.max_tokens > 1 || probe_save())) save_live();
     }
     J.prefill_end = now();
     J.prefill_counters = model->counters();
@@ -1861,6 +2059,7 @@ public:
     stats["multi_drafted"] = J.multi_drafted;   // s0ma change 93
     stats["multi_accepted"] = J.multi_accepted;
     stats["live_slot"] = J.slot;
+    stats["probe"] = J.probe == 1;   // s0ma change 96
     if (disk_on()) {
       std::lock_guard<std::mutex> l(disk_m);
       size_t ours = 0;
@@ -2040,6 +2239,8 @@ public:
     decline_multi = j.value("decline_multi", false);
     spark = j.value("spark", false);
     has_drafter = j.value("drafter", false);
+    probes = j.value("probes", false);   // (the protocol tests of the one-by-one path keep it)
+    probe_ctx = j.value("probe_context", int64_t(1) << 20);
   }
   int live_slots() const override { return 1 + int(parked_pos.size()); }
   int64_t slot_context() const override { return parked_pos.empty() ? 0 : slot_ctx; }
@@ -2098,12 +2299,34 @@ public:
   }
   // (s0ma change 91) the prompts' positions advance together; each gets the row of its last position
   bool supports_prefill_multi() const override { return !parked_pos.empty(); }
+  // (s0ma change 96) "probes": true takes scratch groups; a probe's row is that of its prompt's last position, as the
+  // one-by-one path gives it
+  bool probes = false;
+  int64_t probe_ctx = 1 << 20;
+  size_t probe_prefills = 0, probe_groups = 0, largest_prefill = 0;
+  bool supports_scratch_prefill() const override { return probes; }
+  int64_t scratch_context() const override { return probe_ctx; }
   std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup> &groups,
                                            const std::function<void(size_t, bool)> &around) override {
-    if (pending || groups.size() < 2) throw std::logic_error("replay prefill_multi");
+    size_t scratch = 0;
+    for (auto &g : groups) scratch += g.slot == kScratch;
+    if (pending || groups.empty() || (groups.size() < 2 && !scratch) || groups.size() > size_t(kMaxGroups) ||
+        (scratch && !probes) || (scratch < groups.size() && parked_pos.empty() && groups.size() - scratch > 1))
+      throw std::logic_error("replay prefill_multi");
+    if (incomplete && scratch < groups.size()) throw std::logic_error("prefill_multi during a prompt");
     if (decline_multi) throw PrefillDeclined("replay test: declined");
     std::vector<PrefillResult> out;
     for (size_t g = 0; g < groups.size(); ++g) {
+      if (groups[g].slot == kScratch) {
+        if (groups[g].options.mode != PrefillMode::Cold || groups[g].ids.empty() ||
+            int64_t(groups[g].ids.size()) > probe_ctx) throw std::logic_error("replay probe group");
+        PrefillResult r;
+        r.begin_position = 0;
+        r.consumed_rows = groups[g].ids.size();
+        r.logits.push_back(rows[(groups[g].ids.size() - 1) % rows.size()]);
+        out.push_back(std::move(r));
+        continue;
+      }
       auto &at = groups[g].slot ? parked_pos.at(size_t(groups[g].slot - 1)) : position;
       if ((groups[g].options.mode == PrefillMode::Cold) != (at == 0)) throw std::logic_error("replay prefill_multi mode");
       PrefillResult r;
@@ -2115,7 +2338,9 @@ public:
       out.push_back(std::move(r));
     }
     if (delay) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-    ++multi_prefills;
+    if (groups.size() > scratch || groups.size() > 1) ++multi_prefills;
+    if (scratch) { ++probe_prefills; probe_groups += scratch; }
+    largest_prefill = std::max(largest_prefill, groups.size());
     return out;
   }
   void commit_group(size_t g, size_t n) override {
@@ -2161,6 +2386,9 @@ public:
             {"expert_vram_hits", calls},   // like Native's counters: since the last begin_request
             {"multi_calls", multi_calls},
             {"multi_prefills", multi_prefills},
+            {"probe_prefills", probe_prefills},
+            {"probe_groups", probe_groups},
+            {"largest_prefill", largest_prefill},
             {"multi_drafts", draft_calls},
             {"slot_swaps", swaps}};
   }

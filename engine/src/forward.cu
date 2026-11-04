@@ -763,7 +763,12 @@ class Native final : public Forward, public hotpath::GateEvidence {
   // slot k's rings, global arenas, n-gram history, committed ids and position in the members for f (pointers only)
   template <class F> void with_slot(int k, F f) {
     if (!k) { f(); return; }
-    auto &S = *live_slots_.at(size_t(k - 1));
+    with_state(live_slots_.at(size_t(k - 1)).get(), f);
+  }
+  // s0ma change 96: the same for any slot state (a live slot's, or a probe's scratch state); null: the members
+  template <class F> void with_state(LiveSlot *P, F f) {
+    if (!P) { f(); return; }
+    auto &S = *P;
     auto sw = [&] {
       for (size_t i = 0; i < windows.size(); ++i) std::swap(windows[i], S.windows[i]);
       for (auto &[l, g] : globals) std::swap(g, S.globals.at(l));
@@ -775,6 +780,17 @@ class Native final : public Forward, public hotpath::GateEvidence {
     try { f(); } catch (...) { sw(); throw; }
     sw();
   }
+  // s0ma change 96: a probe's scratch state for rows tokens (freed with it): zeroed rings and arenas of at least
+  // 4096 tokens (DS41_SLOT_CONTEXT's floor), so every kernel sees the geometry a live slot can have
+  std::unique_ptr<LiveSlot> scratch_state(int64_t rows) {
+    const int cap = int(std::max<int64_t>(4096, (rows + 7) / 8 * 8));
+    auto s = std::make_unique<LiveSlot>();
+    for (int l = 0; l < 40; ++l) { s->windows.emplace_back(RING * 528); CK(cudaMemsetAsync(s->windows.back().p, 0, s->windows.back().bytes, stream)); }
+    for (int l : {2, 8, 14, 20}) s->globals.emplace(l, std::make_unique<Global>(cap, l == 20 ? 1 : 2));
+    return s;
+  }
+  int64_t scratch_context_ = 16384;   // DS41_PROBE_CONTEXT
+  uint64_t probe_prefills = 0, probe_groups = 0, probe_rows = 0;
   int64_t slot_context_ = 0;
   uint64_t slot_swaps = 0;
   double slot_swap_ms = 0;
@@ -1004,6 +1020,12 @@ public:
         for (int l : {2, 8, 14, 20}) s->globals.emplace(l, std::make_unique<Global>(int(cap), l == 20 ? 1 : 2));
         live_slots_.push_back(std::move(s));
       }
+      if (const char *pc = std::getenv("DS41_PROBE_CONTEXT"); pc && *pc) {   // s0ma change 96
+        const long long v = std::strtoll(pc, nullptr, 10);
+        if (v < 8 || v > config.max_context) throw std::invalid_argument("DS41_PROBE_CONTEXT must be 8..max_context");
+        scratch_context_ = int64_t(v);
+      }
+      scratch_context_ = std::min<int64_t>(scratch_context_, config.max_context);
       if (slots > 1) {
         size_t bytes = 0;
         for (auto &[l, g] : live_slots_[0]->globals) bytes += g->kv.bytes + g->key.bytes + g->raw_kv.bytes + g->raw_score.bytes;
@@ -1810,6 +1832,9 @@ public:
               {"multi_rows", multi_rows},
               {"multi_prefills", multi_prefills},   // s0ma change 91
               {"multi_prefill_rows", multi_prefill_rows},
+              {"probe_prefills", probe_prefills},   // s0ma change 96: prefills with scratch (probe) groups
+              {"probe_groups", probe_groups},
+              {"probe_rows", probe_rows},
               {"expert_vram_hits", s.hits - initial_stats.hits},
               {"expert_host_hits", s.host_hits - initial_stats.host_hits},
               {"expert_nvme_misses", s.nvme_misses - initial_stats.nvme_misses},

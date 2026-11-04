@@ -727,11 +727,18 @@ public:
     std::swap(seed_mode_, s.seed_mode); std::swap(prompt_tail_, s.tail);
   }
   bool supports_prefill_multi() const override { return target_->supports_prefill_multi() && append_restore_; }
+  // s0ma change 96: a probe's scratch group has no drafter state (it is never decoded): the target's alone
+  bool supports_scratch_prefill() const override { return target_->supports_scratch_prefill(); }
+  int64_t scratch_context() const override { return target_->scratch_context(); }
   std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup> &groups,
                                            const std::function<void(size_t, bool)> &) override {
     check();
-    if (!supports_prefill_multi()) throw std::logic_error("prefill_multi needs DS41_SPARK_APPEND_RESTORE=1");
-    if (prompt_active_ || incomplete_prompt_) throw std::logic_error("prefill_multi during a prompt");
+    bool real = false;
+    for (auto &g : groups) real = real || g.slot != kScratch;
+    if (real ? !supports_prefill_multi() : !supports_scratch_prefill())
+      throw std::logic_error("prefill_multi needs DS41_SPARK_APPEND_RESTORE=1");
+    // (probes alone touch no drafter state: an incomplete prompt in slot 0 does not matter to them)
+    if (real && (prompt_active_ || incomplete_prompt_)) throw std::logic_error("prefill_multi during a prompt");
 #ifdef DS41_SPARK_POLICY_V2
     if (policy2_pending_) throw std::logic_error("prefill_multi during a policy transaction");
     q0_ready_ = false;
@@ -739,14 +746,17 @@ public:
     {   // what the target would refuse anyway, before any swap (nothing changed: the caller goes one by one)
       std::vector<uint8_t> seen(size_t(std::max(1, target_->live_slots())), 0);
       for (auto &g : groups)
-        if (g.slot < 0 || g.slot >= target_->live_slots() || seen[size_t(g.slot)]++)
+        if (g.slot == kScratch) {
+          if (g.options.mode != PrefillMode::Cold) throw PrefillDeclined("prefill_multi: probe group");
+        } else if (g.slot < 0 || g.slot >= target_->live_slots() || seen[size_t(g.slot)]++)
           throw PrefillDeclined("prefill_multi: slot");
     }
     std::vector<SlotPrompt> sp(groups.size());
-    for (auto &s : sp) {
+    for (size_t g = 0; g < groups.size(); ++g) {
+      if (groups[g].slot == kScratch) continue;
       void *t = nullptr;
       cuda_checked(cudaMalloc(&t, size_t(128) * 30720));
-      s.tail.reset(t);
+      sp[g].tail.reset(t);
     }
     std::vector<uint8_t> restore(groups.size(), 0);
     auto enter = [&](size_t g) { if (groups[g].slot) spark_swap(groups[g].slot); swap_prompt(sp[g]); };
@@ -759,6 +769,7 @@ public:
     bool started = false;
     try {
       for (size_t g = 0; g < groups.size(); ++g) {
+        if (groups[g].slot == kScratch) continue;
         enter(g);
         Leave out{[&] { leave(g); }};
         const int64_t old = ds41_spark_committed(spark_.get()), n = int64_t(groups[g].ids.size());
@@ -778,6 +789,7 @@ public:
       auto results = target_->prefill_multi(groups, [&](size_t g, bool on) { if (on) enter(g); else leave(g); });
       auto stream = weights_.cuda_stream;
       for (size_t g = 0; g < groups.size(); ++g) {
+        if (groups[g].slot == kScratch) continue;
         enter(g);
         Leave out{[&] { leave(g); }};
         const int64_t n = int64_t(groups[g].ids.size());

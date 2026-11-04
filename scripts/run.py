@@ -414,12 +414,24 @@ def live_slots(cfg):
         return 1
 
 
+def probes(cfg):
+    """s0ma change 96: one-token requests the API admits beside the live slots (ds41d's probe groups); 0: off."""
+    try:
+        env = environment(cfg, render=False)
+        if str(env.get('DS41_PROBES', '1')).startswith('0') or str(env.get('DS41_PROBE_SAVE', '0')).startswith('1'):
+            return 0
+        return max(1, min(32, int(env.get('DS41_PROBES_MAX', '16'))))
+    except (ValueError, OSError):
+        return 0
+
+
 def api_command(cfg, socket):
     return [str(ROOT / '.venv/bin/python'), '-m', 'ds41_api.server', '--backend', 'socket', '--socket', str(socket),
             '--tokenizer', str(Path(cfg['weights']) / 'tokenizer.json'), '--model', cfg['model_id'],
             '--host', '127.0.0.1', '--port', str(cfg['port']),
             # s0ma change 91: as many requests reach the engine as it keeps live slots (it queues the rest itself)
             '--max-concurrent', str(live_slots(cfg)),
+            '--max-probes', str(probes(cfg)),   # s0ma change 96
             '--max-queue', str(cfg['max_queue']), '--max-tokens-limit', str(cfg['max_tokens_limit'])]
 
 

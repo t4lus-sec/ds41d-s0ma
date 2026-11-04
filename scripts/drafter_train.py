@@ -108,6 +108,60 @@ def jobs_block(s0ma):
 SHA = re.compile(r'(sha256:)?[0-9a-f]{64}')
 
 
+_ZSTD = None
+
+
+def unzstd(raw):
+    """a zstd frame: the zstandard module, Python 3.14's compression.zstd, or zstandard installed once into
+    ~/.ds41/pylib (DS41_PYLIB; never into an environment), else the zstd command (one process a blob: slow)"""
+    global _ZSTD
+    if _ZSTD is None:
+        _ZSTD = _zstd_reader()
+    return _ZSTD(raw)
+
+
+def _zstd_reader():
+    import subprocess
+    import shutil
+
+    def module():
+        try:
+            import zstandard
+            return lambda b: zstandard.ZstdDecompressor().decompressobj().decompress(b)
+        except ImportError:
+            pass
+        try:
+            from compression import zstd
+            return zstd.decompress
+        except ImportError:
+            return None
+    r = module()
+    if r:
+        return r
+    lib = Path(os.environ.get('DS41_PYLIB') or Path.home() / '.ds41' / 'pylib')
+    if str(lib) not in sys.path:
+        sys.path.insert(0, str(lib))
+    r = module()
+    if r:
+        return r
+    say(f'  zstd blobs: installing the zstandard module into {lib} (once)')
+    lib.mkdir(parents=True, exist_ok=True)
+    p = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--target', str(lib), 'zstandard'],
+                       capture_output=True, text=True)
+    if p.returncode == 0:
+        import importlib
+        importlib.invalidate_caches()
+        r = module()
+        if r:
+            return r
+    exe = shutil.which('zstd') or shutil.which('unzstd')
+    if exe:
+        say('  zstd blobs: the zstandard module did not install; using the zstd command (slower)')
+        return lambda b: subprocess.run([exe, '-dcq'], input=b, capture_output=True, check=True).stdout
+    sys.exit('zstd blobs: no zstandard module, pip could not install it '
+             f'({(p.stderr or "").strip()[-200:]}), and no zstd command (sudo apt install zstd)')
+
+
 class Calls:
     def __init__(self, root):
         self.root, self.objects, self._index, self._blobs = root, root / 'objects', None, {}
@@ -148,12 +202,7 @@ class Calls:
                 except OSError:
                     break
             if raw[:4] == b'\x28\xb5\x2f\xfd':
-                try:
-                    import zstandard
-                    raw = zstandard.ZstdDecompressor().decompressobj().decompress(raw)
-                except ImportError:
-                    from compression import zstd
-                    raw = zstd.decompress(raw)
+                raw = unzstd(raw)
             if len(self._blobs) > 20000:
                 self._blobs.clear()
             self._blobs[sha] = json.loads(raw)

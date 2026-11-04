@@ -81,6 +81,7 @@ class SparkTarget final : public Forward, public DraftProvider {
   std::vector<std::unique_ptr<ParkedRings>> parked_;
   std::vector<int> multi_slots_;   // s0ma change 91: the pending multi step's groups' slots
   std::vector<uint8_t> multi_done_;
+  uint64_t multi_drafts_ = 0;   // s0ma change 93
   bool prompt_active_ = false, cold_seed_pending_ = false;
   bool incomplete_prompt_ = false;
   int64_t prompt_rows_ = 0, captures_seen_ = 0, tail_rows_ = 0;
@@ -632,6 +633,37 @@ public:
     q0_ready_ = false;   // the cached first-draft q was the other conversation's
 #endif
   }
+  bool draft_one(int slot, int anchor, double temperature, double top_p, uint64_t seed, uint64_t step, int &token,
+                 std::vector<double> &q) override {   // s0ma change 93 (see DraftProvider::draft_one)
+    check();
+    if (prompt_active_ || incomplete_prompt_ || slot < 0 || slot >= target_->live_slots()) return false;
+#ifdef DS41_SPARK_POLICY_V2
+    if (policy2_pending_) return false;
+#endif
+    if (slot) spark_swap(slot);
+    struct Back { SparkTarget &t; int k; ~Back() { if (k) try { t.spark_swap(k); } catch (...) { t.poisoned_ = true; } } }
+        back{*this, slot};
+    if (ds41_spark_committed(spark_.get()) + 5 > weights_.rope_rows) return false;
+    begin(anchor);
+    DraftDraw g;
+    if (draw_gpu(0, anchor, temperature, top_p, seed, step, 0, uint32_t(Purpose::Draft), g)) {
+      token = g.token;
+      if (temperature > 0) {
+        if (g.q) q.assign(g.q, g.q + vocab());
+        else if (g.q_device) fetch_q(g.q_device, q);
+        else return false;
+      } else q.clear();
+    } else {
+      auto l = logits(0, anchor);
+      if (temperature == 0) { token = argmax(l); q.clear(); }
+      else {
+        q = probabilities(l, temperature, top_p);
+        token = sample(q, Rng{seed}, step, 0, Purpose::Draft);
+      }
+    }
+    ++multi_drafts_;
+    return true;
+  }
   // s0ma change 91: a multi-conversation step. No drafting in it; each group's accepted rows reach the drafter with
   // that slot's rings and committed length swapped in
   bool supports_verify_multi() const override { return target_->supports_verify_multi(); }
@@ -831,6 +863,7 @@ public:
     auto out = target_->counters();
     out["spark_native_candidate"] = true;
     out["spark_committed_inputs"] = ds41_spark_committed(spark_.get());
+    out["spark_multi_drafts"] = multi_drafts_;   // s0ma change 93
     out["spark_fixed_width"] = fixed_width_;
     out["spark_sampling_path"] = gpu_verify_on() ? "device-fp64-v2-UNQUALIFIED" : "host-fp64-v2-UNQUALIFIED";
     if (gpu_verify_on()) {   // s0ma change 29

@@ -187,4 +187,28 @@ with tempfile.TemporaryDirectory(prefix="ds41-conc-") as tmp:
         assert out["R"][-1]["finish_reason"] == "length" and len(tokens(out["R"])) == 60, out["R"][-1]
     finally:
         proc.terminate(); proc.wait(10)
-print("concurrency: same tokens alone and together, multi steps, priority, leaving clients, reuse, combined prefill passed")
+    # s0ma change 93: with a drafter, multi steps draft too: the same greedy tokens alone and together
+    proc, path = start(tmp, 3, delay=3, name="draft", drafter=True)
+    try:
+        def dsubmit(rid, conv, n, prompt):
+            o = submit(rid, conv, n, prompt, 5)
+            o["draft"] = "on"
+            return o
+        solo_d = {c: tokens(request(path, dsubmit(f"ds{c}", f"dsc{c}", 20, p))) for c, p in list(prompts.items())[:3]}
+        for c, t in solo_d.items():
+            assert t == alone[c][:20] if len(alone[c]) >= 20 else len(t) == 20, (c, t)
+        out = {}
+        ts = [threading.Thread(target=request, args=(path, dsubmit(f"dt{c}", f"dtc{c}", 20, p), out))
+              for c, p in list(prompts.items())[:2]]
+        for t in ts: t.start()
+        for t in ts: t.join(60)
+        drafted = 0
+        for c in list(prompts)[:2]:
+            assert tokens(out[f"dt{c}"]) == solo_d[c], (c, tokens(out[f"dt{c}"]), solo_d[c])
+            st = out[f"dt{c}"][-1]["stats"]
+            drafted += st.get("multi_drafted", 0)
+            assert st.get("multi_accepted", 0) == st.get("multi_drafted", 0), st   # a perfect drafter
+        assert drafted > 0, "no drafts in multi steps"
+    finally:
+        proc.terminate(); proc.wait(10)
+print("concurrency: same tokens alone and together, multi steps, priority, leaving clients, reuse, combined prefill, drafts in multi steps passed")

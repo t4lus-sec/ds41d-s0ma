@@ -124,13 +124,16 @@ def main():
         diffs = [first_diff(r['tokens'], solo[i]['tokens']) for i, r in enumerate(recs)]
         multi = [r['finish']['stats'].get('multi_steps', 0) for r in recs]
         comb = [r['finish']['stats'].get('combined_prefill', 0) for r in recs]
-        row = {'streams': s, 'steady_combined_tok_s': steady, 'overall_tok_s': overall,
+        md = sum(r['finish']['stats'].get('multi_drafted', 0) for r in recs)
+        ma = sum(r['finish']['stats'].get('multi_accepted', 0) for r in recs)
+        row = {'multi_drafted': md, 'multi_accepted': ma, 'streams': s, 'steady_combined_tok_s': steady, 'overall_tok_s': overall,
                'per_stream_tok_s': [rate(r) for r in recs], 'multi_steps': multi, 'combined_prefill': comb,
                'first_diff_from_solo': diffs, 'solo_mean_tok_s': solo_mean}
         report['together'].append(row)
         print(f"{s} together: {steady:.1f} tok/s combined while all ran ({steady / solo_mean:.2f}x solo's "
               f"{solo_mean:.1f}), {overall:.1f} tok/s submit-to-last; each {', '.join(f'{rate(r):.1f}' for r in recs)}; "
-              f"multi steps {multi}; prefill shared by {comb}; greedy tokens differ from solo at "
+              f"multi steps {multi}, drafts in them {md} ({ma} accepted); prefill shared by {comb}; "
+              f"greedy tokens differ from solo at "
               f"{['same' if d is None else d for d in diffs]}", flush=True)
     # 3. prefill
     if 'prefill' not in a.skip:

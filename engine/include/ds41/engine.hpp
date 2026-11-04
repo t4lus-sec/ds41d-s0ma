@@ -327,6 +327,10 @@ public:
   virtual const double *onehot_q(int, int) { return nullptr; }
   // the most rows a step of this drafter verifies (copied drafts stay within it: no new verify widths)
   virtual int max_width() const { return 6; }
+  // s0ma change 93: one draft for the conversation in live slot `slot` (the drafter's state for it swapped in and
+  // back), for a multi-conversation step: the token after `anchor` and, when sampling, its q (host, [vocab]). false:
+  // no draft now (the slot is too close to the drafter's limit, or no drafter). Outside the width policy.
+  virtual bool draft_one(int, int, double, double, uint64_t, uint64_t, int &, std::vector<double> &) { return false; }
   virtual void observe(const DraftObservation &) = 0;
   virtual void complete(const DraftObservation &observation, bool censored) {
     if (!censored) observe(observation);

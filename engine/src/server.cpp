@@ -843,6 +843,8 @@ public:
     double draft_ms = 0, verify_ms = 0, draft_forward_ms = 0, draft_draw_ms = 0;
     int anchor = -1;
     uint64_t epoch = 0;    // the model's counter epoch at its prefill's end
+    uint64_t multi_drafted = 0, multi_accepted = 0;   // s0ma change 93: drafts in multi steps
+    double draft_p = -1;   // its first draft's acceptance in multi steps (EWMA; -1: none yet)
     size_t combined = 0;   // s0ma change 91: the prompts its prefill shared (0: alone)
   };
   // the model's slots 1..n-1 (slot 0 is `prefix`, slot0_job and slot0_used)
@@ -1150,6 +1152,76 @@ public:
     if (multi) step_multi(turn);
     else step_single(turn.front());
   }
+  // s0ma change 93: which conversations of a multi step draft one token. A step of s conversations and r rows costs
+  // M[s] + B[r] - B[s] ms (M: a step of s conversations one row each; B: one conversation's r rows) plus a draft's
+  // own cost; a draft yields its acceptance p (each job's, EWMA; its single-stream acceptance before any). The plan
+  // takes the drafts (best p first) that raise expected tokens a millisecond. Measured step times replace the model
+  // once a (s, r) has 4 of them; every 32nd step tries a (s, r) not measured yet. DS41_MULTI_DRAFT=0: none.
+  struct DraftPlan {
+    std::vector<double> M{0, 17.2, 24.1, 28.6, 36.7, 45.0, 54.0}, B{0, 17.2, 22.1, 27.7, 32.4, 42.7, 53.7};
+    double draft_ms = 1.2;
+    std::map<std::pair<size_t, size_t>, std::pair<double, int>> seen;   // (s, r) -> EWMA ms, count
+    uint64_t steps = 0;
+    bool on = true;
+    DraftPlan() {
+      const char *v = std::getenv("DS41_MULTI_DRAFT");
+      on = !(v && v[0] == '0');
+      auto table = [](const char *name, std::vector<double> &t) {
+        const char *e = std::getenv(name);
+        if (!e || !*e) return;
+        std::vector<double> x{0};
+        for (const char *p = e; *p;) {
+          char *end = nullptr;
+          const double d = std::strtod(p, &end);
+          if (end == p || !(d > 0)) throw std::invalid_argument(std::string(name) + ": six positive ms, comma separated");
+          x.push_back(d);
+          p = *end == ',' ? end + 1 : end;
+        }
+        if (x.size() != 7) throw std::invalid_argument(std::string(name) + ": six positive ms, comma separated");
+        t = x;
+      };
+      table("DS41_MULTI_STEP_MS", M);
+      table("DS41_MULTI_ROWS_MS", B);
+    }
+    double cost(size_t s, size_t r) const {
+      auto it = seen.find({s, r});
+      if (it != seen.end() && it->second.second >= 4) return it->second.first;
+      return M[std::min<size_t>(s, 6)] + B[std::min<size_t>(r, 6)] - B[std::min<size_t>(s, 6)] + double(r - s) * draft_ms;
+    }
+    static double p_of(const Job &j) {
+      if (j.draft_p >= 0) return j.draft_p;
+      return j.drafted ? std::min(0.95, double(j.accepted) / double(j.drafted)) : 0.7;
+    }
+    template <class Ok>
+    std::vector<size_t> choose(const std::vector<std::shared_ptr<Job>> &members, Ok ok) {
+      std::vector<size_t> order;
+      const size_t s = members.size();
+      if (!on) return order;
+      for (size_t g = 0; g < s; ++g) if (ok(*members[g])) order.push_back(g);
+      std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return p_of(*members[a]) > p_of(*members[b]); });
+      const size_t most = std::min(order.size(), size_t(6) - std::min<size_t>(s, 6));
+      size_t best = 0;
+      double rate = double(s) / cost(s, s), tokens = double(s);
+      for (size_t d = 1; d <= most; ++d) {
+        tokens += p_of(*members[order[d - 1]]);
+        const double r = tokens / cost(s, s + d);
+        if (r > rate) { rate = r; best = d; }
+      }
+      if (++steps % 32 == 0)   // explore: the smallest draft count whose (s, r) is not measured yet
+        for (size_t d = 0; d <= most; ++d) {
+          auto it = seen.find({s, s + d});
+          if (it == seen.end() || it->second.second < 4) { best = d; break; }
+        }
+      order.resize(best);
+      return order;
+    }
+    void observe(size_t s, size_t r, double ms) {
+      auto &e = seen[{s, r}];
+      e.first = e.second ? e.first + 0.2 * (ms - e.first) : ms;
+      ++e.second;
+    }
+    void accepted(Job &j, size_t a) { j.draft_p = j.draft_p < 0 ? double(a) : j.draft_p + 0.1 * (double(a) - j.draft_p); }
+  } draft_plan;
   static bool combine_on() {   // DS41_PREFILL_COMBINE=0: prompts prefill one by one
     static const bool v = [] { const char *e = std::getenv("DS41_PREFILL_COMBINE"); return !(e && e[0] == '0'); }();
     return v;
@@ -1644,41 +1716,98 @@ public:
       step_single(pick);
       return;
     }
-    std::vector<int> tokens(members.size(), -1);
+    // s0ma change 93: which conversations draft one token this step (DraftPlan: expected tokens a millisecond)
+    const size_t n = members.size();
+    std::vector<int> drafts(n, -1);
+    std::vector<std::vector<double>> qs(n);
+    std::vector<uint64_t> nonces(n);
+    for (size_t g = 0; g < n; ++g) nonces[g] = members[g]->attempts->take();
+    std::vector<size_t> want = draft_plan.choose(members, [&](const Job &j) {
+      const size_t cap = j.slot == 0 ? size_t(context) : size_t(model->slot_context());
+      return j.drafter && j.draft_mode != "off" && j.sampling.max_tokens - j.completed >= 2 &&
+             entry(j.slot).inputs.size() + 2 <= std::min(cap, size_t(context));
+    });
+    const double t0 = now();
     std::vector<std::vector<std::vector<float>>> rows;
+    std::vector<Verification> result(n);
     try {
-      const double t0 = now();
-      rows = model->verify_multi(groups);
-      const double ms = (now() - t0) * 1000;
-      for (size_t g = 0; g < members.size(); ++g) {
+      double draft_ms = 0;
+      for (size_t g : want) {
         Job &J = *members[g];
-        const uint64_t nonce = J.attempts->take();
-        ++J.cycles; ++J.multi_steps;
-        J.verify_ms += ms / double(members.size());
-        Verification v = reject_sample({}, {}, probabilities_rows(rows[g], J.sampling.temperature, J.sampling.top_p),
-                                       J.rng, nonce, J.sampling.temperature);
-        if (v.emitted.empty()) throw std::runtime_error("multi step: no token");
-        tokens[g] = v.emitted.front();
+        const double d0 = now();
+        int token = -1;
+        if (J.drafter->draft_one(J.slot, J.anchor, J.sampling.temperature, J.sampling.top_p, J.rng.seed, nonces[g],
+                                 token, qs[g])) {
+          drafts[g] = token;
+          groups[g].tokens.push_back(token);
+        }
+        J.draft_ms += (now() - d0) * 1000;
+        draft_ms += (now() - d0) * 1000;
       }
-      for (size_t g = 0; g < members.size(); ++g) model->commit_group(g, 1);
+      const double v0 = now();
+      rows = model->verify_multi(groups);
+      const double ms = (now() - v0) * 1000;
+      for (size_t g = 0; g < n; ++g) {
+        Job &J = *members[g];
+        ++J.cycles; ++J.multi_steps;
+        J.verify_ms += ms / double(n);
+        const bool d = drafts[g] >= 0;
+        std::vector<int> proposals;
+        std::vector<Distribution> q;
+        if (d) {
+          proposals.push_back(drafts[g]);
+          if (J.sampling.temperature != 0) q.push_back(std::move(qs[g]));
+        }
+        result[g] = reject_sample(proposals, q, probabilities_rows(rows[g], J.sampling.temperature, J.sampling.top_p),
+                                  J.rng, nonces[g], J.sampling.temperature);
+        if (result[g].emitted.empty()) throw std::runtime_error("multi step: no token");
+      }
     } catch (const std::exception &e) {
       for (auto &j : members) { fail(*j, e.what()); retire(j); }
       return;
     }
-    for (size_t g = 0; g < members.size(); ++g) {
+    // the tokens go out first (a stop or a cancel ends a job's delivered prefix), then every group commits what it
+    // delivered (1 + accepted drafts among them, as SpeculativeStep::finish), before any other model call
+    std::vector<size_t> delivered(n, 0), commit(n, 1);
+    std::vector<uint8_t> active(n, 1);
+    for (size_t g = 0; g < n; ++g) {
+      Job &J = *members[g];
+      for (size_t k = 0; k < result[g].emitted.size(); ++k) {
+        if (!emit(J, result[g].emitted[k], rows[g][k])) { active[g] = 0; break; }
+        ++delivered[g];
+      }
+      if (cancelled(J) && J.completed < J.sampling.max_tokens) { J.reason = "cancelled"; active[g] = 0; }
+      commit[g] = 1 + std::min(delivered[g], result[g].accepted);
+    }
+    try {
+      for (size_t g = 0; g < n; ++g) model->commit_group(g, commit[g]);
+    } catch (const std::exception &e) {
+      for (auto &j : members) { fail(*j, e.what()); retire(j); }
+      return;
+    }
+    size_t rows_used = 0, tokens_out = 0;
+    for (size_t g = 0; g < n; ++g) { rows_used += groups[g].tokens.size(); tokens_out += delivered[g]; }
+    draft_plan.observe(n, rows_used, (now() - t0) * 1000);
+    for (size_t g = 0; g < n; ++g) {
       Job &J = *members[g];
       try {
-      auto &P = entry(J.slot);
-      J.last_step = used(J.slot) = ++use_clock;
-      P.inputs.push_back(J.anchor);
-      P.keys.push_back(uint64_t(J.anchor));
-      P.logits = rows[g][0];
-      if (J.copying) J.suffix.push(J.anchor);
-      bool active = emit(J, tokens[g], rows[g][0]);
-      J.anchor = tokens[g];
-      if (cancelled(J) && J.completed < J.sampling.max_tokens) { J.reason = "cancelled"; active = false; }
-      if (!active || J.completed >= J.sampling.max_tokens || P.inputs.size() >= size_t(context))
-        finish_job(J, J.reason);
+        auto &P = entry(J.slot);
+        J.last_step = used(J.slot) = ++use_clock;
+        const auto &inputs = groups[g].tokens;
+        P.inputs.insert(P.inputs.end(), inputs.begin(), inputs.begin() + std::ptrdiff_t(commit[g]));
+        P.keys.insert(P.keys.end(), inputs.begin(), inputs.begin() + std::ptrdiff_t(commit[g]));
+        P.logits = rows[g][commit[g] - 1];
+        if (J.copying) for (size_t i = 0; i < commit[g]; ++i) J.suffix.push(inputs[i]);
+        if (drafts[g] >= 0) {
+          ++J.drafted; ++J.multi_drafted;
+          J.verified_accepted += result[g].accepted;
+          const size_t ok = std::min(delivered[g], result[g].accepted);
+          J.accepted += ok; J.multi_accepted += ok;
+          if (delivered[g] == result[g].emitted.size()) draft_plan.accepted(J, result[g].accepted);
+        }
+        J.anchor = result[g].emitted.back();
+        if (!active[g] || J.completed >= J.sampling.max_tokens || P.inputs.size() >= size_t(context))
+          finish_job(J, J.reason);
       } catch (const std::exception &e) {
         fail(J, e.what());
       }
@@ -1729,6 +1858,8 @@ public:
     stats["priority"] = J.priority;              // s0ma change 91
     stats["multi_steps"] = J.multi_steps;
     stats["combined_prefill"] = J.combined;
+    stats["multi_drafted"] = J.multi_drafted;   // s0ma change 93
+    stats["multi_accepted"] = J.multi_accepted;
     stats["live_slot"] = J.slot;
     if (disk_on()) {
       std::lock_guard<std::mutex> l(disk_m);
@@ -1876,7 +2007,7 @@ public:
     return out;
   }
 };
-class Replay final : public Forward {
+class Replay final : public Forward, public DraftProvider {
   std::vector<std::vector<float>> rows;
   size_t position = 0, pending = 0;
   int eos_;
@@ -1908,6 +2039,7 @@ public:
     slot_ctx = j.value("slot_context", 1 << 20);
     decline_multi = j.value("decline_multi", false);
     spark = j.value("spark", false);
+    has_drafter = j.value("drafter", false);
   }
   int live_slots() const override { return 1 + int(parked_pos.size()); }
   int64_t slot_context() const override { return parked_pos.empty() ? 0 : slot_ctx; }
@@ -1923,6 +2055,24 @@ public:
   }
   // "spark": true models the drafter bridge's prompt lifecycle: an incomplete prompt blocks swaps until a reset
   bool spark = false, incomplete = false;
+  // s0ma change 93 (protocol tests): "drafter": true gives a perfect drafter (the next row's argmax), widths up to 3
+  bool has_drafter = false;
+  size_t draft_calls = 0;
+  DraftProvider *drafter() override { return has_drafter ? this : nullptr; }
+  int choose_width(int maximum) override { return std::min(3, maximum); }
+  void begin(int) override {}
+  std::vector<float> logits(int k, int) override { return rows[(position + size_t(k)) % rows.size()]; }
+  void observe(const DraftObservation &) override {}
+  void rollback(int64_t) override {}
+  bool draft_one(int slot, int, double temperature, double top_p, uint64_t seed, uint64_t step, int &token,
+                 std::vector<double> &q) override {
+    if (slot < 0 || slot > int(parked_pos.size())) return false;
+    const auto &r = rows[(slot ? parked_pos[size_t(slot - 1)] : position) % rows.size()];
+    if (temperature == 0) { token = argmax(r); q.clear(); }
+    else { q = probabilities(r, temperature, top_p); token = sample(q, Rng{seed}, step, 0, Purpose::Draft); }
+    ++draft_calls;
+    return true;
+  }
   void end_prompt(bool complete) override { if (spark && !complete) incomplete = true; }
   bool supports_verify_multi() const override { return !parked_pos.empty(); }
   std::vector<std::vector<std::vector<float>>> verify_multi(const std::vector<VerifyGroup> &groups) override {
@@ -2011,6 +2161,7 @@ public:
             {"expert_vram_hits", calls},   // like Native's counters: since the last begin_request
             {"multi_calls", multi_calls},
             {"multi_prefills", multi_prefills},
+            {"multi_drafts", draft_calls},
             {"slot_swaps", swaps}};
   }
 };

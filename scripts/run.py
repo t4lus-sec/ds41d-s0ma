@@ -370,10 +370,12 @@ def environment(cfg, render=True):
         # s0ma change 105: the drafter's 98 starved experts (change 80's weight audit) read in place from host memory
         # instead of pinned in VRAM (change 81); the freed ~0.87 GiB goes to target slots. Measured 2026-11-04
         # (route counts): 0 of 28,800 drafter routes reach them. Sero, two seeds: 80.93 tok/s against 77.8-80.2 plain,
-        # verify 26.85 -> 26.4 ms a step, acceptance 0.755. Needs the EXL3 drafter bank. A lab --env DS41_SPARK_COLD=
-        # (empty) turns it off
+        # verify 26.85 -> 26.4 ms a step, acceptance 0.755. Needs the EXL3 drafter bank. A lab --env DS41_SPARK_COLD=0
+        # turns it off
         if env.get('DS41_MTP_EXL3', '0') not in ('', '0'):
             env.setdefault('DS41_SPARK_COLD', SPARK_STARVED)
+        if env.get('DS41_SPARK_COLD') == '0':   # s0ma change 107: a lab --env DS41_SPARK_COLD=0 turns it off
+            env.pop('DS41_SPARK_COLD')
         # s0ma change 52 (V6): 2 GiB more K3 slots in 4 chunks that each prompt borrows back for its scratch (change 51).
         # Seed 22, 46 GiB tier: 40.43 -> 41.88 tok/s, tokens 7/7 identical, verify 57.4 -> 55.3 ms a step; first
         # token 5.65 -> 6.13 s mean (all of it inside the engine's prefill; lending itself 3-10 ms). A lab

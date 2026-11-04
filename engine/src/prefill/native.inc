@@ -77,6 +77,8 @@ struct PrefillData {
   // s0ma change 55: both point into pinned buffers the engine keeps between prompts (prefill_pinned)
   ds41::HostBuffer* route_host=nullptr;
   ds41::HostBuffer* descriptors=nullptr;
+  // s0ma change 86: the layer's job descriptors and route slots, and the waves', copied into VRAM (see pdesc)
+  Device desc_dev, wave_dev;
   Json layers=Json::array();
   std::array<std::unique_ptr<EngramAsync::Ticket>,2> engram;
   std::array<const char*,2> engram_raw{};
@@ -622,6 +624,26 @@ ds41::HostBuffer* prefill_pinned(std::unique_ptr<ds41::HostBuffer>& b,size_t n) 
   if(!b||b->size()<n)b=std::make_unique<ds41::HostBuffer>(std::max(n+n/2,size_t(2)<<20),true);
   return b.get();
 }
+// s0ma change 86: the sweep's kernels read their job descriptors and route slots from VRAM, not from the pinned host
+// buffer the host writes them into. Every warp of the gather and scatter kernels reads its row's slot, and kernel
+// reads of mapped host memory are uncached PCIe reads: ~15 million a layer for an 8K segment (gather and scatter, 160
+// warps per routed row), sharing the link with the RAM tier's expert copies. ds41-probe.sh contend (2026-11-03):
+// 13 MiB copies 57.3 GB/s alone, 30.9 beside kernels reading 64 B from host memory, the 28-35 GB/s the sweep's copies
+// ran at. Now each layer's descriptors (and each wave's) cross once, by a zero-copy kernel on the stream that uses
+// them (not a cudaMemcpyAsync, which would queue behind the expert copies on the copy engine). The same values in
+// the same order: exact. DS41_PREFILL_DEVICE_DESC=0 reads them from host memory as before.
+static bool prefill_device_desc() {
+  static const bool on=[]{const char *v=std::getenv("DS41_PREFILL_DEVICE_DESC");return !(v&&v[0]=='0');}();
+  return on;
+}
+// n bytes from a mapped host address (its device alias) into VRAM, on s
+static void pdesc(void *dst,const void *src_alias,size_t n,cudaStream_t s) {
+  if(!n)return;
+  const int threads=256;
+  const int blocks=int(std::min<size_t>((n+16*threads-1)/(16*threads),512));
+  zc_copy<<<blocks,threads,0,s>>>(static_cast<const unsigned char*>(src_alias),static_cast<unsigned char*>(dst),n);
+  CK(cudaGetLastError());
+}
 Json pmoe(int l,ds41e::prefill::Span span) {
   auto &pf=*pref;size_t base=size_t(span.begin-pf.begin),count=size_t(span.size());
   auto* ids=static_cast<int32_t*>(pf.route_host->data());
@@ -680,6 +702,17 @@ Json pmoe(int l,ds41e::prefill::Span span) {
       batches[id].push_back({job,offset,m});job+=3;offset+=m;
     }
   }
+  if(prefill_device_desc()) {   // s0ma change 86: the descriptors into VRAM, ahead of every lane (they wait on stream)
+    const size_t n=descriptor_bytes+count*6*4;
+    // a failed allocation keeps this layer on the mapped descriptors (as before), never fails the prompt
+    if(pf.desc_dev.bytes<n)try{pf.desc_dev.resize(std::max(n+n/2,size_t(1)<<20));}
+      catch(const std::exception &e){(void)cudaGetLastError();std::cerr<<"prefill: descriptors stay in host memory ("<<e.what()<<")\n";}
+    if(pf.desc_dev.bytes>=n) {
+      pdesc(pf.desc_dev.p,pf.descriptors->device_data(),n,stream);
+      gpu_jobs=pf.desc_dev.as<ds41::GemmJob>();
+      gpu_slots=reinterpret_cast<int32_t*>(pf.desc_dev.as<char>(descriptor_bytes));
+    }
+  }
   if(!exl3) CK(ds41::quantize_mxfp8(pf.ffn_input.as<Bf16>(base*H*2),pf.quant.as<uint8_t>(),
       pf.scales.as<uint8_t>(),int(count),H,stream));
   auto resident_before=experts->stats();
@@ -692,7 +725,13 @@ Json pmoe(int l,ds41e::prefill::Span span) {
   // once a layer (the previous layer's sweep has finished: pmoe synchronizes the stream before it returns)
   const int wave_rows=exl3?prefill_wave_rows():0;
   const size_t wave_desc_jobs=(chunks*3*sizeof(ds41::GemmJob)+63)&~size_t(63);
-  ds41::HostBuffer *wave_desc=wave_rows?prefill_pinned(prefill_wave_buf,wave_desc_jobs+count*6*4+64):nullptr;
+  // (s0ma change 86: each wave's slots start on a 16-byte boundary, so its copy runs in 16-byte loads: chunks * 16
+  // bytes of slack, one wave per chunk at most)
+  const size_t wave_desc_bytes=wave_desc_jobs+count*6*4+chunks*16+64;
+  ds41::HostBuffer *wave_desc=wave_rows?prefill_pinned(prefill_wave_buf,wave_desc_bytes):nullptr;
+  if(wave_desc&&prefill_device_desc()&&pf.wave_dev.bytes<wave_desc_bytes)   // s0ma change 86 (as desc_dev on failure)
+    try{pf.wave_dev.resize(std::max(wave_desc_bytes+wave_desc_bytes/2,size_t(1)<<20));}
+    catch(const std::exception &e){(void)cudaGetLastError();std::cerr<<"prefill: wave descriptors stay in host memory ("<<e.what()<<")\n";}
   size_t wave_jobs_used=0,wave_slots_used=0;
   if(wave_rows&&pf.waves.size()<variants)pf.waves.resize(variants);
   // s0ma change 77: every lane's wave scratch before the sweep (change 77's copies-first needs all of it)
@@ -778,12 +817,15 @@ Json pmoe(int l,ds41e::prefill::Span span) {
     auto *gpu_j=static_cast<ds41::GemmJob*>(wave_desc->device_data());
     auto *cpu_sl=reinterpret_cast<int32_t*>(static_cast<char*>(wave_desc->data())+wave_desc_jobs);
     auto *gpu_sl=reinterpret_cast<int32_t*>(static_cast<char*>(wave_desc->device_data())+wave_desc_jobs);
+    const bool wave_vram=prefill_device_desc()&&pf.wave_dev.bytes>=wave_desc_bytes;   // s0ma change 86: each wave's descriptors into VRAM first
+    auto *dev_j=wave_vram?pf.wave_dev.as<ds41::GemmJob>():gpu_j;
+    auto *dev_sl=wave_vram?reinterpret_cast<int32_t*>(pf.wave_dev.as<char>(wave_desc_jobs)):gpu_sl;
     for(size_t i=0;i<items.size();) {
       // a wave: consecutive items while their rows fit
       size_t e=i;int rows=0;
       while(e<items.size()&&rows+items[e].b->rows<=W.rows){rows+=items[e].b->rows;++e;}
       const size_t n=e-i,j0=wave_jobs_used,sl=wave_slots_used;
-      if(j0+3*n>chunks*3||sl+size_t(rows)>count*6)throw std::logic_error("prefill wave arena");
+      if(j0+3*n>chunks*3||sl+size_t(rows)>count*6+chunks*4)throw std::logic_error("prefill wave arena");
       ds41::GemmJob *G=cpu_j+j0,*U=G+n,*D=U+n;
       int r0=0,maxr=0;
       for(size_t k=0;k<n;++k){const auto &it=items[i+k];const int m=it.b->rows;maxr=std::max(maxr,m);
@@ -791,9 +833,10 @@ Json pmoe(int l,ds41e::prefill::Span span) {
         U[k]={it.id,m,W.x.as<uint8_t>(size_t(r0)*H*2),W.ru.as<uint8_t>(size_t(r0)*H*2),W.up.as<Bf16>(size_t(r0)*I*2)};
         D[k]={it.id,m,W.act.as<uint8_t>(size_t(r0)*I*2),W.rd.as<uint8_t>(size_t(r0)*I*2),W.down.as<Bf16>(size_t(r0)*H*2)};
         std::copy_n(cpu_slots+it.b->offset,m,cpu_sl+sl+size_t(r0));r0+=m;}
-      wave_jobs_used+=3*n;wave_slots_used+=size_t(rows);
-      const ds41::GemmJob *g=gpu_j+j0,*u=g+n,*d=u+n;
-      ds41e::prefill::gather_routes_bf16(pf.ffn_input.as<char>(base*H*2),pf.weights.as<float>(base*6*4),gpu_sl+sl,
+      wave_jobs_used+=3*n;wave_slots_used=(wave_slots_used+size_t(rows)+3)&~size_t(3);   // (change 86: 16-byte aligned)
+      if(wave_vram){pdesc(dev_j+j0,gpu_j+j0,3*n*sizeof(ds41::GemmJob),s);pdesc(dev_sl+sl,gpu_sl+sl,size_t(rows)*4,s);}
+      const ds41::GemmJob *g=dev_j+j0,*u=g+n,*d=u+n;
+      ds41e::prefill::gather_routes_bf16(pf.ffn_input.as<char>(base*H*2),pf.weights.as<float>(base*6*4),dev_sl+sl,
           W.x.p,W.bw.as<float>(),rows,s);
       CK(ds41::exl3_prefill_rotate_group(table,g,u,int(n),ds41::Projection::Gate,ds41::Projection::Up,H,maxr,s));
       for(size_t a=0;a<n;){size_t b=a;int mr=0;while(b<n&&items[i+b].bits==items[i+a].bits){mr=std::max(mr,items[i+b].b->rows);++b;}
@@ -803,7 +846,7 @@ Json pmoe(int l,ds41e::prefill::Span span) {
       CK(ds41::exl3_prefill_rotate_group(table,d,nullptr,int(n),ds41::Projection::Down,ds41::Projection::Down,I,maxr,s));
       for(size_t a=0;a<n;){size_t b=a;int mr=0;while(b<n&&items[i+b].bits==items[i+a].bits){mr=std::max(mr,items[i+b].b->rows);++b;}
         CK(ds41::exl3_prefill_rotated_group(table,d+a,int(b-a),ds41::Projection::Down,H,I,mr,items[i+a].bits,s));a=b;}
-      ds41e::prefill::scatter_routes(W.down.p,gpu_sl+sl,pf.routed.as<char>(base*6*H*2),rows,s);
+      ds41e::prefill::scatter_routes(W.down.p,dev_sl+sl,pf.routed.as<char>(base*6*H*2),rows,s);
       CK(cudaGetLastError());
       i=e;
     }

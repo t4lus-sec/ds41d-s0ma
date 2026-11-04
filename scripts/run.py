@@ -360,6 +360,13 @@ def environment(cfg, render=True):
             if (mtp / 'records-mtp.tsv').exists() and (mtp / 'receipts.json').exists():
                 env.setdefault('DS41_MTP_EXL3', str(mtp))
                 break
+        # s0ma change 106: CUDA graphs for the fixed groups (change 100) with programmatic dependent launch. Measured
+        # 2026-11-04, Sero, two seeds: verify 26.85 -> 26.3-26.4 ms a step in all four graph runs, 79.1-79.6 tok/s
+        # against 77.8-80.2 plain; first token as plain once change 103 kept the prompts' VRAM (1.116 s). lab
+        # concurrent and lab probes with both on: streams together give the same greedy tokens as alone, probes alone vs
+        # together identical, nothing failed. A lab --env DS41_GRAPHS=0 / DS41_PDL=0 turns either off
+        env.setdefault('DS41_GRAPHS', 'fixed')
+        env.setdefault('DS41_PDL', '1')
         # s0ma change 105: the drafter's 98 starved experts (change 80's weight audit) read in place from host memory
         # instead of pinned in VRAM (change 81); the freed ~0.87 GiB goes to target slots. Measured 2026-11-04
         # (route counts): 0 of 28,800 drafter routes reach them. Sero, two seeds: 80.93 tok/s against 77.8-80.2 plain,

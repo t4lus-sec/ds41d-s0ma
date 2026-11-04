@@ -1059,6 +1059,9 @@ public:
       if (holder(J.slot) == &J) holder(J.slot) = nullptr;
       entry(J.slot) = {};
     }
+    // s0ma change 98: the engine's own error message (never request content) goes to the log as well
+    std::cerr << "request failed (" << J.verb << ", priority " << J.priority << ", slot " << J.slot
+              << (J.probe == 1 ? ", probe" : "") << "): " << what.substr(0, 400) << "\n";
     finish(J, "error", what);
     if (J.started) --active;
     J.started = false;

@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <cmath>
 #include "ds41/engine.hpp"
 #include "ds41/spark.h"
@@ -57,9 +58,9 @@ class SparkTarget final : public Forward, public DraftProvider {
   }
   void policy_checked(int rc, const char *operation) {
     if (rc) {
-      poisoned_ = true;
-      throw std::runtime_error(std::string("Spark policy-v2 ") + operation +
-                               " failed: " + std::to_string(rc));
+      const std::string why = std::string("Spark policy-v2 ") + operation + " failed: " + std::to_string(rc);
+      poison(__LINE__, why);
+      throw std::runtime_error(why);
     }
   }
   void reset_policy2() {
@@ -234,20 +235,41 @@ class SparkTarget final : public Forward, public DraftProvider {
   }
   void check() const {
     if (poisoned_)
-      throw std::runtime_error("native Spark adapter poisoned; restart ds41d");
+      throw std::runtime_error("native Spark adapter poisoned (" + poison_why_ + "); restart ds41d");
+  }
+  // s0ma change 98: the first cause is kept, logged once and named in every later refusal (it reached only the one
+  // request that hit it before)
+  std::string poison_why_;
+  static std::string current_what() noexcept {
+    try {
+      if (auto e = std::current_exception()) std::rethrow_exception(e);
+    } catch (const std::exception &e) {
+      return e.what();
+    } catch (...) {
+      return "a non-standard exception";
+    }
+    return "no exception in flight";
+  }
+  void poison(int line, const std::string &why) noexcept {
+    if (poisoned_) return;
+    poisoned_ = true;
+    try {
+      poison_why_ = "spark_bridge.cpp:" + std::to_string(line) + ": " + why;
+      std::cerr << "native Spark adapter poisoned at " << poison_why_ << std::endl;
+    } catch (...) {}
   }
   void checked(int rc) {
     if (rc) {
-      poisoned_ = true;
-      throw std::runtime_error(std::string("native Spark adapter: ") +
-                               ds41_spark_error());
+      const std::string why = std::string("native Spark adapter: ") + ds41_spark_error();
+      poison(__LINE__, why);
+      throw std::runtime_error(why);
     }
   }
   void cuda_checked(cudaError_t rc) {
     if (rc != cudaSuccess) {
-      poisoned_ = true;
-      throw std::runtime_error(std::string("native Spark CUDA: ") +
-                               cudaGetErrorString(rc));
+      const std::string why = std::string("native Spark CUDA: ") + cudaGetErrorString(rc);
+      poison(__LINE__, why);
+      throw std::runtime_error(why);
     }
   }
   void bind(const char *name, const ds41_target_tensor_v1 &view) {
@@ -291,7 +313,7 @@ class SparkTarget final : public Forward, public DraftProvider {
       return 0;
     } catch (const std::exception &e) {
       self.callback_error_ = e.what();
-      self.poisoned_ = true;
+      self.poison(__LINE__, current_what());
       return -1;
     }
   }
@@ -311,7 +333,7 @@ class SparkTarget final : public Forward, public DraftProvider {
       return 0;
     } catch (const std::exception &e) {
       self.callback_error_ = e.what();
-      self.poisoned_ = true;
+      self.poison(__LINE__, current_what());
       return -1;
     }
   }
@@ -520,7 +542,7 @@ public:
       }
       return result;
     } catch (...) {
-      poisoned_ = true;
+      poison(__LINE__, current_what());
       throw;
     }
   }
@@ -559,7 +581,7 @@ public:
     target_->load_conversation(*s->target);
     try {
       checked(ds41_spark_state_import(spark_.get(), s->rings.data(), s->rings.size(), s->spark_committed));
-    } catch (...) { poisoned_ = true; throw; }
+    } catch (...) { poison(__LINE__, current_what()); throw; }
     // as reset(), but the committed length is the loaded one (the width policy keeps what it has learned)
     prompt_active_ = cold_seed_pending_ = incomplete_prompt_ = false;
     prompt_rows_ = captures_seen_ = tail_rows_ = 0;
@@ -623,9 +645,9 @@ public:
     target_->swap_slot(k);
     try {
       checked(ds41_spark_state_swap_device(spark_.get(), r->p, 2 * ds41_spark_state_bytes(), &r->committed));
-    } catch (...) { poisoned_ = true; throw; }
+    } catch (...) { poison(__LINE__, current_what()); throw; }
     if (ds41_spark_committed(spark_.get()) != target_->committed_position()) {
-      poisoned_ = true;
+      poison(__LINE__, current_what());
       throw std::logic_error("swap_slot: drafter and target committed lengths differ");
     }
     seed_mode_ = "live-slot";
@@ -641,7 +663,7 @@ public:
     if (policy2_pending_) return false;
 #endif
     if (slot) spark_swap(slot);
-    struct Back { SparkTarget &t; int k; ~Back() { if (k) try { t.spark_swap(k); } catch (...) { t.poisoned_ = true; } } }
+    struct Back { SparkTarget &t; int k; ~Back() { if (k) try { t.spark_swap(k); } catch (...) { t.poison(__LINE__, current_what()); } } }
         back{*this, slot};
     if (ds41_spark_committed(spark_.get()) + 5 > weights_.rope_rows) return false;
     begin(anchor);
@@ -708,7 +730,7 @@ public:
       spark_swap(k);
       target_->commit_group(g, accepted);
       spark_swap(k);
-    } catch (...) { poisoned_ = true; throw; }
+    } catch (...) { poison(__LINE__, current_what()); throw; }
   }
   // s0ma change 91: a combined prefill. Each conversation's prompt lifecycle (as begin_prompt, prefill and
   // end_prompt run it for one prompt, the whole remaining prompt in one segment) with its own state and capture tail
@@ -763,7 +785,7 @@ public:
     // a failed swap back cannot leave the bridge usable: poisoned (never an exception out of a destructor)
     auto leave = [&](size_t g) noexcept {
       swap_prompt(sp[g]);
-      try { if (groups[g].slot) spark_swap(groups[g].slot); } catch (...) { poisoned_ = true; }
+      try { if (groups[g].slot) spark_swap(groups[g].slot); } catch (...) { poison(__LINE__, current_what()); }
     };
     struct Leave { std::function<void()> f; ~Leave() { f(); } };
     bool started = false;
@@ -824,7 +846,7 @@ public:
       throw;   // nothing changed (every group's state was left in its own SlotPrompt, the rings swapped back)
     } catch (...) {
       if (!started && !poisoned_) throw;   // (refused before the target ran: nothing changed)
-      poisoned_ = true;
+      poison(__LINE__, current_what());
       throw;
     }
   }

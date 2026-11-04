@@ -705,6 +705,10 @@ class Native final : public Forward, public hotpath::GateEvidence {
   // still runs. Steps inside the window say "profiler_range": true in the hot-path profile.
   long profile_from = -1, profile_to = -1, verify_count = 0;
   bool profiler_open = false;
+  // s0ma change 90: DS41_PROFILE_PREFILL=N opens the profiler range around the N-th native prefill call (counted from 1
+  // over the process): the device is synchronized before cudaProfilerStart and again before cudaProfilerStop, so the
+  // range holds that prefill's launches only. It takes the place of DS41_PROFILE_STEPS when both are set.
+  long profile_prefill = -1, prefill_calls = 0;
   // s0ma change 63: full residency's plan (mixed_store_classes), applied to the placement
   bool full_residency = false;
   std::vector<ds41::ExpertId> full_preload, full_seeds;
@@ -859,6 +863,14 @@ public:
       if (*end || profile_from < 1 || profile_to < profile_from)
         throw std::invalid_argument("DS41_PROFILE_STEPS must be A:B (verify steps, 1 <= A <= B)");
       std::cerr << "profiler range: verify steps " << profile_from << " to " << profile_to << "\n";
+    }
+    if (const char *r = std::getenv("DS41_PROFILE_PREFILL"); r && *r) {   // s0ma change 90
+      char *end = nullptr;
+      profile_prefill = std::strtol(r, &end, 10);
+      if (*end || profile_prefill < 1) throw std::invalid_argument("DS41_PROFILE_PREFILL must be N (a prefill, N >= 1)");
+      if (profile_from > 0) std::cerr << "profiler range: DS41_PROFILE_PREFILL replaces DS41_PROFILE_STEPS\n";
+      profile_from = profile_to = -1;
+      std::cerr << "profiler range: prefill " << profile_prefill << "\n";
     }
     if (!c.fused_head_library.empty()) {
       // Spark drafts with its compact BF16 head over this same native matrix (head_kind 1).

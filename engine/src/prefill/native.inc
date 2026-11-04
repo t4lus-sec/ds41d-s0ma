@@ -1305,6 +1305,17 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
       (options.mode==PrefillMode::Append&&committed==0))
     throw std::invalid_argument("prefill mode/state/context/chunk/tail");
   for(int id:input)if(id<0||id>=V)throw std::invalid_argument("prefill token id");
+  // s0ma change 90: the profiler range around the N-th prefill (closed however this call leaves)
+  struct ProfileRange {
+    bool open=false;size_t rows=0;long n=0;
+    ~ProfileRange(){if(!open)return;(void)cudaDeviceSynchronize();(void)cudaProfilerStop();
+      std::cerr<<"profiler range: closed after prefill "<<n<<" (rows "<<rows<<")\n";}
+  } profile_range;
+  if(profile_prefill>0&&++prefill_calls==profile_prefill) {
+    CK(cudaDeviceSynchronize());CK(cudaProfilerStart());
+    profile_range.open=true;profile_range.rows=input.size();profile_range.n=prefill_calls;profile_prefill=-1;
+    std::cerr<<"profiler range: open at prefill "<<prefill_calls<<" (rows "<<input.size()<<", cached "<<committed<<")\n";
+  }
   double begin_ms=clock_ms();
   // s0ma change 53: where a prompt's time goes outside its layers (one "prefill phases:" line a prompt)
   std::vector<std::pair<const char*,double>> phase_marks;

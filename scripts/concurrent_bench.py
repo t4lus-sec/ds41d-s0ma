@@ -135,9 +135,11 @@ def main():
     # 3. prefill
     if 'prefill' not in a.skip:
         longs = [case_ids('agentic-000', 2000), case_ids('agentic-001', 2000), case_ids('mt-000', 2000)]
+        # a token of its own in front of each prompt, different alone and together: no prompt is ever served from a
+        # kept conversation (the engine reuses any kept prompt prefix), so both measure full prefills
         alone = []
         for i, ids in enumerate(longs):
-            r = submit(path, op(f'ps-{tag}-{i}', f'ps-{tag}-{i}', ids, 2))
+            r = submit(path, op(f'ps-{tag}-{i}', f'ps-{tag}-{i}', [1000 + i] + ids, 2))
             alone.append(r)
         solo_ttft = [r['stamps'][0] - r['submitted'] for r in alone]
         # a short main request runs first, so the three queue and start together
@@ -145,19 +147,17 @@ def main():
         blocker = threading.Thread(target=submit, args=(path, op(f'pb-{tag}', f'pb-{tag}', decode[0], 48, 0), out, 'b'))
         blocker.start()
         time.sleep(0.5)
-        recs = together(path, [op(f'pt-{tag}-{i}', f'pt-{tag}-{i}', ids, 2, 5) for i, ids in enumerate(longs)])
+        recs = together(path, [op(f'pt-{tag}-{i}', f'pt-{tag}-{i}', [2000 + i] + ids, 2, 5) for i, ids in enumerate(longs)])
         blocker.join()
         start = out['b']['stamps'][-1]
         last_first = max(r['stamps'][0] for r in recs)
         comb = [r['finish']['stats'].get('combined_prefill', 0) for r in recs]
-        same = [r['tokens'][:2] == alone[i]['tokens'][:2] for i, r in enumerate(recs)]
-        report['prefill'] = {'rows': [len(x) for x in longs], 'solo_ttft_s': solo_ttft,
-                             'together_all_first_s': last_first - start, 'combined_prefill': comb,
-                             'first_tokens_same': same}
-        print(f"prefill: {len(longs)} prompts of {[len(x) for x in longs]} tokens: alone {sum(solo_ttft):.2f} s in all "
+        report['prefill'] = {'rows': [len(x) + 1 for x in longs], 'solo_ttft_s': solo_ttft,
+                             'together_all_first_s': last_first - start, 'combined_prefill': comb}
+        print(f"prefill: {len(longs)} prompts of {[len(x) + 1 for x in longs]} tokens: alone {sum(solo_ttft):.2f} s in all "
               f"({', '.join(f'{x:.2f}' for x in solo_ttft)}); together every first token "
               f"{last_first - start:.2f} s after the main request ended ({sum(solo_ttft) / max(1e-9, last_first - start):.2f}x); "
-              f"combined {comb}; first tokens as alone {same}", flush=True)
+              f"combined {comb}", flush=True)
     # 4. priority
     if 'priority' not in a.skip:
         out = {}

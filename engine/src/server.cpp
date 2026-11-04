@@ -885,10 +885,11 @@ public:
     if (slot0_job) slot0_job->slot = 0;
     if (P.job) P.job->slot = k;
   }
-  // slot 0's content can be replaced: an idle conversation there goes to RAM (it was saved at its prompt's end)
+  // slot 0's content can be replaced: an idle conversation there is already in RAM (saved at its prompt's end). It is
+  // not saved again: with its answer it would extend that save, which remember() would then drop, and the next turn
+  // (or the same prompt again) could no longer load it (change 91's first bench: 0 loaded, an 8K prompt prefilled again)
   void drop_slot0() {
     if (slot0_job) throw std::logic_error("drop_slot0: a running job");
-    if (!prefix.inputs.empty() && !prefix.boundary) save_live();
     prefix = {};
   }
   void finish(Job &J, std::string reason, Json error = nullptr, Json stats = Json::object()) {

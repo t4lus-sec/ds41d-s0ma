@@ -79,6 +79,9 @@ struct PrefillData {
   ds41::HostBuffer* descriptors=nullptr;
   // s0ma change 86: the layer's job descriptors and route slots, and the waves', copied into VRAM (see pdesc)
   Device desc_dev, wave_dev;
+  // s0ma change 89: per variant (0 the main stream, else side lane v-1), a VRAM expert table holding the entries of the
+  // staged (and change-77 arena) experts that variant runs, each copied in just before its kernels
+  std::vector<Device> lane_table;
   Json layers=Json::array();
   std::array<std::unique_ptr<EngramAsync::Ticket>,2> engram;
   std::array<const char*,2> engram_raw{};
@@ -885,7 +888,25 @@ Json pmoe(int l,ds41e::prefill::Span span) {
     CK(cudaEventRecord(timer.end,s));
     dispatched+=todo.size();
   };
-  one=[&](ds41::ExpertId id,const ds41::DeviceExpert* table,cudaStream_t s){
+  // s0ma change 89: VRAM tables for the staged experts' entries, before the sweep (one() may run on the stager's thread)
+  if(prefill_device_desc()&&pf.lane_table.size()<variants)pf.lane_table.resize(variants);
+  if(prefill_device_desc())for(size_t v=0;v<variants;++v)if(!pf.lane_table[v].bytes)
+    try{pf.lane_table[v].resize(ds41::expert_count*sizeof(ds41::DeviceExpert));}
+    catch(const std::exception&){(void)cudaGetLastError();}   // that variant keeps reading the mapped table
+  one=[&](ds41::ExpertId id,const ds41::DeviceExpert* mapped_table,cudaStream_t s){
+    // s0ma change 89: a staged expert's table entry is host-mapped (the stager's, or the change-77 arena's), and every
+    // warp of every block of its kernels reads it: ~3,600 uncached PCIe reads an expert, ~20 million an 8K prompt,
+    // sharing the link with the copies (change 86's finding, the descriptors' smaller cousin). Its entry goes into this
+    // variant's VRAM table first, on the stream that runs its kernels; the same 64 bytes: exact.
+    const ds41::DeviceExpert* table=mapped_table;
+    if(mapped_table!=experts->table()&&prefill_device_desc()) {
+      const size_t v=size_t(prefill_variant(s));
+      if(v<pf.lane_table.size()&&pf.lane_table[v].bytes) {
+        auto *dev=pf.lane_table[v].as<ds41::DeviceExpert>();
+        pdesc(dev+id,mapped_table+id,sizeof(ds41::DeviceExpert),s);
+        table=dev;
+      }
+    }
     const size_t timer_at=timers_used++;auto &timer=*compute.at(timer_at);timer_lane.at(timer_at)=prefill_variant(s);
     ++dispatched;CK(cudaEventRecord(timer.start,s));
     // s0ma change 82: this expert through FP16 GEMMs on its weights decoded once (enough rows, scratch ready)

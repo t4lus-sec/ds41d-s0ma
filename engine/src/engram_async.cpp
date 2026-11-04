@@ -1,6 +1,7 @@
 #include "ds41/engram_async.hpp"
 #include "ds41/engram.h"
 #include <dlfcn.h>
+#include <cstdlib>
 #include <stdexcept>
 namespace ds41e {
 struct EngramAsync::Impl {
@@ -68,7 +69,13 @@ EngramAsync::EngramAsync(const std::string &library, const Config &c)
   cfg.hash_json = c.engram.c_str();
   cfg.integrity_json = c.receipt.c_str();
   cfg.cache_rows = 65536;
-  cfg.queue_depth = 48;
+  // s0ma change 95: reads in flight (DS41_ENGRAM_QD, 1..1024). 48 kept a fast NVMe
+  // under-filled for prefill-sized tickets; what is read, and in what order it lands, is unchanged.
+  cfg.queue_depth = 128;
+  if (const char *v = std::getenv("DS41_ENGRAM_QD")) {
+    const long qd = std::strtol(v, nullptr, 10);
+    if (qd >= 1 && qd <= 1024) cfg.queue_depth = uint32_t(qd);
+  }
   cfg.max_batch_rows = 4096;
   cfg.pin_memory = 1;
   impl->check(impl->open(&cfg, &impl->store));

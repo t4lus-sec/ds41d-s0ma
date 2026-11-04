@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "ds41/native_store.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -311,9 +312,54 @@ EngramHash::EngramHash(const std::string &path) : meta_(read_json(path)) {
           m.get<int64_t>() > INT64_MAX / (vocab - 1))
         throw std::runtime_error("Engram multiplier overflow/range");
   }
+  for (const auto &id : meta_.at("token_map")) map_.push_back(id.get<int64_t>());
+  pad_ = pad;
+  for (int i = 0; i < 2; ++i) {
+    const auto &layer = meta_.at("layers").at(size_t(i));
+    for (int k = 0; k < 4; ++k) mul_[i][k] = layer.at("multipliers").at(size_t(k)).get<int64_t>();
+    for (int c = 0; c < 24; ++c) {
+      primes_[i][c] = layer.at("primes").at(size_t(c)).get<int64_t>();
+      offsets_[i][c] = layer.at("offsets").at(size_t(c)).get<int64_t>();
+    }
+  }
+}
+void EngramHash::rows_into(int token, int64_t pos, bool text, int64_t *out1,
+                           int64_t *out14) {
+  if (token < 0 || size_t(token) >= map_.size() || pos < 0 ||
+      size_t(pos) > history_.size())
+    throw std::invalid_argument("hash token or position");
+  if (size_t(pos) == history_.size())
+    history_.push_back(0);
+  history_[pos] = text ? map_[size_t(token)] : -1;
+  int64_t values[4];
+  bool blocked = false;
+  for (int k = 0; k < 4; ++k) {
+    blocked = blocked || pos < k || (pos >= k && history_[pos - k] == -1);
+    values[k] = blocked ? pad_ : history_[pos - k];
+  }
+  for (int i = 0; i < 2; ++i) {
+    int64_t *out = i ? out14 : out1;
+    int64_t rolling = values[0] * mul_[i][0];
+    for (int k = 1; k < 4; ++k) {
+      rolling ^= values[k] * mul_[i][k];
+      for (int h = 0; h < 8; ++h) {
+        int col = (k - 1) * 8 + h;
+        out[col] = rolling % primes_[i][col] + offsets_[i][col];
+      }
+    }
+  }
 }
 std::vector<std::vector<int64_t>> EngramHash::rows(int token, int64_t pos,
                                                    bool text) {
+  static const bool fast = [] {
+    const char *v = std::getenv("DS41_ENGRAM_HASH_FAST");
+    return !(v && v[0] == '0');
+  }();
+  if (fast) {   // s0ma change 95
+    std::vector<std::vector<int64_t>> result(2, std::vector<int64_t>(24));
+    rows_into(token, pos, text, result[0].data(), result[1].data());
+    return result;
+  }
   if (token < 0 || token >= int(meta_.at("token_map").size()) || pos < 0 ||
       size_t(pos) > history_.size())
     throw std::invalid_argument("hash token or position");

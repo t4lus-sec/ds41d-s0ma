@@ -35,11 +35,18 @@ void validate_spans(uint64_t record_bytes,
 class EngramHash {
   Json meta_;
   std::vector<int64_t> history_;
+  // s0ma change 95: the metadata as plain numbers (read once; it was looked up in
+  // the JSON for every token, ~4 us a token). Same arithmetic, same row IDs.
+  std::vector<int64_t> map_;
+  int64_t pad_ = 0;
+  int64_t mul_[2][4] = {}, primes_[2][24] = {}, offsets_[2][24] = {};
 
 public:
   explicit EngramHash(const std::string &path);
   std::vector<std::vector<int64_t>> rows(int token, int64_t pos,
                                          bool text = true);
+  // s0ma change 95: the same 2x24 IDs, written to out1[24] (layer 1) and out14[24].
+  void rows_into(int token, int64_t pos, bool text, int64_t *out1, int64_t *out14);
   const std::vector<int64_t>& history() const { return history_; }
   void reset() { history_.clear(); }
   void truncate(size_t n) { if (n < history_.size()) history_.resize(n); }

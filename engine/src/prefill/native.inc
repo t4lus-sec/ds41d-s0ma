@@ -1114,14 +1114,31 @@ void pengram_rows(int layer,const char* raw,const int* rows,int count,Device& ch
 }
 // s0ma change 94: the prompt's embeddings in one launch a 32K rows, straight into pf.hidden and pf.previous_pre (the
 // same copies the per-row expand_embedding makes); image rows then overwritten row by row as before
+// s0ma change 95: the prompt's Engram row IDs, written in place (no per-token vectors).
+void phash_rows(PrefillData &pf,const std::vector<int>& input,const std::vector<uint8_t>* image) {
+  static const bool fast=[]{const char* v=std::getenv("DS41_ENGRAM_HASH_FAST");return !(v&&v[0]=='0');}();
+  if(!fast) {
+    for(size_t r=0;r<input.size();++r) {
+      auto ids=hash.rows(input[r],committed+int64_t(r),!(image&&(*image)[r]));
+      for(int j=0;j<2;++j)pf.rowids[j].insert(pf.rowids[j].end(),ids[j].begin(),ids[j].end());
+    }
+    return;
+  }
+  const size_t at0=pf.rowids[0].size(),at1=pf.rowids[1].size();
+  pf.rowids[0].resize(at0+input.size()*24);pf.rowids[1].resize(at1+input.size()*24);
+  for(size_t r=0;r<input.size();++r)
+    hash.rows_into(input[r],committed+int64_t(r),!(image&&(*image)[r]),
+        pf.rowids[0].data()+at0+r*24,pf.rowids[1].data()+at1+r*24);
+}
 void pembed_rows(PrefillData &pf,const std::vector<int>& input,const std::vector<const void*>* image_embed) {
   static const bool batched=[]{const char* v=std::getenv("DS41_PREFILL_EMBED_ROWS");return !(v&&v[0]=='0');}();
   if(batched&&pf.ids.bytes>=input.size()*4) {
     for(size_t first=0;first<input.size();first+=32768) {
       const size_t n=std::min<size_t>(32768,input.size()-first);
       CK(cudaMemcpyAsync(pf.ids.p,input.data()+first,n*4,cudaMemcpyHostToDevice,stream));
-      hotpath::embedding(w("embed.weight").data.p,pf.ids.as<int>(),pf.hidden.as<char>(first*HC*H*2),
-          pf.previous_pre.as<float>(first*4),int(n),stream);
+      static const bool wide=[]{const char* v=std::getenv("DS41_PREFILL_EMBED_WIDE");return !(v&&v[0]=='0');}();
+      (wide?hotpath::embedding_wide:hotpath::embedding)(w("embed.weight").data.p,pf.ids.as<int>(),   // s0ma change 95
+          pf.hidden.as<char>(first*HC*H*2),pf.previous_pre.as<float>(first*4),int(n),stream);
       CK(cudaGetLastError());
       CK(cudaStreamSynchronize(stream));   // (the host ids are read before the next part)
     }
@@ -1431,10 +1448,7 @@ std::vector<PrefillResult> prefill_multi(const std::vector<PrefillGroup>& groups
     in_step=true;graph_ready=false;
     for(auto &C:ctx) in(C,[&]{
       auto &pf=*pref;const auto &input=C.g->ids;
-      for(size_t r=0;r<input.size();++r) {
-        auto ids=hash.rows(input[r],committed+r,true);
-        for(int j=0;j<2;++j)pf.rowids[j].insert(pf.rowids[j].end(),ids[j].begin(),ids[j].end());
-      }
+      phash_rows(pf,input,nullptr);   // s0ma change 95
       if(async_engram)for(int j=0;j<2;++j)pf.engram[j]=async_engram->submit(j==0?1:14,pf.rowids[j]);
       pembed_rows(pf,input,nullptr);
       CK(cudaStreamSynchronize(stream));
@@ -1652,10 +1666,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
   PrefillResult result;result.begin_position=committed;result.consumed_rows=input.size();
   try {
     in_step=true;graph_ready=false;
-    for(size_t r=0;r<input.size();++r) {
-      auto ids=hash.rows(input[r],committed+r,!pf.image[r]);
-      for(int j=0;j<2;++j)pf.rowids[j].insert(pf.rowids[j].end(),ids[j].begin(),ids[j].end());
-    }
+    phash_rows(pf,input,&pf.image);   // s0ma change 95
     // Both whole-suffix tickets deduplicate globally. They start before layer0
     // and stay alive through their last H2D. Appends hash/submit only new IDs.
     if(async_engram)for(int j=0;j<2;++j)pf.engram[j]=async_engram->submit(j==0?1:14,pf.rowids[j]);

@@ -21,6 +21,25 @@ __global__ void embed(const B *table, const int *tokens, B *h, float *pre) {DS41
   if (i < 4 * H) h[row * 4 * H + i] = table[tokens[row] * H + i % H];
   if (i < 4) pre[row * 4 + i] = i == 0 ? 1.f : 0.f;
 }
+// s0ma change 95: one block a row; each table element read once, 16 bytes a load
+// (the table is host-mapped, so embed's four 2-byte reads crossed PCIe four times).
+// Same values to the same places: h[row][c][i] = table[token][i] for c in 0..3.
+constexpr int EMBED_V = H * 2 / 16, EMBED_T = 128, EMBED_K = EMBED_V / EMBED_T;
+static_assert(EMBED_V % EMBED_T == 0, "embedding row split");
+__global__ void __launch_bounds__(EMBED_T) embed_wide(const uint4 *__restrict__ table,
+    const int *__restrict__ tokens, uint4 *__restrict__ h, float *__restrict__ pre) {DS41_PDL_WAIT();
+  const int row = blockIdx.x;
+  const uint4 *src = table + size_t(tokens[row]) * EMBED_V;
+  uint4 *dst = h + size_t(row) * 4 * EMBED_V;
+  uint4 v[EMBED_K];
+#pragma unroll
+  for (int k = 0; k < EMBED_K; ++k) v[k] = src[threadIdx.x + k * EMBED_T];
+#pragma unroll
+  for (int k = 0; k < EMBED_K; ++k)
+#pragma unroll
+    for (int c = 0; c < 4; ++c) dst[c * EMBED_V + threadIdx.x + k * EMBED_T] = v[k];
+  if (threadIdx.x < 4) pre[row * 4 + threadIdx.x] = threadIdx.x == 0 ? 1.f : 0.f;
+}
 __global__ void gather(const uint8_t *x, const uint8_t *s, const float *w,
                        const int *source, const int *slots, uint8_t *out,
                        uint8_t *os, float *ow) {DS41_PDL_WAIT();
@@ -175,6 +194,11 @@ __global__ void route_plan_rows(const float *biased,int rows,int *ids,int *sourc
 void embedding(const void *table, const int *tokens, void *h, float *pre,
                int rows, cudaStream_t s) {
   embed<<<dim3(80, rows), 256, 0, s>>>((const B *)table, tokens, (B *)h, pre);
+}
+void embedding_wide(const void *table, const int *tokens, void *h, float *pre,
+                    int rows, cudaStream_t s) {
+  if (rows > 0)
+    embed_wide<<<rows, EMBED_T, 0, s>>>((const uint4 *)table, tokens, (uint4 *)h, pre);
 }
 void gather_routes(const uint8_t *x, const uint8_t *s, const float *w,
                    const int *source, const int *slots, uint8_t *out,

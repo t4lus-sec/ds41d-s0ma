@@ -4,6 +4,9 @@
 namespace ds41e::hotpath {
 void embedding(const void *table, const int *tokens, void *h, float *pre,
                int rows, cudaStream_t);
+// s0ma change 95: the same result, each table row read once with 16-byte loads (prefill).
+void embedding_wide(const void *table, const int *tokens, void *h, float *pre,
+                    int rows, cudaStream_t s);
 void gather_routes(const uint8_t *x, const uint8_t *scales,
                    const float *weights, const int *source, const int *slots,
                    uint8_t *out, uint8_t *out_scales, float *out_weights,

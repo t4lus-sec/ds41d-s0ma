@@ -262,6 +262,7 @@ void prefetch_loop(PrefillPrefetch &P) {
       }
       next:;
     } catch (const std::exception &e) {
+      (void)cudaGetLastError();   // s0ma change 108
       std::cerr << "prefill prefetch: " << e.what() << "\n";
     }
     { std::lock_guard<std::mutex> g(P.m); P.busy = false; }
@@ -794,6 +795,7 @@ Json pmoe(int l,ds41e::prefill::Span span) {
         W.x.resize(r*H*2);W.bw.resize(r*4);W.gate.resize(r*I*2);W.up.resize(r*I*2);W.act.resize(r*I*2);
         W.down.resize(r*H*2);W.rg.resize(r*H*2);W.ru.resize(r*H*2);W.rd.resize(r*I*2);W.rows=wave_rows;
       } catch(const std::exception &e) {
+        (void)cudaGetLastError();   // s0ma change 108: the failed cudaMalloc's error is not left for the next check
         std::cerr<<"prefill waves off for this prompt (scratch: "<<e.what()<<")\n";
         pf.waves_off=true;for(auto &X:pf.waves)X=PrefillData::Wave{};break;
       }
@@ -842,6 +844,7 @@ Json pmoe(int l,ds41e::prefill::Span span) {
         W.x.resize(r*H*2);W.bw.resize(r*4);W.gate.resize(r*I*2);W.up.resize(r*I*2);W.act.resize(r*I*2);
         W.down.resize(r*H*2);W.rg.resize(r*H*2);W.ru.resize(r*H*2);W.rd.resize(r*I*2);W.rows=wave_rows;
       } catch(const std::exception &e) {
+        (void)cudaGetLastError();   // s0ma change 108 (as above)
         std::cerr<<"prefill waves off for this prompt (scratch: "<<e.what()<<")\n";
         pf.waves_off=true;W=PrefillData::Wave{};
       }

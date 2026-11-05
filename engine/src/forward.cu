@@ -91,6 +91,11 @@ __global__ void zc_copy(const unsigned char *__restrict__ src, unsigned char *__
 }
 constexpr int H = 5120, I = 2304, V = 129280, HC = 4, RING = 134;
 void ck(int status, const char *op) {
+  // s0ma change 108: a CUDA error reported here is also taken off the runtime's last-error slot. Without that, a
+  // failure the caller catches and handles (a scratch cudaMalloc that falls back) stays behind and the next
+  // CK(cudaGetLastError()) after an unrelated launch reports it: 2026-11-05, "exl3_prefill_rotate(...): out of memory"
+  // after the prefill waves' scratch did not fit, which poisoned the drafter until a restart
+  if (status && status < 10000) (void)cudaGetLastError();
   if (status)
     throw std::runtime_error(std::string(op) + ": " +
                              (status < 10000

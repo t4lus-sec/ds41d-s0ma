@@ -21,7 +21,7 @@ namespace {
 // enqueued on a lane after a staged expert then queue behind that expert's copy (correct, but slower).
 bool ring_device_wait(){static const bool on=[]{const char*v=std::getenv("DS41_PREFILL_RING_DEVICE_WAIT");return v&&v[0]=='1';}();return on;}
 struct RingWait {double ms=0;uint64_t blocked=0;};
-void ck(cudaError_t e){if(e)throw std::runtime_error(cudaGetErrorString(e));}
+void ck(cudaError_t e){if(e){(void)cudaGetLastError();throw std::runtime_error(cudaGetErrorString(e));}}   // s0ma change 108
 double ms(){return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 struct Event {
  cudaEvent_t e=nullptr;

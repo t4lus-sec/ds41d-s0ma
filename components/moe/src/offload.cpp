@@ -17,7 +17,8 @@
 
 namespace ds41 {
 namespace {
-void ck(cudaError_t rc) { if (rc != cudaSuccess) throw std::runtime_error(cudaGetErrorString(rc)); }
+void ck(cudaError_t rc) {   // s0ma change 108: the error is also taken off the runtime's last-error slot
+    if (rc != cudaSuccess) { (void)cudaGetLastError(); throw std::runtime_error(cudaGetErrorString(rc)); } }
 using Clock = std::chrono::steady_clock;
 uint64_t ns(Clock::duration d) { return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count(); }
 }

@@ -26,12 +26,12 @@ def rows():
     return out
 
 
-def start(tmp, slots, delay=3, decline=False, name="", **extra):
+def start(tmp, slots, delay=3, decline=False, name="", args=(), **extra):
     path = Path(tmp) / f"s{slots}{'d' if decline else ''}{name}.sock"
     fixture = Path(tmp) / f"f{slots}{'d' if decline else ''}{name}.json"
     fixture.write_text(json.dumps({"schema": "ds41-replay-test-v1", "eos": 0, "logits": rows(),
                                    "delay_ms": delay, "live_slots": slots, "decline_multi": decline, **extra}))
-    proc = subprocess.Popen([binary, "serve", "--socket", str(path), "--replay-test", str(fixture), "--prefix-cache"],
+    proc = subprocess.Popen([binary, "serve", "--socket", str(path), "--replay-test", str(fixture), "--prefix-cache", *args],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     deadline = time.monotonic() + 5
     while not path.exists():
@@ -58,6 +58,16 @@ def request(path, obj, out=None, hold=None):
     if out is not None:
         out[obj["request_id"]] = events
     return events
+
+
+def control(path, obj):
+    sock = socket.socket(socket.AF_UNIX)
+    sock.settimeout(30)
+    sock.connect(str(path))
+    sock.sendall((json.dumps(obj) + "\n").encode())
+    line = sock.makefile("rb").readline()
+    sock.close()
+    return json.loads(line)
 
 
 def tokens(events):
@@ -369,4 +379,58 @@ with tempfile.TemporaryDirectory(prefix="ds41-conc-") as tmp:
         assert tokens(request(path, submit("tcb2", "tcb2", 5, [1, 2, 3]))) == alone
     finally:
         proc.terminate(); proc.wait(10)
-print("concurrency: same tokens alone and together, multi steps, priority, leaving clients, reuse, combined prefill, drafts in multi steps, probes, drafter captures passed")
+    # s0ma change 109: with --prefix-any-conversation, a side call or subagent whose prompt extends the main turn's no
+    # longer deletes the main turn's save; conversation_end drops one conversation (or every id under a prefix)
+    proc, path = start(tmp, 2, name="ends", args=("--prefix-any-conversation",), conversations=True)
+    try:
+        main_p = [3, 4, 5, 6, 7, 8]
+        ev = request(path, submit("e1", "main:s1", 3, main_p, 0))
+        assert ev[-1]["stats"]["prompt_cache"] == "none", ev[-1]["stats"]
+        request(path, submit("e2", "predict:s1", 3, main_p + [9, 9], 5))
+        request(path, submit("e3", "worker:alice:u1", 3, [11, 12, 13, 14], 10))
+        request(path, submit("e4", "worker:bob:u2", 3, [15, 16, 17], 10))
+        request(path, submit("e5", "", 3, [21, 22, 23], 10))
+        request(path, submit("e6", "", 3, [21, 22, 23, 24], 10))   # no ids: the earlier one goes, as before
+        listed = control(path, {"op": "conversations"})
+        assert listed["ok"], listed
+        ram = {(e["conversation_id"], e["tokens"]) for e in listed["ram"]}
+        assert ram == {("main:s1", 6), ("predict:s1", 8), ("worker:alice:u1", 4), ("worker:bob:u2", 3), ("", 4)}, ram
+        assert {e["conversation_id"]: e["priority"] for e in listed["ram"]}["worker:bob:u2"] == 10
+        # the main turn's continuation reuses its prompt (from a live slot or RAM)
+        ev = request(path, submit("e7", "main:s1", 3, main_p + [1, 2], 0))
+        st = ev[-1]["stats"]
+        assert st["prompt_cache"] in ("live", "ram") and st["reused_prompt_tokens"] >= 6, st
+        r = control(path, {"op": "conversation_end", "conversation_id": "worker:alice:u1"})
+        assert r["ok"] and r["dropped_ram"] == 1, r
+        r = control(path, {"op": "conversation_end", "conversation_id": "worker:alice:u1"})
+        assert r["ok"] and r["dropped_ram"] == 0, r
+        r = control(path, {"op": "conversation_end", "conversation_prefix": "worker:"})
+        assert r["ok"] and r["dropped_ram"] == 1, r
+        for bad in ({"op": "conversation_end"}, {"op": "conversation_end", "conversation_id": ""},
+                    {"op": "conversation_end", "conversation_prefix": "w"},
+                    {"op": "conversation_end", "conversation_id": "a", "conversation_prefix": "abcd"}):
+            r = control(path, bad)
+            assert not r["ok"] and r["error"], (bad, r)
+        left = {e["conversation_id"] for e in control(path, {"op": "conversations"})["ram"]}
+        assert not any(c.startswith("worker:") for c in left) and "main:s1" in left, left
+        # an ended conversation that goes on is saved again; a request still works after the controls
+        ev = request(path, submit("e8", "worker:alice:u1", 3, [11, 12, 13, 14, 1], 10))
+        assert ev[-1]["finish_reason"] == "length", ev[-1]
+        assert ev[-1]["stats"]["conversations_ended"] == 3, ev[-1]["stats"]
+    finally:
+        proc.terminate(); proc.wait(10)
+    # a full RAM budget evicts workers' saves (a worse priority) before the main turn's, least recently used first
+    os.environ["DS41_CONVERSATIONS_GIB"] = "0.0000042"   # about three saves of these prompts
+    try:
+        proc, path = start(tmp, 1, name="evict", args=("--prefix-any-conversation",), conversations=True)
+    finally:
+        del os.environ["DS41_CONVERSATIONS_GIB"]
+    try:
+        request(path, submit("v0", "main:s2", 3, [3, 4, 5, 6], 0))
+        for i in range(4):
+            request(path, submit(f"v{i + 1}", f"worker:w{i}:u", 3, [30 + i, 31, 32, 33], 10))
+        left = [e["conversation_id"] for e in control(path, {"op": "conversations"})["ram"]]
+        assert "main:s2" in left and "worker:w0:u" not in left and "worker:w3:u" in left, left
+    finally:
+        proc.terminate(); proc.wait(10)
+print("concurrency: same tokens alone and together, multi steps, priority, leaving clients, reuse, combined prefill, drafts in multi steps, probes, drafter captures, conversation ends, priority eviction passed")

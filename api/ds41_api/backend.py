@@ -58,6 +58,8 @@ class Usage:
     # Speculative decoding: drafted tokens and how many were accepted.
     draft_tokens: Optional[int] = None
     accepted_draft_tokens: Optional[int] = None
+    # s0ma change 109: where the reused prompt came from: none / live / ram / disk.
+    prompt_cache: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -70,6 +72,7 @@ class Usage:
             "decode_ms",
             "draft_tokens",
             "accepted_draft_tokens",
+            "prompt_cache",
         ):
             value = getattr(self, key)
             if value is not None:
@@ -86,6 +89,7 @@ class Usage:
             decode_ms=d.get("decode_ms"),
             draft_tokens=d.get("draft_tokens"),
             accepted_draft_tokens=d.get("accepted_draft_tokens"),
+            prompt_cache=d.get("prompt_cache"),
         )
 
 
@@ -222,6 +226,19 @@ class Backend(ABC):
 
     async def cancel(self, request_id: str) -> bool:
         return False
+
+    async def end_conversation(
+        self, conversation_id: Optional[str] = None, prefix: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """s0ma change 109: drop the saved prompt states of one conversation
+        (or of every id that starts with `prefix`). Returns the engine's reply:
+        {ok, dropped_ram, dropped_disk, dropped_queued, idle_slots, bytes}."""
+        return {"ok": False, "error": "unsupported"}
+
+    async def list_conversations(self) -> Dict[str, Any]:
+        """s0ma change 109: the saved conversations: {ok, ram: [...], disk: [...]}
+        (ids, token counts, bytes; never tokens)."""
+        return {"ok": False, "error": "unsupported"}
 
     async def close(self) -> None:
         """Release resources (connections, workers)."""

@@ -34,6 +34,7 @@ class FakeBackend(Backend):
         self._script_pos = 0
         self._live: Dict[str, bool] = {}
         self.submitted: List[dict] = []  # test introspection
+        self.ended: List[dict] = []      # s0ma change 109
 
     # -- scripting -------------------------------------------------------
 
@@ -135,6 +136,21 @@ class FakeBackend(Backend):
             )
         finally:
             self._live.pop(request_id, None)
+
+    async def end_conversation(
+        self, conversation_id: Optional[str] = None, prefix: Optional[str] = None
+    ) -> Dict[str, Any]:
+        if (conversation_id is None) == (prefix is None):
+            return {"ok": False, "error": "conversation_end takes conversation_id or conversation_prefix"}
+        self.ended.append({"conversation_id": conversation_id, "prefix": prefix})
+        hit = [s for s in self.submitted if s["conversation_id"] is not None and (
+            s["conversation_id"] == conversation_id if prefix is None else s["conversation_id"].startswith(prefix))]
+        return {"ok": True, "dropped_ram": len({s["conversation_id"] for s in hit}), "dropped_disk": 0,
+                "dropped_queued": 0, "idle_slots": 0, "bytes": 0}
+
+    async def list_conversations(self) -> Dict[str, Any]:
+        ids = sorted({s["conversation_id"] for s in self.submitted if s["conversation_id"] is not None})
+        return {"ok": True, "ram": [{"conversation_id": i, "tokens": 0, "bytes": 0} for i in ids], "disk": []}
 
     async def cancel(self, request_id: str) -> bool:
         if request_id in self._live:

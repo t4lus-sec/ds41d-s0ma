@@ -10,6 +10,8 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <optional>
 #include <sys/time.h>
 #include <cstring>
@@ -378,6 +380,8 @@ class Service {
     std::vector<float> logits;
     std::shared_ptr<Forward::Snapshot> state;
     size_t bytes = 0;
+    int priority = 0;   // s0ma change 109: the best (lowest) submit priority that saved or used it
+    std::chrono::steady_clock::time_point used = std::chrono::steady_clock::now();
   };
   std::list<Saved> saved;
   size_t saved_bytes = 0;
@@ -391,11 +395,41 @@ class Service {
     }();
     return b;
   }
-  void save_live() {
+  // s0ma change 109: an entry that a newer prompt extends goes only within its own conversation (or when either has
+  // no id). Lookups still take any conversation's prompt (prefix_any); this only keeps a side call or a subagent whose
+  // prompt extends the main turn's from deleting the main turn's save.
+  bool supersedes(const std::string &newer, const std::string &older) const {
+    return newer == older || (prefix_any && (newer.empty() || older.empty()));
+  }
+  // s0ma change 109: RAM eviction. Entries unused for DS41_CONVERSATIONS_KEEP_S (default 1800) go first, least
+  // recently used first; then the worst priority (the largest number: s0ma's workers) before a better one, least
+  // recently used first among equals. The newest entry never goes.
+  static std::chrono::seconds conversations_keep() {
+    static const auto v = [] {
+      const char *e = std::getenv("DS41_CONVERSATIONS_KEEP_S");
+      const long x = e && *e ? std::atol(e) : 1800;
+      return std::chrono::seconds(std::max(0L, x));
+    }();
+    return v;
+  }
+  std::list<Saved>::iterator eviction_victim() {
+    const auto stale = std::chrono::steady_clock::now() - conversations_keep();
+    auto victim = saved.end();
+    for (auto it = std::next(saved.begin()); it != saved.end(); ++it) {
+      if (victim == saved.end()) { victim = it; continue; }
+      const bool a = it->used < stale, b = victim->used < stale;
+      // later in the list is less recently used, so ties go to the later one
+      if (a != b ? a : it->priority >= victim->priority) victim = it;
+    }
+    return victim;
+  }
+  void save_live(int priority = 0) {
     const size_t budget = conversations_budget();
     if (!budget || prefix.inputs.empty()) return;
     for (auto it = saved.begin(); it != saved.end(); ++it)   // this very prompt is saved already (a retry)
       if ((prefix_any || it->conversation == prefix.conversation) && it->keys == prefix.keys) {
+        it->priority = std::min(it->priority, priority);
+        it->used = std::chrono::steady_clock::now();
         saved.splice(saved.begin(), saved, it);
         return;
       }
@@ -405,7 +439,7 @@ class Service {
       return;
     }
     if (!state) return;
-    Saved e{prefix.conversation, prefix.inputs, prefix.keys, prefix.logits, state, 0};
+    Saved e{prefix.conversation, prefix.inputs, prefix.keys, prefix.logits, state, 0, priority};
     if (disk_on()) disk_enqueue(e);   // s0ma change 81 (also when RAM cannot hold it)
     if (remember(std::move(e))) ++conversation_saves;
   }
@@ -416,7 +450,7 @@ class Service {
     if (!budget || e.bytes > budget) return false;
     // an earlier prompt of the same conversation that this one extends is no longer needed
     for (auto it = saved.begin(); it != saved.end();) {
-      if ((prefix_any || it->conversation == e.conversation) && it->keys.size() <= e.keys.size() &&
+      if (supersedes(e.conversation, it->conversation) && it->keys.size() <= e.keys.size() &&
           std::equal(it->keys.begin(), it->keys.end(), e.keys.begin())) {
         saved_bytes -= it->bytes;
         it = saved.erase(it);
@@ -425,8 +459,9 @@ class Service {
     saved_bytes += e.bytes;
     saved.push_front(std::move(e));
     while (saved_bytes > budget && saved.size() > 1) {
-      saved_bytes -= saved.back().bytes;
-      saved.pop_back();
+      auto victim = eviction_victim();
+      saved_bytes -= victim->bytes;
+      saved.erase(victim);
       ++conversation_evictions;
     }
     return true;
@@ -587,18 +622,28 @@ class Service {
     disk_writer = std::thread([this] { disk_loop(); });
   }
   uint64_t disk_bytes_all = 0;
+  // s0ma change 109: conversations ended (conversation_end) while their file may be in the writer's hands: such a file
+  // is deleted once written, not indexed
+  struct Ended {
+    std::string id;
+    bool prefix = false;
+    bool hit(const std::string &c) const { return prefix ? c.compare(0, id.size(), id) == 0 : c == id; }
+  };
+  std::vector<Ended> ended;
   // queued states are held beside the RAM list (each about its conversation's KV): at most a budget's worth, and a
   // queued prompt that this one extends is not written at all
   void disk_enqueue(const Saved &e) {
     std::lock_guard<std::mutex> l(disk_m);
     for (auto it = disk_jobs.begin(); it != disk_jobs.end();) {
       const auto &k = it->e.keys;
-      if ((prefix_any || it->e.conversation == e.conversation) && k.size() <= e.keys.size() &&
+      if (supersedes(e.conversation, it->e.conversation) && k.size() <= e.keys.size() &&
           std::equal(k.begin(), k.end(), e.keys.begin())) {
         disk_queued_bytes -= it->e.state->host_bytes;
         it = disk_jobs.erase(it);
       } else ++it;
     }
+    ended.erase(std::remove_if(ended.begin(), ended.end(), [&](const Ended &x) { return x.hit(e.conversation); }),
+                ended.end());   // the conversation goes on (a new one under an ended id)
     const size_t limit = std::max(conversations_budget(), size_t(1) << 30);
     if (disk_jobs.size() >= 4 || disk_queued_bytes + e.state->host_bytes > limit) { ++disk_skipped; return; }
     disk_queued_bytes += e.state->host_bytes;
@@ -675,9 +720,16 @@ class Service {
       if (!ok) { ++disk_failures; continue; }
       ++disk_writes;
       std::error_code ec;
+      if (std::any_of(ended.begin(), ended.end(), [&](const Ended &x) { return x.hit(e.conversation); })) {
+        std::filesystem::remove(path, ec);   // s0ma change 109: its conversation ended while it was written
+        ++disk_deletes;
+        for (auto it = disk.begin(); it != disk.end(); ++it)
+          if (it->path == path) { disk_bytes_all -= it->bytes; disk.erase(it); break; }
+        continue;
+      }
       // the files this one extends (and an older copy of itself) go
       for (auto it = disk.begin(); it != disk.end();) {
-        const bool extended = it->ours && (prefix_any || it->conversation == e.conversation) &&
+        const bool extended = it->ours && supersedes(e.conversation, it->conversation) &&
             it->keys.size() <= e.keys.size() && std::equal(it->keys.begin(), it->keys.end(), e.keys.begin());
         if (extended || it->path == path) {
           if (it->path != path) { std::filesystem::remove(it->path, ec); ++disk_deletes; }
@@ -861,6 +913,95 @@ public:
   std::vector<std::shared_ptr<Job>> running;
   std::thread scheduler;
   bool sched_stop = false;
+  std::vector<std::function<void()>> controls;   // s0ma change 109: run by the scheduler between steps
+  // s0ma change 109: conversation_end {conversation_id | conversation_prefix} drops that conversation's saved states
+  // (RAM, the disk writer's queue, its files) and puts its idle live slot first in line for reuse; conversations lists
+  // the saved ones (ids, lengths, tiers: never tokens). Both run on the scheduler thread, between steps.
+  Json control(const std::string &verb, const Json &op) {
+    std::string id;
+    bool by_prefix = false;
+    if (verb == "conversation_end") {
+      const bool exact = op.contains("conversation_id") && op.at("conversation_id").is_string(),
+                 pre = op.contains("conversation_prefix") && op.at("conversation_prefix").is_string();
+      if (exact == pre) return {{"ok", false}, {"error", "conversation_end takes conversation_id or conversation_prefix"}};
+      id = op.at(exact ? "conversation_id" : "conversation_prefix").get<std::string>();
+      by_prefix = pre;
+      if (id.empty() || id.size() > 4096 || (by_prefix && id.size() < 4))
+        return {{"ok", false}, {"error", "conversation id: 1..4096 bytes (a prefix at least 4)"}};
+    }
+    auto done = std::make_shared<std::promise<Json>>();
+    auto result = done->get_future();
+    {
+      std::lock_guard<std::mutex> l(sched_m);
+      if (sched_stop) return {{"ok", false}, {"error", "stopping"}};
+      controls.push_back([this, done, verb, id, by_prefix] {
+        try {
+          done->set_value(verb == "conversations" ? list_conversations() : end_conversation(id, by_prefix));
+        } catch (const std::exception &e) {
+          done->set_value(Json{{"ok", false}, {"error", e.what()}});
+        }
+      });
+    }
+    sched_cv.notify_all();
+    if (result.wait_for(std::chrono::minutes(10)) != std::future_status::ready)
+      return {{"ok", false}, {"error", "timed out waiting for the scheduler"}};
+    return result.get();
+  }
+  Json end_conversation(const std::string &id, bool by_prefix) {
+    const Ended match{id, by_prefix};
+    size_t ram = 0, disk_files = 0, queued = 0;
+    uint64_t bytes = 0;
+    for (auto it = saved.begin(); it != saved.end();)
+      if (match.hit(it->conversation)) {
+        saved_bytes -= it->bytes;
+        bytes += it->bytes;
+        ++ram;
+        it = saved.erase(it);
+      } else ++it;
+    size_t slots = 0;
+    for (auto &P : parked)
+      if (!P.job && !P.prefix.inputs.empty() && match.hit(P.prefix.conversation)) { P.used = 0; ++slots; }
+    if (disk_on()) {
+      std::lock_guard<std::mutex> l(disk_m);
+      for (auto it = disk_jobs.begin(); it != disk_jobs.end();)
+        if (match.hit(it->e.conversation)) {
+          disk_queued_bytes -= it->e.state->host_bytes;
+          ++queued;
+          it = disk_jobs.erase(it);
+        } else ++it;
+      std::error_code ec;
+      for (auto it = disk.begin(); it != disk.end();)
+        if (it->ours && match.hit(it->conversation)) {
+          std::filesystem::remove(it->path, ec);
+          ++disk_deletes;
+          ++disk_files;
+          bytes += it->bytes;
+          disk_bytes_all -= it->bytes;
+          it = disk.erase(it);
+        } else ++it;
+      ended.push_back(match);
+      if (ended.size() > 256) ended.erase(ended.begin());
+    }
+    ++conversations_ended;
+    return {{"ok", true}, {"dropped_ram", ram}, {"dropped_disk", disk_files}, {"dropped_queued", queued},
+            {"idle_slots", slots}, {"bytes", bytes}};
+  }
+  Json list_conversations() {
+    const auto t = std::chrono::steady_clock::now();
+    Json ram = Json::array(), files = Json::array();
+    for (auto &e : saved)
+      ram.push_back({{"conversation_id", e.conversation}, {"tokens", e.keys.size()}, {"bytes", e.bytes},
+                     {"priority", e.priority},
+                     {"idle_s", std::chrono::duration<double>(t - e.used).count()}});
+    if (disk_on()) {
+      std::lock_guard<std::mutex> l(disk_m);
+      for (auto &d : disk)
+        if (d.ours) files.push_back({{"conversation_id", d.conversation}, {"tokens", d.keys.size()}, {"bytes", d.bytes}});
+    }
+    return {{"ok", true}, {"ram", ram}, {"disk", files}, {"ram_bytes", saved_bytes},
+            {"ram_budget", conversations_budget()}};
+  }
+  uint64_t conversations_ended = 0;
   static bool batch_lower() {
     static const bool v = [] { const char *e = std::getenv("DS41_BATCH_LOWER"); return e && e[0] == '1'; }();
     return v;
@@ -903,7 +1044,8 @@ public:
     for (const auto &field : {
              std::pair<const char *, const char *>{"reused_prompt_tokens", "cached_prompt_tokens"},
              {"prefill_ms", "prefill_ms"}, {"generation_ms", "decode_ms"},
-             {"drafted", "draft_tokens"}, {"accepted", "accepted_draft_tokens"}})
+             {"drafted", "draft_tokens"}, {"accepted", "accepted_draft_tokens"},
+             {"prompt_cache", "prompt_cache"}})   // s0ma change 109
       if (stats.contains(field.first)) usage[field.second] = stats.at(field.first);
     send_json(J.fd, {{"type", "finish"}, {"finish_reason", reason}, {"usage", usage}, {"error", error},
                      {"stats", stats}});
@@ -933,6 +1075,10 @@ public:
           }
           if (!send_json(fd, {{"ok", found}}))
             break;
+          continue;
+        }
+        if (verb == "conversation_end" || verb == "conversations") {   // s0ma change 109
+          if (!send_json(fd, control(verb, op))) break;
           continue;
         }
         if (verb == "train_capture" && !train_capture_dir())   // s0ma change 99: lab only
@@ -1038,12 +1184,19 @@ public:
     --connections;
   }
   void schedule_loop() {
+    std::vector<std::function<void()>> todo;
     for (;;) {
       {
         std::unique_lock<std::mutex> l(sched_m);
         sched_cv.wait_for(l, std::chrono::milliseconds(10),
-                          [&] { return sched_stop || !queue.empty() || !running.empty(); });
-        if (sched_stop && queue.empty() && running.empty()) return;
+                          [&] { return sched_stop || !queue.empty() || !running.empty() || !controls.empty(); });
+        todo.swap(controls);
+      }
+      for (auto &c : todo) c();   // s0ma change 109: between steps, on the thread that owns the caches
+      todo.clear();
+      {
+        std::lock_guard<std::mutex> l(sched_m);
+        if (sched_stop && queue.empty() && running.empty() && controls.empty()) return;
         if (queue.empty() && running.empty()) continue;
       }
       try {
@@ -1721,8 +1874,12 @@ public:
           reused = prefix.inputs.size();
           rewound = loaded = true;
           ++conversation_loads;
-          if (file) { from_file = true; remember(std::move(*file)); }
-          else saved.splice(saved.begin(), saved, best);
+          if (file) { from_file = true; file->priority = J.priority; remember(std::move(*file)); }
+          else {
+            best->priority = std::min(best->priority, J.priority);   // s0ma change 109
+            best->used = std::chrono::steady_clock::now();
+            saved.splice(saved.begin(), saved, best);
+          }
         } catch (const std::exception &e) {
           std::cerr << "conversation load failed: " << e.what() << "\n";
           reused = 0;
@@ -1828,7 +1985,7 @@ public:
         prefix.boundary.reset(); prefix.boundary_len = 0;
       }
       // s0ma change 73 (96: not a one-token answer's, unless DS41_PROBE_SAVE=1: its prompt is not extended)
-      if (!cancelled() && (sampling.max_tokens > 1 || probe_save())) save_live();
+      if (!cancelled() && (sampling.max_tokens > 1 || probe_save())) save_live(J.priority);
     }
     J.prefill_end = now();
     J.prefill_counters = model->counters();
@@ -2109,6 +2266,8 @@ public:
     stats["acceptance"] = J.drafted ? double(J.accepted) / double(J.drafted) : 0.0;
     stats["conversation_loaded"] = J.loaded;     // s0ma change 73
     stats["conversation_from_disk"] = J.from_file;   // s0ma change 81
+    // s0ma change 109: where the reused part of the prompt came from
+    stats["prompt_cache"] = !J.reused ? "none" : J.from_file ? "disk" : J.loaded ? "ram" : "live";
     stats["priority"] = J.priority;              // s0ma change 91
     stats["multi_steps"] = J.multi_steps;
     stats["combined_prefill"] = J.combined;
@@ -2135,6 +2294,7 @@ public:
     stats["conversation_saves"] = conversation_saves;
     stats["conversation_loads"] = conversation_loads;
     stats["conversation_evictions"] = conversation_evictions;
+    stats["conversations_ended"] = conversations_ended;
     stats["copy_steps"] = J.copy_steps;          // s0ma change 72: suffix drafting
     stats["copy_drafted"] = J.copy_drafted;
     stats["copy_accepted"] = J.copy_accepted;
@@ -2327,6 +2487,7 @@ public:
     spark = j.value("spark", false);
     has_drafter = j.value("drafter", false);
     probes = j.value("probes", false);   // (the protocol tests of the one-by-one path keep it)
+    conversations = j.value("conversations", false);
     probe_ctx = j.value("probe_context", int64_t(1) << 20);
     probe_fit = j.value("probe_fit", size_t(1) << 20);
   }
@@ -2363,6 +2524,19 @@ public:
     return true;
   }
   void end_prompt(bool complete) override { if (spark && !complete) incomplete = true; }
+  // (s0ma change 109) "conversations": true saves and loads conversations (the position; 1 KiB each)
+  bool conversations = false;
+  std::shared_ptr<Snapshot> save_conversation() override {
+    if (!conversations || pending) return nullptr;
+    auto s = std::make_shared<Snapshot>();
+    s->position = int64_t(position);
+    s->host_bytes = 1024;
+    return s;
+  }
+  void load_conversation(const Snapshot &s) override {
+    if (!conversations || pending) throw std::logic_error("replay load_conversation");
+    position = size_t(s.position);
+  }
   bool supports_verify_multi() const override { return !parked_pos.empty(); }
   std::vector<std::vector<std::vector<float>>> verify_multi(const std::vector<VerifyGroup> &groups) override {
     if (pending || groups.empty()) throw std::logic_error("replay verify_multi");

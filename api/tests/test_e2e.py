@@ -390,3 +390,16 @@ def test_default_sampling_reaches_backend(server: ServerHandle):
     sampling = server.backend.submitted[-1]["sampling"]
     assert sampling.temperature == 1.0
     assert sampling.top_p == 1.0
+
+
+def test_conversations_end_endpoint(server):
+    """s0ma change 109: POST /v1/conversations/end reaches the backend; bad bodies are 400s."""
+    r = httpx.post(f"{server.base}/v1/conversations/end", json={"conversation_id": "worker:alice:u1"}, timeout=10)
+    assert r.status_code == 200 and r.json()["ok"], r.text
+    assert server.backend.ended == [{"conversation_id": "worker:alice:u1", "prefix": None}]
+    r = httpx.post(f"{server.base}/v1/conversations/end", json={"conversation_prefix": "worker:"}, timeout=10)
+    assert r.status_code == 200
+    for bad in ({}, {"conversation_id": 3}, {"conversation_id": "a", "conversation_prefix": "abcd"}):
+        r = httpx.post(f"{server.base}/v1/conversations/end", json=bad, timeout=10)
+        assert r.status_code == 400, (bad, r.text)
+    assert httpx.get(f"{server.base}/v1/conversations", timeout=10).json()["ok"]

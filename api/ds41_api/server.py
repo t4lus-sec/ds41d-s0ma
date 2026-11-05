@@ -173,6 +173,30 @@ def create_app(
     async def health() -> Dict[str, Any]:
         return {"ok": True, "model": model_id}
 
+    # s0ma change 109: a finished conversation's saved prompt states go
+    # (RAM, disk), so the live ones keep the room.
+    @app.post("/v1/conversations/end")
+    async def conversations_end(request: Request):
+        try:
+            body = await request.json()
+        except ValueError:
+            return _json_error(400, "invalid JSON body", "invalid_request_error")
+        if not isinstance(body, dict):
+            return _json_error(400, "body must be an object", "invalid_request_error")
+        cid, prefix = body.get("conversation_id"), body.get("conversation_prefix")
+        if (cid is None) == (prefix is None) or not isinstance(cid if cid is not None else prefix, str):
+            return _json_error(
+                400, "give conversation_id or conversation_prefix (a string)", "invalid_request_error"
+            )
+        reply = await backend.end_conversation(cid, prefix)
+        if not reply.get("ok"):
+            return _json_error(400, str(reply.get("error") or "refused"), "invalid_request_error")
+        return reply
+
+    @app.get("/v1/conversations")
+    async def conversations_list():
+        return await backend.list_conversations()
+
     @app.exception_handler(QueueFullError)
     async def queue_full_handler(request: Request, exc: QueueFullError):
         if request.url.path.startswith("/v1/messages"):
@@ -521,6 +545,8 @@ def create_app(
                 else 0
             },
         }
+        if usage is not None and usage.prompt_cache:   # s0ma change 109
+            block["prompt_tokens_details"]["cache_source"] = usage.prompt_cache
         if timing:
             block["ds41_timing"] = timing
         return block

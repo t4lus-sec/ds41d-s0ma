@@ -112,6 +112,40 @@ class SocketBackend(Backend):
             pass
         return False
 
+    async def _control_op(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """One control op on its own connection (s0ma change 109): the engine
+        answers one line, which may wait for its scheduler's current step."""
+        reader, writer = await asyncio.open_unix_connection(self.socket_path)
+        try:
+            writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+            await writer.drain()
+            raw = await asyncio.wait_for(reader.readline(), timeout=600.0)
+            if not raw:
+                return {"ok": False, "error": "engine closed the connection"}
+            reply = json.loads(raw.decode("utf-8"))
+            if isinstance(reply, dict) and reply.get("type") == "finish":   # an engine without the op
+                return {"ok": False, "error": reply.get("error") or "unsupported"}
+            return reply
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def end_conversation(
+        self, conversation_id: Optional[str] = None, prefix: Optional[str] = None
+    ) -> Dict[str, Any]:
+        op: Dict[str, Any] = {"op": "conversation_end"}
+        if conversation_id is not None:
+            op["conversation_id"] = conversation_id
+        if prefix is not None:
+            op["conversation_prefix"] = prefix
+        return await self._control_op(op)
+
+    async def list_conversations(self) -> Dict[str, Any]:
+        return await self._control_op({"op": "conversations"})
+
     async def close(self) -> None:
         if self._control_writer is not None:
             self._control_writer.close()
@@ -150,6 +184,16 @@ async def serve_socket(
                 )
                 await writer.drain()
                 return
+            if op.get("op") in ("conversation_end", "conversations"):   # s0ma change 109
+                if op["op"] == "conversations":
+                    reply = await backend.list_conversations()
+                else:
+                    reply = await backend.end_conversation(
+                        op.get("conversation_id"), op.get("conversation_prefix")
+                    )
+                writer.write((json.dumps(reply, ensure_ascii=False) + "\n").encode("utf-8"))
+                await writer.drain()
+                return
             if op.get("op") != "submit":
                 writer.write(
                     (
@@ -179,7 +223,8 @@ async def serve_socket(
                 return
 
             stream = await backend.submit(
-                token_ids, sampling, images, op.get("conversation_id"), request_id
+                token_ids, sampling, images, op.get("conversation_id"), request_id,
+                op.get("priority"),
             )
             async for event in stream:
                 writer.write(

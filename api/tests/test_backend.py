@@ -152,3 +152,32 @@ async def test_socket_error_on_empty_tokens(tmp_path: Path):
         await server_task
     except asyncio.CancelledError:
         pass
+
+
+async def test_socket_conversation_end(tmp_path: Path):
+    """s0ma change 109: conversation_end and conversations go over the socket; priority reaches the backend."""
+    fb = FakeBackend(tokenizer=CharTokenizer())
+    fb.add_script("ok")
+    sock = tmp_path / "backend.sock"
+    started = asyncio.Event()
+    server_task = asyncio.create_task(serve_socket(fb, sock, started))
+    await started.wait()
+    client = SocketBackend(sock)
+    for cid in ("main:s1", "worker:alice:u1", "worker:bob:u2"):
+        await collect(await client.submit([5, 6], SamplingParams(), conversation_id=cid, priority=10))
+    assert fb.submitted[-1]["priority"] == 10
+    listed = await client.list_conversations()
+    assert [e["conversation_id"] for e in listed["ram"]] == ["main:s1", "worker:alice:u1", "worker:bob:u2"]
+    r = await client.end_conversation("worker:alice:u1")
+    assert r["ok"] and r["dropped_ram"] == 1
+    r = await client.end_conversation(prefix="worker:")
+    assert r["ok"] and r["dropped_ram"] == 2
+    assert not (await client.end_conversation())["ok"]
+    assert fb.ended == [{"conversation_id": "worker:alice:u1", "prefix": None},
+                        {"conversation_id": None, "prefix": "worker:"}]
+    await client.close()
+    server_task.cancel()
+    try:
+        await server_task
+    except asyncio.CancelledError:
+        pass

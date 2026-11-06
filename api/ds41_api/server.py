@@ -292,8 +292,8 @@ def create_app(
         collector: TimingCollector,
         slot,
     ) -> AsyncIterator[str]:
-        parser = StreamParser(thinking_mode, request.stop_sequences())
         detok = encoder.detokenizer()
+        parser = StreamParser(thinking_mode, request.stop_sequences(), specials=detok.specials)
         include_usage = bool((request.stream_options or {}).get("include_usage"))
         want_logprobs = request.resolved_logprobs() > 0
         finish_reason: Optional[str] = None
@@ -417,8 +417,8 @@ def create_app(
         prompt_tokens: int,
         collector: TimingCollector,
     ) -> Dict[str, Any]:
-        parser = StreamParser(thinking_mode, request.stop_sequences())
         detok = encoder.detokenizer()
+        parser = StreamParser(thinking_mode, request.stop_sequences(), specials=detok.specials)
         want_logprobs = request.resolved_logprobs() > 0
         content_logprobs: List[Dict[str, Any]] = []
         completion_tokens = 0

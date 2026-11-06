@@ -86,8 +86,8 @@ async def run_generation(
     from .schemas import resolve_thinking_mode
 
     thinking_mode = resolve_thinking_mode(request.thinking)
-    parser = StreamParser(thinking_mode, request.stop_sequences())
     detok = encoder.detokenizer()
+    parser = StreamParser(thinking_mode, request.stop_sequences(), specials=detok.specials)
     timing = TimingCollector()
     timing.waited_in_queue(queue_wait_s)
     timing.submit_started()

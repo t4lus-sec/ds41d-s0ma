@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import encoding as enc
 from .backend import ImagePayload
+from .specials import CONTROL, LITERAL, MARK, Specials
 from .schemas import ChatCompletionRequest, resolve_thinking_mode
 
 # Model id reported by the server and matched in requests.
@@ -53,6 +54,25 @@ class Encoder:
         self.tokenizer = tokenizer
         # ds41_api.vision.VisionConfig when the checkpoint has a vision tower (image prompts), else None.
         self.vision = vision
+        # s0ma change 110: the tokenizer's special strings, kept apart from the same characters in text
+        # (None for a tokenizer without added special tokens, such as the tests' CharTokenizer)
+        self.specials: Optional[Specials] = None
+        self._special_ids: Dict[int, str] = {}   # control id -> its marker (the detokenizer's map)
+        self._added_ids: set = set()
+        self._plain: Dict[str, List[int]] = {}
+        self._plain_tokenizer: Any = None
+        decoder = getattr(tokenizer, "get_added_tokens_decoder", None)
+        if callable(decoder):
+            added = decoder()
+            strings = [t.content for t in added.values() if getattr(t, "special", False)]
+            strings += [s for s in CONTROL if tokenizer.token_to_id(s) is not None]
+            if strings:
+                self.specials = Specials(strings)
+                self._added_ids = set(added)
+                for s, marker in self.specials.mark.items():
+                    tid = tokenizer.token_to_id(s)
+                    if tid is not None:
+                        self._special_ids[tid] = marker
 
     @classmethod
     def from_file(cls, tokenizer_path: str, allow_remote_images: bool = True) -> "Encoder":
@@ -70,9 +90,56 @@ class Encoder:
     def encode_prompt(self, prompt: str) -> List[int]:
         """Prompt string (already contains all special tokens, including BOS)
         -> token ids. add_special_tokens=False keeps the encoder from adding
-        another BOS."""
-        enc_obj = self.tokenizer.encode(prompt, add_special_tokens=False)
-        return list(enc_obj.ids)
+        another BOS. The markers build_prompt left for special strings in the
+        request's text (s0ma change 110) become those strings as plain text."""
+        if self.specials is None or MARK not in prompt:
+            return list(self.tokenizer.encode(prompt, add_special_tokens=False).ids)
+        ids: List[int] = []
+        parts = re.split("(" + MARK + ".)", prompt, flags=re.DOTALL)
+        for k, part in enumerate(parts):
+            if not part:
+                continue
+            if k % 2:
+                literal = self.specials.string_of(part)
+                if literal is None:
+                    raise ValueError("prompt holds an unknown special-string marker")
+                ids += self._plain_ids(literal)
+            else:
+                ids += self.tokenizer.encode(part, add_special_tokens=False).ids
+        return ids
+
+    def _plain_ids(self, text: str) -> List[int]:
+        """A special string's characters as ordinary text: the tokenizer with
+        special tokens encoded as text when it can, else split until no added
+        token matches. Cached."""
+        hit = self._plain.get(text)
+        if hit is not None:
+            return hit
+        ids: Optional[List[int]] = None
+        if self._plain_tokenizer is None and hasattr(self.tokenizer, "to_str"):
+            try:
+                from tokenizers import Tokenizer
+
+                clone = Tokenizer.from_str(self.tokenizer.to_str())
+                clone.encode_special_tokens = True
+                self._plain_tokenizer = clone
+            except Exception:  # noqa: BLE001 - an older tokenizers: the split below
+                self._plain_tokenizer = False
+        if self._plain_tokenizer:
+            got = list(self._plain_tokenizer.encode(text, add_special_tokens=False).ids)
+            if not any(t in self._added_ids for t in got):
+                ids = got
+
+        def split(t: str) -> List[int]:
+            got = list(self.tokenizer.encode(t, add_special_tokens=False).ids)
+            if len(t) <= 1 or not any(i in self._added_ids for i in got):
+                return got
+            return split(t[:1]) + split(t[1:])
+
+        if ids is None:
+            ids = split(text)
+        self._plain[text] = ids
+        return ids
 
     def decode_ids(self, ids: Sequence[int]) -> str:
         return self.tokenizer.decode(list(ids), skip_special_tokens=False)
@@ -91,7 +158,7 @@ class Encoder:
         return None
 
     def detokenizer(self) -> "IncrementalDetokenizer":
-        return IncrementalDetokenizer(self.tokenizer)
+        return IncrementalDetokenizer(self.tokenizer, self._special_ids or None, self.specials)
 
     # -- request -> prompt ----------------------------------------------
 
@@ -113,6 +180,9 @@ class Encoder:
             )
 
         messages = copy.deepcopy(request.messages)
+        # s0ma change 110: special strings in the request's own text become markers (plain text in encode_prompt)
+        esc = self.specials.escape_tree if self.specials is not None else (lambda v: v)
+        messages = esc(messages)
         attach_tools = request.tools is not None and tool_choice != "none"
         # The reference encoder renders tools/response_format only on a
         # system-role messages[0] and silently drops them otherwise. The
@@ -125,14 +195,14 @@ class Encoder:
             messages.insert(0, {"role": "system", "content": ""})
         if messages:
             if attach_tools:
-                messages[0]["tools"] = request.tools
+                messages[0]["tools"] = esc(request.tools)
             if request.response_format is not None:
-                messages[0]["response_format"] = request.response_format
+                messages[0]["response_format"] = esc(request.response_format)
 
         prompt, media = enc.encode_messages(
             messages,
             thinking_mode=thinking_mode,
-            context=request.context,
+            context=esc(request.context),
             reasoning_effort=request.reasoning_effort,
             return_multi_modal_data=True,
         )
@@ -212,14 +282,26 @@ class IncrementalDetokenizer:
     across tokens) is held back until the sequence completes.
     """
 
-    def __init__(self, tokenizer: Any):
+    def __init__(self, tokenizer: Any, marks: Optional[Dict[int, str]] = None,
+                 specials: Optional[Specials] = None):
         self.tokenizer = tokenizer
         self._pending: List[int] = []
+        # s0ma change 110: control ids come out as markers, so the parser tells the model's </think> from the
+        # characters "</think>" in its text; give the parser `specials` to read them
+        self.marks = marks or {}
+        self.specials = specials if self.marks else None
+
+    def _text(self, ids: List[int]) -> str:
+        text = self.tokenizer.decode(ids, skip_special_tokens=False)
+        return text.replace(MARK, LITERAL) if self.marks else text
 
     def feed(self, token_id: int) -> str:
         """Add one token id, return any newly completed text ('' if none)."""
+        marker = self.marks.get(token_id)
+        if marker is not None:
+            return self.flush() + marker
         self._pending.append(token_id)
-        text = self.tokenizer.decode(self._pending, skip_special_tokens=False)
+        text = self._text(self._pending)
         if "\ufffd" in text:
             return ""
         self._pending = []
@@ -229,6 +311,6 @@ class IncrementalDetokenizer:
         """Return any remaining partial text (should be empty after EOS)."""
         if not self._pending:
             return ""
-        text = self.tokenizer.decode(self._pending, skip_special_tokens=False)
+        text = self._text(self._pending)
         self._pending = []
         return text

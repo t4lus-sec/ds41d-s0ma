@@ -24,6 +24,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import encoding as enc
+from .specials import Specials
 
 _TH_END = enc.thinking_end_token
 _EOS = enc.eos_token
@@ -49,8 +50,23 @@ def _new_call_id() -> str:
 
 
 class StreamParser:
-    def __init__(self, thinking_mode: str, stop_sequences: Optional[List[str]] = None):
+    def __init__(self, thinking_mode: str, stop_sequences: Optional[List[str]] = None,
+                 specials: Optional[Specials] = None):
         assert thinking_mode in ("thinking", "chat")
+        # s0ma change 110: with `specials` (the detokenizer's), the delimiters are the control tokens' markers,
+        # so the same characters written as text never end the reasoning or open a tool call; all output is
+        # unmarked again
+        self._specials = specials
+        mark = (lambda t: specials.mark.get(t, t)) if specials is not None else (lambda t: t)
+        d = mark(enc.dsml_token)
+        self._TH_END = mark(enc.thinking_end_token)
+        self._EOS = mark(enc.eos_token)
+        self._TC_START = "\n\n<" + d + enc.tool_calls_block_name
+        self._TC_END = "</" + d + enc.tool_calls_block_name + ">"
+        self._INVOKE_START = "<" + d + enc.tool_call_tag_name
+        self._INVOKE_END = "</" + d + enc.tool_call_tag_name
+        self._PARAM_START = "<" + d + enc.tool_parameter_tag_name
+        self._PARAM_END = "/" + d + enc.tool_parameter_tag_name
         self.thinking_mode = thinking_mode
         self.stops = [s for s in (stop_sequences or []) if s]
         self.state = "thinking" if thinking_mode == "thinking" else "content"
@@ -105,19 +121,24 @@ class StreamParser:
             deltas.extend(new_deltas)
             if not progressed:
                 break
-        return deltas
+        return self._out(deltas)
+
+    def _out(self, deltas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if self._specials is None:
+            return deltas
+        return [self._specials.unmark_tree(d) for d in deltas]
 
     def _step(self) -> Tuple[bool, List[Dict[str, Any]]]:
         buf = self.buffer
         state = self.state
 
         if state == "thinking":
-            pos, delim = self._earliest(buf, [_TH_END])
+            pos, delim = self._earliest(buf, [self._TH_END])
             if delim is not None:
                 return self._consume_reasoning(
-                    buf[:pos], buf, pos + len(_TH_END), "content"
+                    buf[:pos], buf, pos + len(self._TH_END), "content"
                 )
-            keep = self._holdback(buf, [_TH_END])
+            keep = self._holdback(buf, [self._TH_END])
             if keep < len(buf):
                 return self._consume_reasoning(
                     buf[: len(buf) - keep], buf, len(buf) - keep, "thinking"
@@ -125,15 +146,15 @@ class StreamParser:
             return False, []
 
         if state == "content":
-            candidates = [_TC_START, _EOS] + self.stops
+            candidates = [self._TC_START, self._EOS] + self.stops
             pos, delim = self._earliest(buf, candidates)
             if delim is not None:
                 out = buf[:pos]
                 self.content += out
                 self.buffer = buf[pos + len(delim):]
-                if delim == _TC_START:
+                if delim == self._TC_START:
                     self.state = "tc_pre"
-                elif delim == _EOS:
+                elif delim == self._EOS:
                     self.state = "done"
                 else:
                     self.stopped_on_stop = True
@@ -149,7 +170,7 @@ class StreamParser:
             return False, []
 
         if state == "tc_pre":
-            pos, delim = self._earliest(buf, [_INVOKE_START, _TC_END])
+            pos, delim = self._earliest(buf, [self._INVOKE_START, self._TC_END])
             if delim is not None:
                 prefix = buf[:pos]
                 if prefix != ">\n":
@@ -157,7 +178,7 @@ class StreamParser:
                         f"Tool call format error: expected '>\\n' but got {prefix!r}"
                     )
                 self.buffer = buf[pos + len(delim):]
-                if delim == _TC_END:
+                if delim == self._TC_END:
                     self.state = "after_tc"
                 else:
                     self._open_call()
@@ -166,7 +187,7 @@ class StreamParser:
             return False, []
 
         if state == "tc_name":
-            pos, delim = self._earliest(buf, [_PARAM_START, _INVOKE_END])
+            pos, delim = self._earliest(buf, [self._PARAM_START, self._INVOKE_END])
             if delim is not None:
                 header = buf[:pos]
                 m = _NAME_RE.findall(header)
@@ -185,7 +206,7 @@ class StreamParser:
                         }
                     ]
                 }
-                if delim == _INVOKE_END:
+                if delim == self._INVOKE_END:
                     close_delta = self._close_call()
                     self.state = "tc_pre"
                     return True, [delta, close_delta] if close_delta else [delta]
@@ -194,18 +215,18 @@ class StreamParser:
             return False, []
 
         if state == "tc_param":
-            pos = buf.find(_PARAM_END)
+            pos = buf.find(self._PARAM_END)
             if pos != -1:
                 param_text = buf[:pos]
                 frag = self._param_fragment(param_text)
                 self._args_fragments.append(frag)
-                self.buffer = buf[pos + len(_PARAM_END):]
+                self.buffer = buf[pos + len(self._PARAM_END):]
                 self.state = "tc_param_tail"
                 return True, [self._args_delta()]
             return False, []
 
         if state == "tc_param_tail":
-            pos, delim = self._earliest(buf, [_PARAM_START, _INVOKE_END])
+            pos, delim = self._earliest(buf, [self._PARAM_START, self._INVOKE_END])
             if delim is not None:
                 prefix = buf[:pos]
                 if prefix != ">\n":
@@ -213,7 +234,7 @@ class StreamParser:
                         f"Parameter format error: expected '>\\n' but got {prefix!r}"
                     )
                 self.buffer = buf[pos + len(delim):]
-                if delim == _INVOKE_END:
+                if delim == self._INVOKE_END:
                     close_delta = self._close_call()
                     self.state = "tc_pre"
                     return True, [close_delta] if close_delta else []
@@ -222,12 +243,12 @@ class StreamParser:
             return False, []
 
         if state == "after_tc":
-            pos = buf.find(_EOS)
+            pos = buf.find(self._EOS)
             if pos != -1:
-                self.buffer = buf[pos + len(_EOS):]
+                self.buffer = buf[pos + len(self._EOS):]
                 self.state = "done"
                 return True, []
-            hold = self._holdback(buf, [_EOS])
+            hold = self._holdback(buf, [self._EOS])
             junk = buf[: len(buf) - hold].strip("\n")
             if junk:
                 raise ValueError(f"Unexpected content after tool calls: {junk!r}")
@@ -314,7 +335,7 @@ class StreamParser:
             if delta:
                 deltas.append(delta)
         self.state = "done"
-        return deltas
+        return self._out(deltas)
 
     def message(self) -> Dict[str, Any]:
         """Final message in the reference parser's shape, plus OpenAI tool
@@ -327,9 +348,10 @@ class StreamParser:
             }
             for tc in self.tool_calls
         ]
-        return {
+        out = {
             "role": "assistant",
             "content": self.content,
             "reasoning_content": self.reasoning_content,
             "tool_calls": tool_calls,
         }
+        return self._specials.unmark_tree(out) if self._specials is not None else out

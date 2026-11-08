@@ -318,6 +318,15 @@ def patch_gib(env):
         return 0.0
 
 
+def config_reserve_gib(cfg):
+    """s0ma change 112: config.local.json's vram_reserve_gib (ds41.sh serve --embedder-gpu writes the embedder's
+    measured VRAM there), 0 when absent."""
+    try:
+        return max(0.0, float(cfg.get('vram_reserve_gib') or 0))
+    except (TypeError, ValueError):
+        raise SystemExit('vram_reserve_gib in config.local.json must be a number of GiB')
+
+
 def reserve_gib(env):
     """s0ma change 111: VRAM another process holds beside ds41d (s0ma's embedder on the GPU: DS41_VRAM_RESERVE_GIB), or
     the lab's stand-in for it (DS41_VRAM_BALLAST_GIB, which ds41d allocates itself), taken from the expert slots so
@@ -353,6 +362,8 @@ def environment(cfg, render=True):
     env = {k: v for k, v in os.environ.items() if not k.startswith(('DS41_', 'CUFILE_'))}
     env.pop('LD_PRELOAD', None)
     env.update(ENGINE_ENV)
+    if config_reserve_gib(cfg):   # s0ma change 112: serving beside the embedder on the GPU; a lab --env still wins
+        env.setdefault('DS41_VRAM_RESERVE_GIB', f'{config_reserve_gib(cfg):.2f}')
     if cfg.get('experts') in ('k2', 'mixed', 'sero'):
         env.update(K2_ENV)
     if cfg.get('experts') == 'sero':
@@ -523,8 +534,11 @@ def preflight(cfg):
                                    '--format=csv,noheader,nounits'], text=True).strip().splitlines()
     if len(gpu) != 1 or 'RTX PRO 6000 Blackwell' not in gpu[0] or int(gpu[0].split(',')[1]) < 97000:
         raise RuntimeError('This measured profile targets exactly one 96 GB RTX PRO 6000 Blackwell')
-    if int(gpu[0].split(',')[2]) > 2048:
-        raise RuntimeError('The GPU is in use; stop other GPU processes (the profile needs nearly all 96 GB)')
+    # s0ma change 112: a process ds41d serves beside (s0ma's embedder: config vram_reserve_gib) may hold its reserve
+    allow = 2048 + int(1024 * config_reserve_gib(cfg))
+    if int(gpu[0].split(',')[2]) > allow:
+        raise RuntimeError(f'The GPU is in use beyond {allow} MiB; stop other GPU processes (the profile needs nearly '
+                           'all 96 GB)')
     tier, mem = host_gib(cfg), meminfo()
     if tier < MIN_HOST_GIB:
         raise RuntimeError(f'The expert placement needs a RAM tier of at least {MIN_HOST_GIB} GiB '

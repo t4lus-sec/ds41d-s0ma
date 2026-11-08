@@ -324,6 +324,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
   bool mtp_exl3 = false;
   int mtp_bits = 0;
   double mtp_extra_gib = 0;                           // VRAM they gave back, for target expert slots
+  void *vram_ballast = nullptr;                       // s0ma change 111: DS41_VRAM_BALLAST_GIB, held for life
   // s0ma change 81: DS41_SPARK_COLD=ID,... (drafter experts, global ids 15360..15743): those experts stay out of
   // VRAM; the drafter's kernels read them in place from pinned host memory (zero-copy, ~54 GB/s), through a private
   // copy of the drafter's table. The same bytes and kernels: drafts unchanged. Their VRAM goes to target slots.
@@ -1016,6 +1017,21 @@ public:
       }
       if (const char *dry = std::getenv("DS41_LOOKAHEAD_DRYRUN")) lookahead_dryrun = std::string(dry) == "1";
       lookahead_sync = std::make_unique<Phase>();
+    }
+    // s0ma change 111: DS41_VRAM_BALLAST_GIB=N holds N GiB of device memory for the engine's life, as another process
+    // on the card would (s0ma's embedder), so the lab measures what that costs; run.py takes it from the expert slots
+    // as it would the embedder's
+    if (const char *b = std::getenv("DS41_VRAM_BALLAST_GIB"); b && *b) {
+      char *end = nullptr;
+      const double g = std::strtod(b, &end);
+      if (*end || !(g >= 0) || g > 16) throw std::invalid_argument("DS41_VRAM_BALLAST_GIB: 0..16 GiB");
+      if (g > 0) {
+        const size_t bytes = size_t(g * double(size_t(1) << 30)) / 4096 * 4096;
+        CK(cudaMalloc(&vram_ballast, bytes));
+        CK(cudaMemset(vram_ballast, 0, bytes));
+        CK(cudaDeviceSynchronize());
+        std::cerr << "VRAM ballast (DS41_VRAM_BALLAST_GIB): " << g << " GiB held for the engine's life\n";
+      }
     }
     reader = std::make_unique<ds41::DirectReader>(64);
     load_weights();

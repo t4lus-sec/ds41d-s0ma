@@ -318,6 +318,19 @@ def patch_gib(env):
         return 0.0
 
 
+def reserve_gib(env):
+    """s0ma change 111: VRAM another process holds beside ds41d (s0ma's embedder on the GPU: DS41_VRAM_RESERVE_GIB), or
+    the lab's stand-in for it (DS41_VRAM_BALLAST_GIB, which ds41d allocates itself), taken from the expert slots so
+    prompts keep the free VRAM they had."""
+    total = 0.0
+    for k in ('DS41_VRAM_RESERVE_GIB', 'DS41_VRAM_BALLAST_GIB'):
+        try:
+            total += max(0.0, float(env.get(k) or 0))
+        except ValueError:
+            raise SystemExit(f'{k} must be a number of GiB')
+    return total
+
+
 def graphs_gib(env):
     """s0ma change 103: the device memory DS41_GRAPHS=fixed|all takes (the cuBLAS handles' fixed 32 MiB workspace and
     ~400 instantiated graphs: 176 MiB less free at the first prefill, measured 2026-11-04), taken from the expert slots
@@ -390,7 +403,11 @@ def environment(cfg, render=True):
         # s0ma change 91: the parked conversations' arenas come out of these slots, so prefill keeps the free VRAM it
         # had (1 GiB less free pushed 8K prompts into two segments, change 25)
         extra = float(SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
-        extra = max(0.0, extra - parked_gib(cfg, env) - patch_gib(env) - graphs_gib(env) - cold_gib(env))
+        extra = extra - parked_gib(cfg, env) - patch_gib(env) - graphs_gib(env) - cold_gib(env) - reserve_gib(env)
+        if extra < 0:   # more than the extra slots hold: the rest would come out of the prompts' free VRAM
+            print(f'run.py: {-extra:.2f} GiB of the reserve is beyond the extra expert slots; prompts get that much '
+                  'less free VRAM', file=sys.stderr)
+        extra = max(0.0, extra)
         env.setdefault('DS41_EXPERT_EXTRA_GIB', f'{extra:.2f}')
     # s0ma change 79: the conversations kept in RAM (change 73) sized to the window: a saved conversation holds ~0.9 KB a
     # token (the four global layers' compressed KV and indexer keys up to its frontier, 890 B, and its ids) and 3 MB

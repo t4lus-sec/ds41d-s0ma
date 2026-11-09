@@ -652,7 +652,10 @@ def main() -> None:
         max_tokens_limit=max(1, args.max_tokens_limit),
     )
     app = create_app(backend, encoder, model_id=args.model, config=config)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    # s0ma change 113: idle keep-alive connections kept 120 s (uvicorn's default is 5). A client that pools
+    # connections longer (httpx, reqwest: 90 s) otherwise reuses one the server is closing that moment, and the
+    # request fails before it is sent ("error sending request", "Server disconnected without sending a response")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info", timeout_keep_alive=120)
 
 
 if __name__ == "__main__":

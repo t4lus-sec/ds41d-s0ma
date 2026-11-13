@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import encoding as enc
 from .backend import ImagePayload
+from .loopguard import strip_reasoning_loops
 from .specials import CONTROL, LITERAL, MARK, Specials
 from .schemas import ChatCompletionRequest, resolve_thinking_mode
 
@@ -182,6 +183,7 @@ class Encoder:
         messages = copy.deepcopy(request.messages)
         # s0ma change 110: special strings in the request's own text become markers (plain text in encode_prompt)
         esc = self.specials.escape_tree if self.specials is not None else (lambda v: v)
+        strip_reasoning_loops(messages)   # s0ma change 114: a cycle in an earlier turn's reasoning is cut
         messages = esc(messages)
         attach_tools = request.tools is not None and tool_choice != "none"
         # The reference encoder renders tools/response_format only on a

@@ -60,6 +60,8 @@ class Usage:
     accepted_draft_tokens: Optional[int] = None
     # s0ma change 109: where the reused prompt came from: none / live / ram / disk.
     prompt_cache: Optional[str] = None
+    # s0ma change 114: what the loop guard did, when it did anything.
+    loop_guard: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -73,6 +75,7 @@ class Usage:
             "draft_tokens",
             "accepted_draft_tokens",
             "prompt_cache",
+            "loop_guard",
         ):
             value = getattr(self, key)
             if value is not None:
@@ -90,6 +93,7 @@ class Usage:
             draft_tokens=d.get("draft_tokens"),
             accepted_draft_tokens=d.get("accepted_draft_tokens"),
             prompt_cache=d.get("prompt_cache"),
+            loop_guard=d.get("loop_guard"),
         )
 
 

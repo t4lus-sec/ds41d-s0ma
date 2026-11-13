@@ -46,6 +46,7 @@ from .backend import Backend, FinishEvent, SamplingParams, TokenEvent
 from .encoder import CharTokenizer, DEFAULT_MODEL_ID, Encoder
 from .vision import expand_prompt_async
 from .fake_backend import FakeBackend
+from .loopguard import LoopGuardBackend
 from .parser import StreamParser
 from .schemas import ChatCompletionRequest, resolve_thinking_mode
 from .socket_backend import SocketBackend
@@ -126,6 +127,7 @@ def create_app(
 ) -> FastAPI:
     cfg = config or ServerConfig()
     gate = RequestGate(cfg)
+    backend = LoopGuardBackend.wrap(backend, encoder)   # s0ma change 114
     app = FastAPI(title="DS41 API", version="0.2.0")
 
     @app.middleware("http")
@@ -547,6 +549,8 @@ def create_app(
         }
         if usage is not None and usage.prompt_cache:   # s0ma change 109
             block["prompt_tokens_details"]["cache_source"] = usage.prompt_cache
+        if usage is not None and usage.loop_guard:   # s0ma change 114
+            block["ds41_loop_guard"] = usage.loop_guard
         if timing:
             block["ds41_timing"] = timing
         return block

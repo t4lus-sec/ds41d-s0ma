@@ -415,10 +415,11 @@ def environment(cfg, render=True):
         # had (1 GiB less free pushed 8K prompts into two segments, change 25)
         extra = float(SERO_EXTRA_GIB if cfg['max_context'] <= SERO_MAX_CONTEXT else SERO_EXTRA_GIB_1M)
         extra = extra - parked_gib(cfg, env) - patch_gib(env) - graphs_gib(env) - cold_gib(env) - reserve_gib(env)
-        if extra < 0:   # more than the extra slots hold: the rest would come out of the prompts' free VRAM
-            print(f'run.py: {-extra:.2f} GiB of the reserve is beyond the extra expert slots; prompts get that much '
-                  'less free VRAM', file=sys.stderr)
-        extra = max(0.0, extra)
+        # s0ma change 115: below zero (the embedder's reserve at a 1M context) ds41d takes the rest from the slots Sero's
+        # dense set and the drafter gave back; clamped to zero it came out of free VRAM, and at 1M there is none: OOM
+        if extra < 0:
+            print(f'run.py: {-extra:.2f} GiB of the reserve is beyond run.py\'s extra expert slots; ds41d takes it from '
+                  'the slots its dense set and drafter give back', file=sys.stderr)
         env.setdefault('DS41_EXPERT_EXTRA_GIB', f'{extra:.2f}')
     # s0ma change 79: the conversations kept in RAM (change 73) sized to the window: a saved conversation holds ~0.9 KB a
     # token (the four global layers' compressed KV and indexer keys up to its frontier, 890 B, and its ids) and 3 MB

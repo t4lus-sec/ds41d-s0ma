@@ -3258,10 +3258,17 @@ private:
     if (const char *x = std::getenv("DS41_EXPERT_EXTRA_GIB"); x && *x) {
       char *end = nullptr;
       extra_gib = std::strtod(x, &end);
-      if (*end || !(extra_gib >= 0) || extra_gib > 64) throw std::invalid_argument("DS41_EXPERT_EXTRA_GIB: 0..64 GiB");
+      // s0ma change 115: negative takes that much back from the slots below (run.py's reserve for another process on
+      // the card, the embedder, beyond its own extra: at a 1M context its 2.4 GiB holds only ~1.4 of the 2.4 reserved)
+      if (*end || !(extra_gib >= -64) || extra_gib > 64) throw std::invalid_argument("DS41_EXPERT_EXTRA_GIB: -64..64 GiB");
     }
     extra_gib += dense_extra_gib;   // s0ma change 34: the VRAM Sero's dense tensors gave back
     extra_gib += mtp_extra_gib;     // s0ma change 49: and the drafter's EXL3 experts
+    if (extra_gib < 0) {
+      std::cerr << "DS41_EXPERT_EXTRA_GIB: " << -extra_gib << " GiB more than the extra expert slots hold; it comes out "
+                   "of free VRAM\n";
+      extra_gib = 0;
+    }
     const char *cw_env = std::getenv("DS41_CLASS_WEIGHTS");
     if ((cw_env && *cw_env) || extra_gib > 0) {
       const char *cw = cw_env && *cw_env ? cw_env : "";

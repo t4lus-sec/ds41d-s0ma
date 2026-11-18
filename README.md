@@ -1,7 +1,7 @@
 # ds41d for s0ma: DeepSeek-V4.1-Flash-1017 at ~80 tok/s on one RTX PRO 6000
 
 **This is a fork of [ds41d](https://github.com/SSHdotCodes/deepseek-v4.1-flash-pro6000)** (SSHdotCodes, MIT),
-pinned at upstream commit `5b0ce26`, with 115 changes on top. It serves the s0ma agent harness. Upstream's README
+pinned at upstream commit `5b0ce26`, with 123 changes on top. It serves the s0ma agent harness. Upstream's README
 follows [below](#upstream-readme), unchanged.
 
 The model quant is **[0xSero's EXL3 2.7 bpw quant of DeepSeek-V4.1-Flash-1017](https://huggingface.co/0xSero/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw)**.
@@ -27,13 +27,17 @@ and 22.
 | this fork, change 25, 64 GB RAM | 0xSero 2.7 bpw | 38.1 tok/s | mean 7.9 s |
 | this fork, change 69, 128 GB RAM | 0xSero 2.7 bpw | 81.3 tok/s | 8K cold: 5.5 s; mean 2.7 s |
 | this fork, change 97 | 0xSero 2.7 bpw | ~80 tok/s | 8K cold: ~3.3 s; mean 1.11 s |
-| **this fork, change 111** (3 interleaved rounds) | **0xSero 2.7 bpw** | **79.2 tok/s** | **mean 1.13 s** |
+| this fork, change 111 (3 interleaved rounds) | 0xSero 2.7 bpw | 79.2 tok/s | mean 1.13 s |
 | the same, with 2 GiB held for an embedding model on the GPU | 0xSero 2.7 bpw | 78.0 tok/s | mean 1.20 s |
+| **this fork, change 123** (3 interleaved rounds), 2.4 GiB held for an embedding model | **0xSero 2.7 bpw** | **79.3 tok/s** | **mean 1.10 s** |
 
 **How to read the table:**
 - **Decode** includes thinking tokens.
-- **What the change 111 figure is made of:** a verify step takes 26.3 ms and drafting 2.3 ms. 74% of draft
-  tokens are accepted.
+- **What the change 123 figure is made of:** a verify step takes 26.2 ms and drafting 2.3 ms. 74% of draft
+  tokens are accepted. Against change 122 with its two decode switches off, the same rounds measured 77.6 tok/s and
+  26.9 ms a verify step, with identical tokens.
+- **Long prompts** (changes 117 to 120, `lab long` at a 1M-token context): first token for a cold 128K-token prompt
+  went from 75.4 s to 48.7 s, 64K from 34.1 to 21.1 s, 32K from 15.7 to 10.6 s.
 - **Mean first token** averages all six prompts. Upstream reports only cold prompts.
 - **The whole bank lives in VRAM and RAM.** At 128 GB, 0xSero's experts fit in VRAM plus the pinned RAM tier, so
   decode reads no experts from the NVMe drive. Engram's n-gram rows are still read from it.
@@ -91,6 +95,7 @@ The full list is in `git log 5b0ce26..`: one commit per change, each with what i
 - Drafts copied from the conversation's own tokens (suffix drafting).
 - Row batching.
 - Selective CUDA graphs with PDL.
+- EXL3 decode kernels with deeper weight prefetch, and a layer's gate and up projections in one launch.
 - GPU route planning.
 - Top-p on the host without a vocabulary sort.
 - Full residency at load whenever the RAM tier can hold the bank.
@@ -99,7 +104,8 @@ The full list is in `git log 5b0ce26..`: one commit per change, each with what i
 - Staged experts spread over four lanes, in grouped launches.
 - Engram reads batched and deeper.
 - One-row-per-warp routing.
-- The prefill reserve lent to expert slots during decode.
+- The prefill reserve lent to expert slots during decode, and expert slots carved for long prompts' scratch.
+- Engram reads merged into larger runs over several readers, and read ahead for a prompt's later segments.
 - A prompt's drive reads admitted into the RAM tier as they pass.
 
 **Serving:**

@@ -419,6 +419,12 @@ def environment(cfg, render=True):
         # 18.9-19.1 s first token; it also holds the next segments' rows that change 119 reads ahead. A lab
         # --env DS41_ENGRAM_CACHE_ROWS=65536 is the old size
         env.setdefault('DS41_ENGRAM_CACHE_ROWS', '4194304')
+        # s0ma change 123: change 122's two EXL3 decode switches on (exact: the same math in the same order). lab ab
+        # 2026-11-18, 3 rounds each, sero, seeds 21 and 22: 77.64 -> 79.33 tok/s (+2.2%; every B run above every A
+        # run), verify 26.87 -> 26.23 ms a step, tokens 14/14 identical. A lab --env DS41_EXL3_PF=4 or
+        # --env DS41_EXL3_GU=0 turns one off
+        env.setdefault('DS41_EXL3_PF', '8')
+        env.setdefault('DS41_EXL3_GU', '1')
         # s0ma change 58: up to 8 GiB a prompt of the experts its last 256 rows routed and its sweep read from the drive,
         # into the RAM tier as they pass (change 57). Seed 22, 48 GiB tier: 41.2-42.8 -> 45.07 tok/s (three runs of
         # the build before), NVMe misses 7,842-7,879 -> 6,527, verify 54.1 -> 51.0 ms a step, tokens 7/7 identical.

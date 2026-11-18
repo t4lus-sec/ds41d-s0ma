@@ -99,6 +99,10 @@ struct PrefillOptions {
   // The prompt's images at absolute positions, sorted and disjoint; rows outside [committed, committed+n)
   // are ignored, so the whole list can be passed with every segment.
   const std::vector<ImageSpan> *images = nullptr;
+  // s0ma change 119: the prompt's tokens after this segment (the server's later segments). Their Engram rows are read
+  // into the store's row cache behind this segment's own, so the next segments find them there. Rows only: no state.
+  const int *lookahead = nullptr;
+  size_t lookahead_count = 0;
 };
 // s0ma change 91: a combined prefill refused before it changed any state (Forward::prefill_multi)
 struct PrefillDeclined : std::runtime_error { using std::runtime_error::runtime_error; };

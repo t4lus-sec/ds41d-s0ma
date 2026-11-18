@@ -444,6 +444,9 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::unique_ptr<ds41::HostBuffer> pages, host;
   std::unique_ptr<EngramAsync> async_engram;
   std::array<std::unique_ptr<EngramAsync::Ticket>, 2> engram_tickets;
+  // s0ma change 119: a segment's tickets for the prompt's later rows (their reads fill the store's cache), and the
+  // previous segment's, released once this segment's own reads (queued after them) are done
+  std::vector<std::unique_ptr<EngramAsync::Ticket>> engram_ahead, engram_ahead_old;
   Json initial_engram_stats, host_cache_policy;
   Json prefill_summary=Json::object();
   std::map<int, std::unique_ptr<Global>> globals;

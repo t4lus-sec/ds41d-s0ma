@@ -7,6 +7,7 @@ namespace ds41e {
 struct EngramAsync::Impl {
   void *library = nullptr;
   ds41_engram_store *store = nullptr;
+  uint64_t cache_rows = 0;   // s0ma change 119
   decltype(&ds41_engram_open) open;
   decltype(&ds41_engram_close) close;
   decltype(&ds41_engram_submit) submit;
@@ -84,7 +85,9 @@ EngramAsync::EngramAsync(const std::string &library, const Config &c)
   cfg.max_batch_rows = 4096;
   cfg.pin_memory = 1;
   impl->check(impl->open(&cfg, &impl->store));
+  impl->cache_rows = cfg.cache_rows;
 }
+uint64_t EngramAsync::cache_rows() const { return impl->cache_rows; }
 EngramAsync::Ticket::Ticket(std::shared_ptr<Impl> p, void *t)
     : owner(std::move(p)), ticket(t) {}
 EngramAsync::Ticket::~Ticket() {

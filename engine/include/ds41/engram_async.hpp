@@ -22,6 +22,7 @@ public:
   EngramAsync(const std::string &library, const Config &);
   std::unique_ptr<Ticket> submit(int layer, const std::vector<int64_t> &rows);
   void dequant(const void *raw_device, void *bf16, int rows, void *stream);
+  uint64_t cache_rows() const;   // s0ma change 119: the store's row cache, in rows
   Json stats() const;
 };
 } // namespace ds41e

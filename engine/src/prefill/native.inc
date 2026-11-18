@@ -1133,6 +1133,26 @@ void phash_rows(PrefillData &pf,const std::vector<int>& input,const std::vector<
     hash.rows_into(input[r],committed+int64_t(r),!(image&&(*image)[r]),
         pf.rowids[0].data()+at0+r*24,pf.rowids[1].data()+at1+r*24);
 }
+// s0ma change 119: the Engram rows of the prompt's next `n` tokens (from absolute position pos), submitted as tickets
+// whose reads land in the store's row cache (DS41_ENGRAM_CACHE_ROWS); the next segment's own tickets then find them
+// there instead of on the drive. As many tokens as 90% of the cache holds (48 rows a token, both layers), none when it
+// holds under 8,192 tokens' worth (the default 65,536-row cache: ~1,200). The hash history is put back as it was: the next segment hashes these tokens again.
+// DS41_ENGRAM_READ_AHEAD=0 turns it off.
+size_t engram_ahead_rows=0,engram_ahead_tickets=0;
+void engram_read_ahead(const int* ids,size_t n,int64_t pos) {
+  static const bool on=[]{const char* v=std::getenv("DS41_ENGRAM_READ_AHEAD");return !(v&&v[0]=='0');}();
+  if(!on)return;
+  const size_t most=size_t(async_engram->cache_rows()*9/10/48);
+  if(most<8192)return;
+  n=std::min(n,most);
+  std::vector<int64_t> r1(n*24),r14(n*24);
+  const size_t keep=hash.history().size();
+  for(size_t i=0;i<n;++i)hash.rows_into(ids[i],pos+int64_t(i),true,r1.data()+i*24,r14.data()+i*24);
+  hash.truncate(keep);
+  engram_ahead.push_back(async_engram->submit(1,r1));
+  engram_ahead.push_back(async_engram->submit(14,r14));
+  engram_ahead_rows+=n;engram_ahead_tickets+=2;
+}
 void pembed_rows(PrefillData &pf,const std::vector<int>& input,const std::vector<const void*>* image_embed) {
   static const bool batched=[]{const char* v=std::getenv("DS41_PREFILL_EMBED_ROWS");return !(v&&v[0]=='0');}();
   if(batched&&pf.ids.bytes>=input.size()*4) {
@@ -1733,6 +1753,11 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
     // Both whole-suffix tickets deduplicate globally. They start before layer0
     // and stay alive through their last H2D. Appends hash/submit only new IDs.
     if(async_engram)for(int j=0;j<2;++j)pf.engram[j]=async_engram->submit(j==0?1:14,pf.rowids[j]);
+    // s0ma change 119: the later segments' Engram rows read ahead into the store's cache, behind this segment's own
+    for(auto &t:engram_ahead)engram_ahead_old.push_back(std::move(t));
+    engram_ahead.clear();
+    if(async_engram&&options.lookahead&&options.lookahead_count&&!(options.images&&!options.images->empty()))
+      engram_read_ahead(options.lookahead,options.lookahead_count,committed+int64_t(input.size()));
     mark("hash");
     // Start I/O before enqueueing prompt-sized embedding work as well.
     pembed_rows(pf,input,&image_embed);   // s0ma change 94
@@ -1847,6 +1872,7 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
       std::cerr<<"\n";
     }
     mark("layers");
+    engram_ahead_old.clear();   // s0ma change 119: done (queued before this segment's own tickets, which are)
     if(train_all) {   // s0ma change 99: every row's head, 8 rows a launch, reduced to its top-k on the device
       const int K=train_k;Device xb{8*H*2},fb{8*H*4},lb{size_t(8)*V*4},tid{size_t(8)*K*4},tlp{size_t(8)*K*4},trest{8*4};
       train_ids.resize(input.size()*size_t(K));train_lp.resize(input.size()*size_t(K));train_rest.resize(input.size());
@@ -1913,7 +1939,8 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
     {
       size_t free=0,total=0;CK(cudaMemGetInfo(&free,&total));
       std::cerr<<"prefill phases: rows "<<input.size()<<", free "<<(free>>20)<<" MiB, lent "<<lent_chunks<<" of "
-               <<lend_chunks_total<<" chunks, Engram waits "<<engram_wait_note<<" ms, ms:";
+               <<lend_chunks_total<<" chunks, Engram waits "<<engram_wait_note<<" ms (read ahead "<<engram_ahead_rows
+               <<" tokens' rows so far), ms:";
       double at=begin_ms;
       for(auto &[name,t]:phase_marks){std::cerr<<" "<<name<<" "<<std::fixed<<std::setprecision(1)<<t-at;at=t;}
       std::cerr<<std::defaultfloat<<std::setprecision(6)<<"\n";

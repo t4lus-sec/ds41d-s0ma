@@ -1942,6 +1942,10 @@ public:
       options.dense_batch_rows = prefill_dense_batch;
       options.warm = next + rows == ids.size();
       options.images = images.empty() ? nullptr : &images;
+      if (next + rows < ids.size()) {   // s0ma change 119: the later segments' tokens, for their Engram rows
+        options.lookahead = ids.data() + next + rows;
+        options.lookahead_count = ids.size() - (next + rows);
+      }
       std::vector<int> segment(ids.begin() + next, ids.begin() + next + rows);
       auto result = model->prefill(segment, options);
       if (result.begin_position != int64_t(next) ||

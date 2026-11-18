@@ -1,4 +1,153 @@
-# DeepSeek-V4.1-Flash-1017 on one RTX PRO 6000
+# ds41d for s0ma: DeepSeek-V4.1-Flash-1017 at ~80 tok/s on one RTX PRO 6000
+
+**This is a fork of [ds41d](https://github.com/SSHdotCodes/deepseek-v4.1-flash-pro6000)** (SSHdotCodes, MIT),
+pinned at upstream commit `5b0ce26`, with 115 changes on top. It serves the s0ma agent harness. Upstream's README
+follows [below](#upstream-readme), unchanged.
+
+The model quant is **[0xSero's EXL3 2.7 bpw quant of DeepSeek-V4.1-Flash-1017](https://huggingface.co/0xSero/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw)**.
+This fork adds the engine support to run it: per-expert widths from K2 to K5, his dense tensors, and a tiered store
+sized for his bank. All credit for the quant, and its quality numbers below, goes to 0xSero.
+
+## Results
+
+Same method as upstream's: `scripts/benchmark.py` with its six fixed prompts (three short chats, a 2.3K-token
+follow-up, two 8K-token agent turns) plus a warm-up. Temperature 1.0, top-p 1.0, thinking `high`. Mean of seeds 21
+and 22.
+
+**The box:**
+- RTX PRO 6000 Blackwell **Max-Q** (300 W), PCIe 5.0 x16. Measured host to GPU: 57 GB/s.
+- 128 GB of DDR5-5600 (2 × 64 GB).
+- Driver 615.71.09, CUDA 13.4.
+
+| build | expert weights | decode | first token |
+|---|---|---:|---|
+| upstream `5b0ce26` (upstream's numbers) | native MXFP4 | 31.6 tok/s | 8K cold: 13.3 s |
+| upstream `5b0ce26` (upstream's numbers) | public K3 EXL3 | 49.1 tok/s | 8K cold: 10.7 s |
+| this fork, change 17, 64 GB RAM | 0xSero 2.7 bpw | 33.3 tok/s | mean 8.4 s |
+| this fork, change 25, 64 GB RAM | 0xSero 2.7 bpw | 38.1 tok/s | mean 7.9 s |
+| this fork, change 69, 128 GB RAM | 0xSero 2.7 bpw | 81.3 tok/s | 8K cold: 5.5 s; mean 2.7 s |
+| this fork, change 97 | 0xSero 2.7 bpw | ~80 tok/s | 8K cold: ~3.3 s; mean 1.11 s |
+| **this fork, change 111** (3 interleaved rounds) | **0xSero 2.7 bpw** | **79.2 tok/s** | **mean 1.13 s** |
+| the same, with 2 GiB held for an embedding model on the GPU | 0xSero 2.7 bpw | 78.0 tok/s | mean 1.20 s |
+
+**How to read the table:**
+- **Decode** includes thinking tokens.
+- **What the change 111 figure is made of:** a verify step takes 26.3 ms and drafting 2.3 ms. 74% of draft
+  tokens are accepted.
+- **Mean first token** averages all six prompts. Upstream reports only cold prompts.
+- **The whole bank lives in VRAM and RAM.** At 128 GB, 0xSero's experts fit in VRAM plus the pinned RAM tier, so
+  decode reads no experts from the NVMe drive. Engram's n-gram rows are still read from it.
+- **Token-exact checks:** changes that claim exactness were checked against the build before them. The same seeds
+  must give the same tokens (`7/7` per seed).
+
+**Concurrency.** Changes 91 and 93 run several conversations at once in live slots. A profile of one
+conversation's steps measured the cost of extra rows: dense work and attention batch well, going from 6.6 to 9.3 ms
+of attention between one and six rows. Past four rows, though, steps wait on RAM-to-GPU expert copies, because
+more rows reach colder experts. Batching conversations together is therefore estimated at about 1.2 to 1.3× total
+throughput at best on this card. That estimate has not been measured.
+
+## Quality
+
+This fork runs 0xSero's tensors as published:
+- **his routed experts:** 2.70 bpw. Each expert has its own width: 6,278 at K2, 7,447 at K3, 1,600 at K4 and 35
+  at K5.
+- **his dense tensors:** attention, shared experts and the head at K4 or K5.
+
+Everything else is either exact in distribution or changes rounding order only:
+- speculative decoding with rejection sampling;
+- copying drafts from the conversation;
+- caching and scheduling;
+- expert placement.
+
+The drafter's own experts are quantized (K2). That changes only how many drafts are accepted, not the output
+distribution.
+
+**0xSero's measurements** against native 1017, on sudoingX's 199-conversation panel (disjoint from his 1.2M-token
+calibration set), from his model card:
+
+| | |
+|---|---|
+| mean KL | **0.0304 nats** (95% CI 0.0268–0.0343) |
+| top-1 agreement | 94.95% |
+| panel perplexity | 1.6010 native → 1.6231 |
+
+We have not re-measured KL on this fork. The engine's `score` verb returns teacher-forced log-probabilities, so it
+can be checked.
+
+## What the fork changes
+
+The full list is in `git log 5b0ce26..`: one commit per change, each with what it does and what it measured.
+
+**Expert banks:**
+- EXL3 K2 and mixed K2/K3 banks.
+- 0xSero's bank, with a width per expert (`grouped_exl3_var`), slot classes per width in VRAM and RAM, and class
+  weights.
+- His dense tensors and K4 head, split over K in decode and run through FP16 GEMMs in prefill.
+- The VRAM those free goes to more expert slots.
+
+**Decode:**
+- The drafter's routed experts from an EXL3 bank.
+- Draft draws and acceptance on the GPU.
+- Drafts copied from the conversation's own tokens (suffix drafting).
+- Row batching.
+- Selective CUDA graphs with PDL.
+- GPU route planning.
+- Top-p on the host without a vocabulary sort.
+- Full residency at load whenever the RAM tier can hold the bank.
+
+**Prefill:**
+- Staged experts spread over four lanes, in grouped launches.
+- Engram reads batched and deeper.
+- One-row-per-warp routing.
+- The prefill reserve lent to expert slots during decode.
+- A prompt's drive reads admitted into the RAM tier as they pass.
+
+**Serving:**
+- Every finished prompt's state saved in RAM and on disk, so a returning conversation prefills only its new
+  tokens.
+- Live slots with a priority scheduler for several conversations.
+- Prompt caches per conversation for subagents, ended with `POST /v1/conversations/end`.
+- One-token probes prefilled together.
+- A VRAM reserve for another process on the card (`vram_reserve_gib`).
+
+**API:**
+- Special strings in request text stay text, so a `</think>` in a document can't end the model's reasoning.
+- A loop guard ends repeating reasoning, and repeating passages are cut out of the history.
+- 120 s keep-alive.
+
+**Tooling:**
+- A lab for A/B benches.
+- A drafter trainer that trains on s0ma's own requests, against the served target.
+
+## Running it
+
+s0ma builds and runs this fork with its `ds41.sh` script. The script applies these changes onto upstream `5b0ce26`,
+fetches the banks and manages the service.
+
+Without it, the pieces are:
+1. `scripts/sero_bank.py fetch models/sero-bank` (about 186 GB) and `scripts/sero_bank.py dense models/sero-bank`.
+2. `"experts": "sero"` in `config.local.json`.
+3. Upstream's `scripts/build.sh` and `scripts/run.py start`.
+
+The drafter's EXL3 bank is prepared by `ds41.sh`, and the steps are not yet documented outside it.
+
+## Credits
+
+- **SSHdotCodes**, for ds41d, which this fork builds on.
+- **[0xSero](https://huggingface.co/0xSero)**, for the EXL3 2.7 bpw quant this fork serves, and its quality
+  measurements.
+- **sudoingX**, for the evaluation panel behind those measurements.
+- **turboderp's [exllamav3](https://github.com/turboderp-org/exllamav3)** (MIT), for the EXL3 format, which the
+  fork's K2–K5 kernels decode.
+- **DeepSeek**, for the model.
+
+The fork's changes are MIT, as is upstream. No weights are included.
+
+---
+
+<a id="upstream-readme"></a>
+
+# DeepSeek-V4.1-Flash-1017 on one RTX PRO 6000 (upstream README)
 
 **31.6 tok/s decode at native precision on one 96 GB card with 128 GB of RAM.** The model is DeepSeek's [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017): a 510 GB checkpoint with native MXFP4 experts and FP8 dense weights. It runs here unconverted and unquantized, with:
 

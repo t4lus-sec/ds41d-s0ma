@@ -19,6 +19,10 @@ exactly, so the result can change acceptance (speed), never what the model says.
           check that this port agrees with ds41d's drafter), then trained, scored again, and written as
           PATCH/patch.safetensors + manifest.json, for DS41_SPARK_PATCH=PATCH.
   eval    --data DATA --weights CKPT [--patch PATCH] [--mtp-bank DIR]
+  overlay --overlay DIR --weights CKPT --out PATCH
+          s0ma change 121: a published drafter overlay (another build's mtp.* tensors, e.g. ursuciprian's D1 for
+          LibertAI's 2.9 bpw EXL3) as a patch: each tensor ds41d binds that it holds, EXL3 ones decoded (exllamav3),
+          in the bound dtype. Prints names, shapes and each one's relative change against the checkpoint's own.
 
 Scores are the expected acceptance of each draft depth, sum(min(p, q)) over the target's top k (a lower bound), and
 the expected accepted drafts a full-width step, sum over k of the product of the first k+1 acceptances. Prints and
@@ -512,6 +516,10 @@ def to_torch(data, dtype, shape):
         return torch.frombuffer(buf, dtype=torch.float16).reshape(shape).float()
     if dtype == 'F8_E4M3':
         return torch.frombuffer(buf, dtype=torch.uint8).reshape(shape).view(torch.float8_e4m3fn).float()
+    if dtype == 'I16':   # s0ma change 121: an EXL3 trellis
+        return torch.frombuffer(buf, dtype=torch.int16).reshape(shape).clone()
+    if dtype in ('I32', 'U32'):
+        return torch.frombuffer(buf, dtype=torch.int32).reshape(shape).clone()
     if dtype in ('F8_E8M0', 'U8', 'I8'):
         return torch.frombuffer(buf, dtype=torch.uint8).reshape(shape).clone()
     raise SystemExit(f'unsupported checkpoint dtype {dtype}')
@@ -1109,6 +1117,92 @@ def identity(a):
     say(f'identity patch ({a.train}): {len(tensors)} stock tensors, {manifest["bytes"] / 2**20:,.0f} MiB -> {out}')
 
 
+def overlay(a):
+    """s0ma change 121: an overlay's drafter tensors as a DS41_SPARK_PATCH. A name may carry a leading 'model.'; an
+    EXL3 linear is PREFIX.trellis + .suh + .svh (+ .mcg / .mul1, + .bias), decoded with exllamav3 to [out, in] and
+    named PREFIX.weight. Only tensors of TENSORS whose element count matches the checkpoint's are written; the rest
+    are listed and stay stock. Prints names, shapes and relative changes only."""
+    import torch
+    from safetensors.torch import save_file
+    src = Path(a.overlay)
+    ov = Checkpoint(src)
+    have = {n for n, f in ov.where.items() if (src / f).exists()}
+    if not have:
+        raise SystemExit(f'{src}: no tensor of its index is in a file here')
+    strip = lambda n: n[len('model.'):] if n.startswith('model.') else n
+    ck = Checkpoint(a.weights)
+    bound = {n: dt for n, dt, _ in TENSORS}
+    device = a.device
+    found, notes = {}, []
+    plain = {strip(n): n for n in have}
+    linear = {strip(n)[:-len('.trellis')] for n in have if strip(n).endswith('.trellis')}
+    for prefix in sorted(linear):
+        name = prefix + '.weight'
+        get = lambda suffix: next((n for n in have if strip(n) == prefix + suffix), None)
+        try:
+            from exllamav3.modules.quant.exl3 import LinearEXL3
+            trellis = to_torch(*ov.raw(get('.trellis')))
+            suh = to_torch(*ov.raw(get('.suh'))).half()
+            svh = to_torch(*ov.raw(get('.svh'))).half()
+            kw = {}
+            for flag in ('mcg', 'mul1'):
+                n = get('.' + flag)
+                if n:
+                    kw[flag] = to_torch(*ov.raw(n)).view(torch.int).to(device)
+            k, n_out = suh.numel(), svh.numel()
+            lin = LinearEXL3(None, k, n_out, suh=suh.to(device), svh=svh.to(device), trellis=trellis.to(device), **kw)
+            found[name] = lin.get_weight_tensor().t().float().cpu()   # [out, in]
+        except Exception as e:   # noqa: BLE001 (reported, then left stock)
+            notes.append(f'{name}: EXL3 decode failed ({type(e).__name__}: {e})')
+    for base, n in plain.items():
+        if base.endswith(('.trellis', '.suh', '.svh', '.mcg', '.mul1')) or base in found:
+            continue
+        data, dtype, shape = ov.raw(n)
+        if dtype == 'F8_E4M3':
+            sc = next((m for m in have if strip(m) == base[:-len('.weight')] + '.scale'), None) if base.endswith('.weight') else None
+            if not sc:
+                notes.append(f'{base}: FP8 without its scale'); continue
+            sdata, sdt, sshape = ov.raw(sc)
+            t, s_ = to_torch(data, dtype, shape), to_torch(sdata, sdt, sshape)
+            s_ = torch.ldexp(torch.ones_like(s_, dtype=torch.float32), s_.int() - 127) if s_.dtype == torch.uint8 else s_.float()
+            found[base] = t * s_.repeat_interleave(shape[0] // sshape[0], 0).repeat_interleave(shape[1] // sshape[1], 1)
+        elif dtype in ('BF16', 'F16', 'F32'):
+            found[base] = to_torch(data, dtype, shape).float()
+    tensors, kept = {}, []
+    for name in sorted(found):
+        if name not in bound:
+            if name.startswith('mtp.') and not name.endswith('.scale'):
+                kept.append(name)
+            continue
+        stock = load_dense(ck, name)
+        new = found[name]
+        if new.numel() != stock.numel():
+            notes.append(f'{name}: {tuple(new.shape)} against the checkpoint\'s {tuple(stock.shape)}'); continue
+        new = new.reshape(stock.shape)
+        rel = float((new - stock).norm() / stock.norm().clamp(min=1e-30))
+        say(f'  {name:48s} {str(tuple(stock.shape)):>16s}  change {rel:.4f}')
+        if name.endswith('attn_sink') or name.endswith('_scale') or name.endswith('_base') or name.endswith('.bias'):
+            new = new.reshape(-1)
+        tensors[name] = new.to(torch.bfloat16 if bound[name] == 'bf16' else torch.float32).contiguous()
+    for n in notes:
+        say(f'  skipped: {n}')
+    if kept:
+        say(f'  {len(kept)} other drafter tensors in the overlay that ds41d does not take from a patch, e.g. ' + ', '.join(kept[:4]))
+    if not tensors:
+        raise SystemExit('no drafter tensor of the overlay matches one ds41d binds: nothing written')
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    part = out / 'patch.safetensors.partial'
+    save_file(tensors, str(part))
+    os.replace(part, out / 'patch.safetensors')
+    manifest = {'format': 1, 'created': time.strftime('%Y-%m-%dT%H:%M:%S'), 'overlay': str(src),
+                'tensors': len(tensors), 'bytes': sum(t.numel() * t.element_size() for t in tensors.values()),
+                'skipped': notes, 'not_patchable': kept}
+    (out / 'manifest.json').write_text(json.dumps(manifest, indent=1) + '\n')
+    say(f'patch: {out}/patch.safetensors ({len(tensors)} of the {len(bound)} tensors ds41d binds, '
+        f'{manifest["bytes"] / 2**20:,.0f} MiB; the rest stock)')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -1137,6 +1231,11 @@ def main():
     w.add_argument('--eval-anchors', type=int, default=4096)
     w.add_argument('--eval-stride', type=int, default=7)
     w.add_argument('--min-gain', type=float, default=0.005)
+    o = sub.add_parser('overlay')
+    o.add_argument('--overlay', required=True)
+    o.add_argument('--weights', required=True)
+    o.add_argument('--out', required=True)
+    o.add_argument('--device', default='cuda:0')
     i = sub.add_parser('identity')
     i.add_argument('--weights', required=True)
     i.add_argument('--out', required=True)
@@ -1162,7 +1261,8 @@ def main():
         else:
             t.add_argument('--patch', default='')
     a = ap.parse_args()
-    {'export': export, 'capture': capture, 'train': train, 'eval': run_eval, 'identity': identity, 'wsp': wsp}[a.cmd](a)
+    {'export': export, 'capture': capture, 'train': train, 'eval': run_eval, 'identity': identity, 'wsp': wsp,
+     'overlay': overlay}[a.cmd](a)
 
 
 if __name__ == '__main__':

@@ -217,7 +217,26 @@ static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
     else if (c.dense) {   // s0ma change 34: the by-value dense launches (gate views), at an explicit width
         CK(ds41::exl3_set_bits(bits == 2 ? 3 : 2));   // the global width must not matter
         if (c.prefill) CK(ds41::exl3_dense_prefill(dt, job, N, K, bits, 0));
-        else dense_split(dt, job, N, K, bits, 0, 0, 1, 0, 0, invariant);   // s0ma change 37: split when narrow
+        else {
+            dense_split(dt, job, N, K, bits, 0, 0, 1, 0, 0, invariant);   // s0ma change 37: split when narrow
+            // s0ma change 127: the weights and scales brought into L2 (both policies; a 15-byte tail skipped) on the
+            // same stream, then the launch again: the same bits
+            std::vector<uint16_t> before(size_t(M) * N), after(before.size());
+            CK(cudaMemcpy(before.data(), dout, before.size() * 2, cudaMemcpyDeviceToHost));
+            ds41::L2Range r[2] = {{dtr, words * 4}, {dsc, uint64_t(K + N) * 2 + 15}};
+            ds41::L2Range* dr;
+            CK(cudaMalloc(&dr, sizeof r)); CK(cudaMemcpy(dr, r, sizeof r, cudaMemcpyHostToDevice));
+            for (int policy = 1; policy <= 2; ++policy) {
+                r[1].bytes = uint64_t(K + N) * 2 - (policy == 2 ? 15 : 0);
+                CK(cudaMemcpy(dr, r, sizeof r, cudaMemcpyHostToDevice));
+                CK(ds41::exl3_l2_prefetch(dr, 2, policy, 8, 0));
+                CK(cudaMemset(dout, 0, before.size() * 2));
+                dense_split(dt, job, N, K, bits, 0, 0, 1, 0, 0, invariant);
+                CK(cudaMemcpy(after.data(), dout, after.size() * 2, cudaMemcpyDeviceToHost));
+                if (after != before) { std::printf("  differs after an L2 prefetch (policy %d)\n", policy); *invariant = false; }
+            }
+            cudaFree(dr);
+        }
         CK(ds41::exl3_set_bits(bits));
     }
     else if (c.prefill) {
@@ -428,8 +447,9 @@ int main() {
     fail += !f32_case(4, 5120, 2048, 6, rng);
     fail += !f32_case(4, 5120, 1280, 1, rng);
     fail += !f32_case(5, 8192, 1024, 4, rng);
-    std::printf("output digest %016llx (DS41_EXL3_PF=%s)\n", (unsigned long long)g_digest,
-                std::getenv("DS41_EXL3_PF") ? std::getenv("DS41_EXL3_PF") : "4");
+    std::printf("output digest %016llx (DS41_EXL3_PF=%s, DS41_EXL3_DENSE_PF=%s)\n", (unsigned long long)g_digest,
+                std::getenv("DS41_EXL3_PF") ? std::getenv("DS41_EXL3_PF") : "4",
+                std::getenv("DS41_EXL3_DENSE_PF") ? std::getenv("DS41_EXL3_DENSE_PF") : "4");
     std::printf(fail ? "%d FAILED\n" : "all passed\n", fail);
     return fail ? 1 : 0;
 }

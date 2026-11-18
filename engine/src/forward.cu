@@ -318,6 +318,14 @@ class Native final : public Forward, public hotpath::GateEvidence {
   struct DenseExl3 { int index = 0, k = 0, n = 0, bits = 0; };
   std::map<std::string, DenseExl3> dense_exl3;      // the tensor's name without ".weight"
   std::vector<Device> dense_records;
+  // s0ma change 127 (DS41_L2_PREFETCH=1, or 2 for evict_last): each layer's Sero dense tensors in the order the layer
+  // reads them, brought into L2 by a side stream as the layer's query projections start
+  Device l2_ranges;                        // [40][l2_slots] ds41::L2Range
+  std::array<int, 40> l2_count{};
+  int l2_policy = 0, l2_ctas = 0;
+  static constexpr int l2_slots = 16;
+  std::array<cudaStream_t, 2> l2_side{};
+  std::array<cudaEvent_t, 2> l2_fork{}, l2_join{};
   Device dense_table;
   double dense_extra_gib = 0;                         // VRAM the swap gave back, for expert slots
   // s0ma change 49: the drafter's 384 routed experts as EXL3 records (DS41_MTP_EXL3=DIR), one width for all
@@ -1055,6 +1063,7 @@ public:
     vram_checkpoint("native_after_native_weights");   // s0ma change 48
     load_sero_dense();
     vram_checkpoint("native_after_sero_dense");
+    setup_l2_prefetch();   // s0ma change 127
     splitk_scratch(0);   // s0ma change 40
     if (fused_head && !dense_of("head")) {   // s0ma change 43: unless Sero's head replaced it
       const auto &head = w("head.weight");
@@ -1256,6 +1265,11 @@ public:
   ~Native() override {
     if (stream)
       cudaStreamSynchronize(stream);
+    for (int i = 0; i < 2; ++i) {   // s0ma change 127
+      if (l2_side[i]) { cudaStreamSynchronize(l2_side[i]); cudaStreamDestroy(l2_side[i]); }
+      if (l2_fork[i]) cudaEventDestroy(l2_fork[i]);
+      if (l2_join[i]) cudaEventDestroy(l2_join[i]);
+    }
     if (lane_stream)
       cudaStreamSynchronize(lane_stream);
     for (auto &ticket : engram_tickets)
@@ -2697,6 +2711,70 @@ private:
               << used / 1e9 << " GB in place of " << freed / 1e9 << " GB of FP8 (" << skipped << " left native):";
     for (const auto &[kind, count] : kinds) std::cerr << " " << kind << " x" << count;
     std::cerr << "; " << dense_extra_gib << " GiB more expert slots\n";
+  }
+  // s0ma change 127: DS41_L2_PREFETCH=1|2: per layer, the ranges of its Sero dense records in the order the layer reads
+  // them (wq_a, wkv, wq_b, wo_a's slices, wo_b, the shared expert's w1, w3, w2), up to DS41_L2_PREFETCH_MIB (default
+  // three quarters of the L2) a layer. Weights only: nothing they compute changes.
+  void setup_l2_prefetch() {
+    const char *v = std::getenv("DS41_L2_PREFETCH");
+    if (!v || (std::string(v) != "1" && std::string(v) != "2") || dense_exl3.empty()) return;
+    int dev = 0, l2 = 0, sms = 0;
+    CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev));
+    CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    size_t cap = size_t(l2) / 4 * 3;
+    if (const char *c = std::getenv("DS41_L2_PREFETCH_MIB"); c && *c) cap = size_t(std::stoul(c)) << 20;
+    std::vector<ds41::L2Range> all(size_t(40) * l2_slots, ds41::L2Range{nullptr, 0});
+    size_t most = 0, ranges = 0;
+    for (int l = 0; l < 40; ++l) {
+      const std::string a = "layers." + std::to_string(l) + ".attn", f = "layers." + std::to_string(l) + ".ffn";
+      std::vector<std::string> names = {a + ".wq_a", a + ".wkv", a + ".wq_b"};
+      for (int g = 0; g < 8; ++g) names.push_back(a + ".wo_a.slice." + std::to_string(g));
+      for (const char *t : {".wo_b"}) names.push_back(a + t);
+      for (const char *t : {".shared_experts.w1", ".shared_experts.w3", ".shared_experts.w2"}) names.push_back(f + t);
+      size_t used = 0;
+      int n = 0;
+      for (const auto &name : names) {
+        const DenseExl3 *d = dense_of(name);
+        if (!d || n == l2_slots) continue;
+        const Device &r = dense_records[size_t(d->index)];
+        if (used + r.bytes > cap) break;
+        all[size_t(l) * l2_slots + n++] = ds41::L2Range{r.p, uint64_t(r.bytes)};
+        used += r.bytes;
+      }
+      l2_count[size_t(l)] = n;
+      most = std::max(most, used);
+      ranges += size_t(n);
+    }
+    if (!ranges) return;
+    l2_ranges.resize(all.size() * sizeof(ds41::L2Range));
+    CK(cudaMemcpy(l2_ranges.p, all.data(), all.size() * sizeof(ds41::L2Range), cudaMemcpyHostToDevice));
+    for (int i = 0; i < 2; ++i) {
+      CK(cudaStreamCreateWithFlags(&l2_side[i], cudaStreamNonBlocking));
+      CK(cudaEventCreateWithFlags(&l2_fork[i], cudaEventDisableTiming));
+      CK(cudaEventCreateWithFlags(&l2_join[i], cudaEventDisableTiming));
+    }
+    l2_policy = std::string(v) == "2" ? 2 : 1;
+    l2_ctas = std::max(1, sms);
+    std::cerr << "L2 prefetch (DS41_L2_PREFETCH=" << l2_policy << (l2_policy == 2 ? ", evict_last" : "") << "): "
+              << ranges << " dense tensors over 40 layers, at most " << double(most) / double(1 << 20)
+              << " MiB a layer of an L2 of " << double(l2) / double(1 << 20) << " MiB (cap " << double(cap) / double(1 << 20)
+              << " MiB), " << l2_ctas << " CTAs a layer\n";
+  }
+  // The side stream forks from the lane's stream as layer l's query projections start, and joins it back when they
+  // end (a captured graph must join every stream it forks)
+  void l2_prefetch_begin(int l) {
+    if (!l2_policy || l < 0 || l >= 40 || !l2_count[size_t(l)]) return;
+    const int i = lane_b_active ? 1 : 0;
+    CK(cudaEventRecord(l2_fork[i], stream));
+    CK(cudaStreamWaitEvent(l2_side[i], l2_fork[i], 0));
+    CK(ds41::exl3_l2_prefetch(l2_ranges.as<ds41::L2Range>(size_t(l) * l2_slots * sizeof(ds41::L2Range)), l2_count[size_t(l)], l2_policy, l2_ctas,
+                              l2_side[i]));
+    CK(cudaEventRecord(l2_join[i], l2_side[i]));
+  }
+  void l2_prefetch_end(int l) {
+    if (!l2_policy || l < 0 || l >= 40 || !l2_count[size_t(l)]) return;
+    CK(cudaStreamWaitEvent(stream, l2_join[lane_b_active ? 1 : 0], 0));
   }
   const DenseExl3 *dense_of(const std::string &prefix) const {
     if (dense_exl3.empty()) return nullptr;

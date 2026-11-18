@@ -89,4 +89,10 @@ cudaError_t grouped_exl3_var(const DeviceExpert* table, const GemmJob* jobs, int
 // same work as grouped_exl3_var's. DS41_EXL3_PF=8 (read once) doubles the decode kernels' loads in flight; exact.
 cudaError_t grouped_exl3_var_gu(const DeviceExpert* table, const GemmJob* gate_jobs, const GemmJob* up_jobs, int count,
                                 int n, int k, const uint8_t* bits, cudaStream_t stream);
+// s0ma change 127: device memory ranges brought into L2 ahead of the kernels that read them (cp.async.bulk.prefetch),
+// range 0 first; policy 1 plain, 2 evict_last. ranges is a device array of `count` (1..64) entries, 16-byte aligned
+// starts (a tail under 16 bytes is skipped). A hint: nothing computed changes. DS41_EXL3_DENSE_PF=8 (read once) keeps 8
+// slices a warp in flight in the dense decode kernels (exl3_dense, exl3_dense_f32), 4 otherwise; exact.
+struct L2Range { const void* p; uint64_t bytes; };
+cudaError_t exl3_l2_prefetch(const L2Range* ranges, int count, int policy, int ctas, cudaStream_t stream);
 }

@@ -606,6 +606,7 @@ void batch_front(int l,BatchLane &lane) {
     if(l==20 && !multi.active) candidate_count=std::min(2048,(scan+7)/8)*8;
     auto attention_body=[&]{
     bgraph(p+".query",m,[&]{
+      l2_prefetch_begin(l);   // s0ma change 127: the layer's dense tensors into L2 on a side stream
       size_t base=size_t(l)*hotpath::GateLayout::LayerBytes;
       bgate(base+hotpath::GateLayout::Input,h.p,hotpath::GateLayout::hc_bytes,m);
       bgate(base+hotpath::GateLayout::IncomingPre,pre.p,16,m);
@@ -629,6 +630,7 @@ void batch_front(int l,BatchLane &lane) {
       bgate(base+hotpath::GateLayout::AttnPre,att_pre.p,16,m);
       bgate(base+hotpath::GateLayout::AttnPost,post.p,16,m);
       bgate(base+hotpath::GateLayout::AttnComb,comb.p,64,m);
+      l2_prefetch_end(l);   // s0ma change 127: the side stream joins back
     });
     btrace(pos,m,l,"attn_input",x,H);
     if(multi.active) battention_multi(l); else battention(l,pos,m);   // s0ma change 91

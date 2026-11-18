@@ -1687,13 +1687,25 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
   auto mark=[&](const char* name){phase_marks.push_back({name,clock_ms()});};
   const void* initial_h=h.p;
   prefill_warm_counts.clear();
+  // s0ma change 126: an image's encoder and rows need VRAM begin_prompt did not count. Borrowed here, before the
+  // residency snapshot: lending moves and drops experts, so lent after it (as change 51 did) the prompt failed its
+  // tier check ("prefill changed decode tier membership") and poisoned the Spark adapter. With change 117's carve
+  // there are ~36 lendable chunks, so a prompt that had not already borrowed them all always failed. And only what the
+  // segment's images and the prefill need, not every chunk (36 would take ~18 GB of experts out of VRAM).
+  if(options.images&&!options.images->empty()) {
+    size_t need=prefill_lend_need(input.size());
+    for(const auto &img:*options.images) {
+      const int64_t b=std::max<int64_t>(img.start,committed),e=std::min<int64_t>(img.end(),committed+int64_t(input.size()));
+      if(b<e)need+=VisionEncoder::workspace_bytes(img);
+    }
+    prefill_lend(need);
+  }
   std::vector<uint8_t> residency_before;
   try{residency_before=p_residency(*experts);}catch(...){poisoned=true;throw;}
   mark("residency");
   auto plan=ds41e::prefill::plan(committed,int64_t(input.size()),int64_t(options.logits_tail),
       train_all?int64_t(input.size()):128);   // s0ma change 99: a training capture keeps every row's captures
-  // s0ma change 51: an image's encoder and rows need VRAM begin_prompt did not count: every lendable chunk
-  if(options.images&&!options.images->empty())prefill_lend(~size_t(0)>>1);
+  // (s0ma change 126: an image prompt's VRAM is borrowed above, before the residency snapshot)
   // Image rows of this segment. Each image the segment touches is encoded first, before the prefill arena
   // takes free VRAM; only its aligner rows (10 MB at most) stay allocated until the prefill returns.
   struct Rows {void* p=nullptr;~Rows(){if(p)cudaFree(p);}};

@@ -3317,10 +3317,24 @@ private:
     // (512). Each prompt frees as many chunks as its first segment's scratch needs; their valuable experts move into
     // the class's least valued slots first. Decode is exact (placement only); the segments are the ones today's
     // free VRAM gives, as the reserve is free again whenever a prompt runs.
-    if (const char *x = std::getenv("DS41_PREFILL_LEND_GIB"); x && *x && std::string(x) != "0") {
+    // s0ma change 117: DS41_PREFILL_LEND_CARVE_GIB=N makes N GiB more of the class's own dynamic slots lendable (carved,
+    // not added: the same VRAM), so a long prompt borrows enough for its whole remaining length and runs as one segment,
+    // one expert sweep a layer, instead of one sweep a ~16K-row segment, each copying the layer's RAM experts again.
+    // Short prompts borrow what they borrow today. Capped at half the class's unpinned slots.
+    // Full residency (below) gives carved chunks back while the RAM tier could not hold what they no longer keep in VRAM.
+    double carve_gib = 0;
+    size_t lend_carved = 0, lend_per = 0;
+    if (const char *x = std::getenv("DS41_PREFILL_LEND_CARVE_GIB"); x && *x) {
       char *end = nullptr;
-      const double g = std::strtod(x, &end);
-      if (*end || !(g > 0) || g > 32) throw std::invalid_argument("DS41_PREFILL_LEND_GIB: 0..32 GiB");
+      carve_gib = std::strtod(x, &end);
+      if (*end || !(carve_gib >= 0) || carve_gib > 64) throw std::invalid_argument("DS41_PREFILL_LEND_CARVE_GIB: 0..64 GiB");
+    }
+    const char *lend_env = std::getenv("DS41_PREFILL_LEND_GIB");
+    const bool lend_added = lend_env && *lend_env && std::string(lend_env) != "0";
+    if (lend_added || carve_gib > 0) {
+      char *end = nullptr;
+      const double g = lend_added ? std::strtod(lend_env, &end) : 0.0;
+      if (lend_added && (*end || !(g > 0) || g > 32)) throw std::invalid_argument("DS41_PREFILL_LEND_GIB: 0..32 GiB");
       double mib = 512;
       if (const char *m = std::getenv("DS41_PREFILL_LEND_CHUNK_MIB"); m && *m) {
         mib = std::strtod(m, &end);
@@ -3337,14 +3351,27 @@ private:
           if ((vram[k] - pins[k]) * bytes[k] > (vram[kl] - pins[kl]) * bytes[kl]) kl = k;
       const size_t per = std::max<size_t>(1, size_t(mib * double(1 << 20)) / bytes[kl]);
       lend_chunk_bytes = per * bytes[kl];
-      lend_chunks_total = std::max<size_t>(1, size_t(g * double(1ull << 30) / double(lend_chunk_bytes)));   // whole chunks, rounded down
-      ec.lend_class = int(kl);
-      ec.lend_chunk_slots = per;
-      ec.lend_slots = lend_chunks_total * per;
-      vram[kl] += ec.lend_slots;
-      std::cerr << "prefill lend: " << ec.lend_slots << " K" << widths[kl] << " slots in " << lend_chunks_total << " chunks of "
-                << lend_chunk_bytes / double(1 << 20) << " MiB, lent to each prompt's scratch, decode keeps "
-                << lend_margin / double(1 << 20) << " MiB free\n";
+      const size_t added = lend_added ? std::max<size_t>(1, size_t(g * double(1ull << 30) / double(lend_chunk_bytes))) : 0;   // whole chunks, rounded down
+      size_t carved = size_t(carve_gib * double(1ull << 30) / double(lend_chunk_bytes));
+      const size_t carve_cap = (vram[kl] - pins[kl]) * 3 / 4 / per;
+      if (carved > carve_cap) {
+        std::cerr << "DS41_PREFILL_LEND_CARVE_GIB=" << carve_gib << ": at most " << carve_cap << " chunks ("
+                  << double(carve_cap * lend_chunk_bytes) / double(1ull << 30) << " GiB), 3/4 of the class's unpinned slots\n";
+        carved = carve_cap;
+      }
+      lend_carved = carved;
+      lend_per = per;
+      lend_chunks_total = added + carved;
+      if (lend_chunks_total) {
+        ec.lend_class = int(kl);
+        ec.lend_chunk_slots = per;
+        ec.lend_slots = lend_chunks_total * per;
+        vram[kl] += added * per;   // the carved chunks are slots the class already had
+        std::cerr << "prefill lend: " << ec.lend_slots << " K" << widths[kl] << " slots in " << lend_chunks_total << " chunks of "
+                  << lend_chunk_bytes / double(1 << 20) << " MiB (" << added << " added, " << carved
+                  << " carved from the class's own), lent to each prompt's scratch, decode keeps "
+                  << lend_margin / double(1 << 20) << " MiB free\n";
+      }
     }
     ec.slots = 0;
     for (auto v : vram) ec.slots += v;
@@ -3395,16 +3422,42 @@ private:
           }
         constexpr size_t reserve = 16;
         std::vector<size_t> pre(n, 0);
-        full_need.assign(n, 0);
         double need_bytes = 0, all_bytes = 0, pre_bytes = 0;
-        for (size_t k = 0; k < n; ++k) {
-          const size_t lent = ec.lend_class == int(k) ? ec.lend_slots : 0;
-          const size_t dyn = vram[k] > pins[k] + lent ? vram[k] - pins[k] - lent : 0;
-          pre[k] = std::min(cand[k].size(), dyn > reserve ? dyn - reserve : 0);
-          full_need[k] = cand[k].size() - pre[k] + reserve;
-          need_bytes += double(full_need[k]) * double(bytes[k]);
-          all_bytes += double(cand[k].size()) * double(bytes[k]);
-          pre_bytes += double(pre[k]) * double(bytes[k]);
+        auto plan_full = [&] {
+          full_need.assign(n, 0);
+          need_bytes = all_bytes = pre_bytes = 0;
+          for (size_t k = 0; k < n; ++k) {
+            const size_t lent = ec.lend_class == int(k) ? ec.lend_slots : 0;
+            const size_t dyn = vram[k] > pins[k] + lent ? vram[k] - pins[k] - lent : 0;
+            pre[k] = std::min(cand[k].size(), dyn > reserve ? dyn - reserve : 0);
+            full_need[k] = cand[k].size() - pre[k] + reserve;
+            need_bytes += double(full_need[k]) * double(bytes[k]);
+            all_bytes += double(cand[k].size()) * double(bytes[k]);
+            pre_bytes += double(pre[k]) * double(bytes[k]);
+          }
+        };
+        plan_full();
+        // s0ma change 117: carved lend chunks are not filled at load; give back as many as the RAM tier needs to stay
+        // full (a prompt would otherwise trade decode's RAM hits for drive reads)
+        bool give_back = false;
+        if (need_bytes > double(c.host_bytes) && lend_carved) {   // only when full residency fits without them
+          ec.lend_slots -= lend_carved * lend_per;
+          plan_full();
+          give_back = need_bytes <= double(c.host_bytes);
+          ec.lend_slots += lend_carved * lend_per;
+          plan_full();
+        }
+        if (give_back) {
+          const size_t was = lend_carved;
+          while (need_bytes > double(c.host_bytes) && lend_carved) {
+            --lend_carved; --lend_chunks_total;
+            ec.lend_slots -= lend_per;
+            plan_full();
+          }
+          if (!ec.lend_slots) { ec.lend_class = -1; ec.lend_chunk_slots = 0; }
+          std::cerr << "prefill lend: " << was - lend_carved << " of " << was << " carved chunks given back so full residency fits; "
+                    << lend_chunks_total << " chunks lendable (" << double(lend_chunks_total * lend_chunk_bytes) / double(1ull << 30)
+                    << " GiB)\n";
         }
         const double gib = double(1ull << 30);
         std::ostringstream fr;

@@ -46,8 +46,7 @@ void bmoe_streamed(const std::string &p,int m,const hotpath::RoutePlan &plan,
     // The device job descriptors carry every layer/expert/output address.
     // Reuse this body across layers; dimensions and scratch addresses are fixed.
     bgraph("experts.stream."+std::to_string(n)+"."+std::to_string(count),m,[&]{
-      CK(expert_gemm(work_jobs.as<ds41::GemmJob>(),n,ds41::Projection::Gate,I,H,stream,layer));
-      CK(expert_gemm(work_up_jobs.as<ds41::GemmJob>(),n,ds41::Projection::Up,I,H,stream,layer));
+      CK(expert_gemm_gate_up(work_jobs.as<ds41::GemmJob>(),work_up_jobs.as<ds41::GemmJob>(),n,stream,layer));   // s0ma change 122
       if(exl3) hotpath::activate_routes_bf16(gate.p,up.p,broute.as<float>(),work_rows.as<int>(),
           act.p,count,stream);
       else hotpath::activate_routes(gate.p,up.p,broute.as<float>(),work_rows.as<int>(),

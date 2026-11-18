@@ -85,4 +85,8 @@ cudaError_t exl3_dense_f32(const DeviceExpert* table, GemmJob job, int n, int k,
                            int x_stride = 0, int out_stride = 0);
 cudaError_t grouped_exl3_var(const DeviceExpert* table, const GemmJob* jobs, int count,
                              Projection projection, int n, int k, const uint8_t* bits, cudaStream_t stream);
+// s0ma change 122: gate (gate_jobs) and up (up_jobs) of the same `count` experts in one launch, k 5120: each CTA the
+// same work as grouped_exl3_var's. DS41_EXL3_PF=8 (read once) doubles the decode kernels' loads in flight; exact.
+cudaError_t grouped_exl3_var_gu(const DeviceExpert* table, const GemmJob* gate_jobs, const GemmJob* up_jobs, int count,
+                                int n, int k, const uint8_t* bits, cudaStream_t stream);
 }

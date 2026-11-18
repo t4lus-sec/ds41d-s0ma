@@ -11,6 +11,7 @@
 #include "device.cuh"
 #include <cooperative_groups.h>
 #include <cstdlib>
+#include <string>
 namespace ds41 {
 namespace exl3_detail {
 // Fixed 8-row tile, 128 columns, four contiguous K partitions. M never changes
@@ -18,7 +19,9 @@ namespace exl3_detail {
 // s0ma change 34 (N1): ROWS is the most rows a job may hold (8; 4 for k=8192, whose 8-row input would not fit the
 // 99 KB of shared memory a block may have). Rows past a job's count are never read, so ROWS changes nothing else.
 // s0ma change 43: OutT float keeps the FP32 result (job.output then points to floats; os in floats)
-template<int K,int BITS,int ROWS=8,typename OutT=__nv_bfloat16>
+// s0ma change 122: PF, the slices each warp keeps in flight (4, or 8 with DS41_EXL3_PF=8), and the first PF slices' weight
+// loads issued before the input rotation instead of after it. The same loads, dequantization and MMAs in the same order.
+template<int K,int BITS,int ROWS=8,typename OutT=__nv_bfloat16,int PF=4>
 // s0ma change 34: xs and os are the input's and output's row strides in elements (K and N unless a slice of wider
 // rows, as 0xSero's wo_a groups: 4096 of each 32,768-wide row in, 1024 of each 8192-wide row out)
 __device__ __forceinline__ void decode_body(const DeviceExpert* table,const GemmJob job,int projection,int N,int xs=K,int os=-1) {
@@ -32,15 +35,8 @@ __device__ __forceinline__ void decode_body(const DeviceExpert* table,const Gemm
     float* red=reinterpret_cast<float*>(A+(ROWS*K<2048?2048:ROWS*K));
     int warp=threadIdx.x/32,lane=threadIdx.x%32,wn=warp%4,wk=warp/4;
     const auto* x=reinterpret_cast<const __nv_bfloat16*>(job.x);
-    for(int idx=warp;idx<job.tokens*(K/128);idx+=16) {
-        int r=idx/(K/128),c=(idx%(K/128))*128;
-        rotate_input(x+size_t(r)*xs+c,su+c,A+r*K+c,lane);
-    }
-    __syncthreads();
-    constexpr int SLICES=K/16,CHUNK=(SLICES+3)/4,PF=4,WNT=2;
+    constexpr int SLICES=K/16,CHUNK=(SLICES+3)/4,WNT=2;
     const int start=wk*CHUNK, len=min(CHUNK,SLICES-start);
-    const int r=lane/4; bool active=r<job.tokens;
-    const uint32_t* A2=reinterpret_cast<const uint32_t*>(A);
     TileW<BITS> pf[PF][WNT];
     auto load=[&](int i,int t){
         size_t off=(size_t(start+i)*(N/16)+blockIdx.x*8+wn*2+t)*(8*BITS);
@@ -51,6 +47,13 @@ __device__ __forceinline__ void decode_body(const DeviceExpert* table,const Gemm
         #pragma unroll
         for(int t=0;t<WNT;++t)pf[d][t]=load(d,t);
     }
+    for(int idx=warp;idx<job.tokens*(K/128);idx+=16) {
+        int r=idx/(K/128),c=(idx%(K/128))*128;
+        rotate_input(x+size_t(r)*xs+c,su+c,A+r*K+c,lane);
+    }
+    __syncthreads();
+    const int r=lane/4; bool active=r<job.tokens;
+    const uint32_t* A2=reinterpret_cast<const uint32_t*>(A);
     float acc[WNT][2][4]={};
     for(int base=0;base<len;base+=PF){
         #pragma unroll
@@ -87,10 +90,10 @@ __device__ __forceinline__ void decode_body(const DeviceExpert* table,const Gemm
     __syncthreads();
     if(warp<job.tokens)rotate_output(out+warp*128,sv+blockIdx.x*128,reinterpret_cast<OutT*>(job.output)+size_t(warp)*os+blockIdx.x*128,lane);
 }
-template<int K,int BITS,int ROWS=8>
+template<int K,int BITS,int ROWS=8,int PF=4>
 __global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const GemmJob* jobs,int projection,int N) {DS41_PDL_WAIT();
     if(jobs[blockIdx.y].tokens<=0)return;   // s0ma change 61: an empty job (a padded device-built job list) does nothing
-    decode_body<K,BITS,ROWS>(table,jobs[blockIdx.y],projection,N);
+    decode_body<K,BITS,ROWS,__nv_bfloat16,PF>(table,jobs[blockIdx.y],projection,N);
 }
 // s0ma change 34 (N1): one job passed by value (a dense tensor: no device job array, and a captured graph keeps it)
 template<int K,int BITS,int ROWS=8,typename OutT=__nv_bfloat16>
@@ -104,15 +107,28 @@ __global__ __launch_bounds__(512,1) void decode_one(const DeviceExpert* table,co
 }
 // s0ma change 15: one launch for jobs of several widths. Each CTA reads its job's expert's width from `bits` and
 // runs that width's decode, so the work per CTA is exactly decode<K,BITS>'s (block-uniform branch, same shared memory).
-template<int K>
-__global__ __launch_bounds__(512,1) void decode_var(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,const uint8_t* bits) {DS41_PDL_WAIT();
-    switch(bits[jobs[blockIdx.y].expert]){
-        case 2: decode_body<K,2>(table,jobs[blockIdx.y],projection,N); break;
-        case 3: decode_body<K,3>(table,jobs[blockIdx.y],projection,N); break;
-        case 4: decode_body<K,4>(table,jobs[blockIdx.y],projection,N); break;
-        case 5: decode_body<K,5>(table,jobs[blockIdx.y],projection,N); break;
+template<int K,int PF=4>
+__device__ __forceinline__ void decode_var_body(const DeviceExpert* table,const GemmJob job,int projection,int N,const uint8_t* bits) {
+    switch(bits[job.expert]){
+        case 2: decode_body<K,2,8,__nv_bfloat16,PF>(table,job,projection,N); break;
+        case 3: decode_body<K,3,8,__nv_bfloat16,PF>(table,job,projection,N); break;
+        case 4: decode_body<K,4,8,__nv_bfloat16,PF>(table,job,projection,N); break;
+        case 5: decode_body<K,5,8,__nv_bfloat16,PF>(table,job,projection,N); break;
         default: asm volatile("trap;");
     }
+}
+template<int K,int PF=4>
+__global__ __launch_bounds__(512,1) void decode_var(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,const uint8_t* bits) {DS41_PDL_WAIT();
+    decode_var_body<K,PF>(table,jobs[blockIdx.y],projection,N,bits);
+}
+// s0ma change 122: gate and up of the same experts in one launch (they read the same rows): CTA row y < count is
+// gate job y, the rest up job y - count. Each CTA computes exactly what its decode_var CTA would.
+template<int K,int PF=4>
+__global__ __launch_bounds__(512,1) void decode_var_gu(const DeviceExpert* table,const GemmJob* gate,const GemmJob* up,int count,
+                                                       int N,const uint8_t* bits) {DS41_PDL_WAIT();
+    const int y=blockIdx.y;
+    if(y<count)decode_var_body<K,PF>(table,gate[y],0,N,bits);
+    else decode_var_body<K,PF>(table,up[y-count],1,N,bits);
 }
 // s0ma: the same tile computed by a cluster of four CTAs, one per K partition (blockIdx.z), four warps each. Every
 // warp does exactly what warp (wn, wk) of decode() does: the same rotated inputs (each CTA rotates only the 128-wide
@@ -554,6 +570,24 @@ bool valid(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,i
 // against decode()'s 4.73 + 1.95), so decode() stays the default; any launch error of the cluster kernel falls back.
 bool split_on(){static const bool on=[]{const char*v=std::getenv("DS41_EXL3_SPLIT");return v&&v[0]=='1';}();return on;}
 bool split_failed=false;
+// s0ma change 122: DS41_EXL3_PF=8 keeps 8 slices a warp in flight in the decode kernels (4 before): twice the bytes in
+// flight an SM, for the latency-bound tail waves and small batches. Exact either way.
+int pf_depth(){static const int d=[]{const char*v=std::getenv("DS41_EXL3_PF");return v&&std::string(v)=="8"?8:4;}();return d;}
+// s0ma change 122: a kernel's dynamic shared memory size set once (it was set before every launch: host time only)
+template<auto F> cudaError_t smem_once(int bytes){   // one flag a kernel (F is the kernel itself)
+    static int done=-1;
+    if(done==bytes)return cudaSuccess;
+    auto err=cudaFuncSetAttribute(F,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
+    if(err==cudaSuccess)done=bytes;
+    return err;
+}
+template<int K,int BITS,int PF> cudaError_t launch_decode_pf(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,cudaStream_t s){
+    constexpr int bytes=(8*K*2<4096?4096:8*K*2)+4*8*128*4;
+    auto err=smem_once<exl3_detail::decode<K,BITS,8,PF>>(bytes);
+    if(err!=cudaSuccess)return err;
+    exl3_detail::decode<K,BITS,8,PF><<<dim3(n/128,count),512,bytes,s>>>(t,j,int(p),n);
+    return cudaGetLastError();
+}
 template<int K,int BITS> cudaError_t launch_decode(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,cudaStream_t s){
     if constexpr(K>5120){   // s0ma change 34: jobs of at most 4 rows (the caller splits larger ones)
         constexpr int bytes=4*K*2+4*8*128*4;
@@ -568,13 +602,10 @@ template<int K,int BITS> cudaError_t launch_decode(const DeviceExpert* t,const G
         if(e==cudaSuccess)return e;
         split_failed=true;   // configuration errors are not sticky: fall back for good
     }
-    constexpr int bytes=(8*K*2<4096?4096:8*K*2)+4*8*128*4;
     // Function attributes are host metadata operations, with no stream work,
     // allocation or synchronization; legal during capture as well as replay.
-    auto err=cudaFuncSetAttribute(exl3_detail::decode<K,BITS>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
-    if(err!=cudaSuccess)return err;
-    exl3_detail::decode<K,BITS><<<dim3(n/128,count),512,bytes,s>>>(t,j,int(p),n);
-    return cudaGetLastError();
+    if(pf_depth()==8)return launch_decode_pf<K,BITS,8>(t,j,count,p,n,s);
+    return launch_decode_pf<K,BITS,4>(t,j,count,p,n,s);
 }
 }
 cudaError_t grouped_exl3(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,cudaStream_t s){
@@ -590,12 +621,27 @@ template<int BITS> cudaError_t launch_k(const DeviceExpert* t,const GemmJob* j,i
     if(k==128)return launch_decode<128,BITS>(t,j,count,p,n,s);
     return cudaErrorNotSupported;
 }
-template<int K> cudaError_t launch_var(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,const uint8_t* bits,cudaStream_t s){
+template<int K,int PF> cudaError_t launch_var_pf(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,const uint8_t* bits,cudaStream_t s){
     constexpr int bytes=(8*K*2<4096?4096:8*K*2)+4*8*128*4;
-    auto err=cudaFuncSetAttribute(exl3_detail::decode_var<K>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
+    auto err=smem_once<exl3_detail::decode_var<K,PF>>(bytes);
     if(err!=cudaSuccess)return err;
-    exl3_detail::decode_var<K><<<dim3(n/128,count),512,bytes,s>>>(t,j,int(p),n,bits);
+    exl3_detail::decode_var<K,PF><<<dim3(n/128,count),512,bytes,s>>>(t,j,int(p),n,bits);
     return cudaGetLastError();
+}
+template<int K> cudaError_t launch_var(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,const uint8_t* bits,cudaStream_t s){
+    return pf_depth()==8?launch_var_pf<K,8>(t,j,count,p,n,bits,s):launch_var_pf<K,4>(t,j,count,p,n,bits,s);
+}
+template<int K,int PF> cudaError_t launch_var_gu(const DeviceExpert* t,const GemmJob* g,const GemmJob* u,int count,int n,const uint8_t* bits,cudaStream_t s){
+    constexpr int bytes=(8*K*2<4096?4096:8*K*2)+4*8*128*4;
+    auto err=smem_once<exl3_detail::decode_var_gu<K,PF>>(bytes);
+    if(err!=cudaSuccess)return err;
+    exl3_detail::decode_var_gu<K,PF><<<dim3(n/128,2*count),512,bytes,s>>>(t,g,u,count,n,bits);
+    return cudaGetLastError();
+}
+// s0ma change 122: gate and up of `count` experts in one launch (k 5120 only: the routed experts' gate and up)
+cudaError_t grouped_exl3_var_gu(const DeviceExpert* t,const GemmJob* g,const GemmJob* u,int count,int n,int k,const uint8_t* bits,cudaStream_t s){
+    if(!valid(t,g,count,Projection::Gate,n,k)||!u||!bits||count>32767||k!=5120)return cudaErrorInvalidValue;if(!count)return cudaSuccess;
+    return pf_depth()==8?launch_var_gu<5120,8>(t,g,u,count,n,bits,s):launch_var_gu<5120,4>(t,g,u,count,n,bits,s);
 }
 cudaError_t grouped_exl3_var(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,const uint8_t* bits,cudaStream_t s){
     if(!valid(t,j,count,p,n,k) || !bits || k>5120)return cudaErrorInvalidValue;if(!count)return cudaSuccess;

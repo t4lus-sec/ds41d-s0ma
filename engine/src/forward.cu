@@ -439,6 +439,20 @@ class Native final : public Forward, public hotpath::GateEvidence {
     return exl3 ? ds41::grouped_exl3_bits(experts->table(), jobs, count, p, n, k, expert_bits(layer), s)
                 : ds41::grouped_mxfp4_native_parallel(experts->table(), jobs, count, p, n, k, s);
   }
+  // s0ma change 122: DS41_EXL3_GU=1: a mixed-width layer's gate and up in one launch (grouped_exl3_var_gu: each CTA
+  // the same work; the two launches' CTAs share waves instead of each ending in a part-empty one). Exact.
+  static bool exl3_gu_on() {
+    static const bool on = [] { const char *v = std::getenv("DS41_EXL3_GU"); return v && std::string(v) == "1"; }();
+    return on;
+  }
+  cudaError_t expert_gemm_gate_up(const ds41::GemmJob *gate_jobs, const ds41::GemmJob *up_jobs, int count, cudaStream_t s,
+                                  int layer) {
+    const bool splitk = exl3 && exl3_splitk_on() && count <= splitk_jobs && splitk_partial[lane_b_active ? 1 : 0].bytes;
+    if (exl3 && !expert_bits(layer) && exl3_gu_on() && !splitk)
+      return ds41::grouped_exl3_var_gu(experts->table(), gate_jobs, up_jobs, count, I, H, expert_width_dev.as<uint8_t>(), s);
+    if (const cudaError_t e = expert_gemm(gate_jobs, count, ds41::Projection::Gate, I, H, s, layer); e != cudaSuccess) return e;
+    return expert_gemm(up_jobs, count, ds41::Projection::Up, I, H, s, layer);
+  }
   std::unique_ptr<hotpath::FusedOps> fused;
   std::unique_ptr<ds41::DirectReader> reader;
   std::unique_ptr<ds41::HostBuffer> pages, host;

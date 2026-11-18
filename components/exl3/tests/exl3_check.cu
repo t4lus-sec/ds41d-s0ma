@@ -131,6 +131,13 @@ static bool f32_case(int bits, int K, int N, int M, std::mt19937& rng) {
                 "differs in %zu\n", ok ? "ok  " : "FAIL", bits, K, N, M, round, hb.size(), row);
     return ok;
 }
+// s0ma change 122: an FNV-1a digest of every output, printed at the end: runs with DS41_EXL3_PF=4 and =8 must print the
+// same one (the deeper prefetch changes when weights are loaded, never what is computed)
+static uint64_t g_digest = 1469598103934665603ull;
+static void digest(const void* p, size_t n) {
+    const unsigned char* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) { g_digest ^= b[i]; g_digest *= 1099511628211ull; }
+}
 struct Case { int bits, K, N, tokens; bool prefill; ds41::Projection p; bool var = false; bool dense = false; int stride = 1; bool dq = false; bool vsplit = false; };
 
 static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
@@ -292,13 +299,31 @@ static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
         CK(cudaMalloc(&dbits, 1)); CK(cudaMemcpy(dbits, &b8, 1, cudaMemcpyHostToDevice));
         CK(ds41::exl3_set_bits(bits == 2 ? 3 : 2));   // the global width must not matter
         CK(ds41::grouped_exl3_var(dt, dj, 1, c.p, N, K, dbits, 0));
-        CK(cudaDeviceSynchronize()); cudaFree(dbits);
+        CK(cudaDeviceSynchronize());
+        // s0ma change 122: gate and up in one launch give grouped_exl3_var's bits (here both read the same weights)
+        if (K == 5120 && c.p != ds41::Projection::Down) {
+            __nv_bfloat16 *og, *ou; ds41::GemmJob *dg, *du;
+            CK(cudaMalloc(&og, size_t(M) * N * 2)); CK(cudaMalloc(&ou, size_t(M) * N * 2));
+            ds41::GemmJob gj{0, M, reinterpret_cast<const uint8_t*>(dx), nullptr, og}, uj{0, M, reinterpret_cast<const uint8_t*>(dx), nullptr, ou};
+            CK(cudaMalloc(&dg, sizeof gj)); CK(cudaMalloc(&du, sizeof uj));
+            CK(cudaMemcpy(dg, &gj, sizeof gj, cudaMemcpyHostToDevice)); CK(cudaMemcpy(du, &uj, sizeof uj, cudaMemcpyHostToDevice));
+            CK(ds41::grouped_exl3_var_gu(dt, dg, du, 1, N, K, dbits, 0));
+            CK(cudaDeviceSynchronize());
+            std::vector<uint16_t> a(size_t(M) * N), g(a.size()), u(a.size());
+            CK(cudaMemcpy(a.data(), dout, a.size() * 2, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(g.data(), og, g.size() * 2, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(u.data(), ou, u.size() * 2, cudaMemcpyDeviceToHost));
+            if (g != a || u != a) { std::printf("  gate+up launch differs from grouped_exl3_var\n"); if (invariant) *invariant = false; }
+            cudaFree(og); cudaFree(ou); cudaFree(dg); cudaFree(du);
+        }
+        cudaFree(dbits);
         CK(ds41::exl3_set_bits(bits));
     }
     else CK(ds41::grouped_exl3(dt, dj, 1, c.p, N, K, 0));
     CK(cudaDeviceSynchronize());
     std::vector<__nv_bfloat16> out(size_t(M) * N);
     CK(cudaMemcpy(out.data(), dout, out.size() * 2, cudaMemcpyDeviceToHost));
+    digest(out.data(), out.size() * 2);
 
     // row 0 alone must give the same bits, on the same path (s0ma change 40: a split launch sums K in its own order,
     // so it is compared with itself; a strided group launch may split differently from one tensor: not compared)
@@ -403,6 +428,8 @@ int main() {
     fail += !f32_case(4, 5120, 2048, 6, rng);
     fail += !f32_case(4, 5120, 1280, 1, rng);
     fail += !f32_case(5, 8192, 1024, 4, rng);
+    std::printf("output digest %016llx (DS41_EXL3_PF=%s)\n", (unsigned long long)g_digest,
+                std::getenv("DS41_EXL3_PF") ? std::getenv("DS41_EXL3_PF") : "4");
     std::printf(fail ? "%d FAILED\n" : "all passed\n", fail);
     return fail ? 1 : 0;
 }

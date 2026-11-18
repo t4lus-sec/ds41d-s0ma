@@ -482,8 +482,7 @@ void bmoe(int l,int m) {
   io_ms+=clock_ms()-t;
   try {
     bgraph(p+".experts."+std::to_string(plan.ids.size()),m,[&]{
-      CK(expert_gemm(jobs.as<ds41::GemmJob>(),int(gj.size()),ds41::Projection::Gate,I,H,stream,l));
-      CK(expert_gemm(up_jobs.as<ds41::GemmJob>(),int(uj.size()),ds41::Projection::Up,I,H,stream,l));
+      CK(expert_gemm_gate_up(jobs.as<ds41::GemmJob>(),up_jobs.as<ds41::GemmJob>(),int(gj.size()),stream,l));   // s0ma change 122
       CK(ds41::swiglu(gate.as<Bf16>(),up.as<Bf16>(),broute.as<float>(),
           act.as<Bf16>(),plan.count,I,10,stream));
       if(!exl3) CK(ds41::quantize_mxfp8(act.as<Bf16>(),eq.as<uint8_t>(),es.as<uint8_t>(),

@@ -1,4 +1,4 @@
-# ds41d for s0ma: DeepSeek-V4.1-Flash-1017 at ~80 tok/s on one RTX PRO 6000
+# ds41d for s0ma: DeepSeek-V4.1-Flash-1017 at ~80 tok/s (~100 on code) on one RTX PRO 6000
 
 **This is a fork of [ds41d](https://github.com/SSHdotCodes/deepseek-v4.1-flash-pro6000)** (SSHdotCodes, MIT),
 pinned at upstream commit `5b0ce26`, with 123 changes on top. It serves the s0ma agent harness. Upstream's README
@@ -33,6 +33,9 @@ and 22.
 
 **How to read the table:**
 - **Decode** includes thinking tokens.
+- **Code runs faster than the table:** about 100 tok/s, up to ~110, observed in s0ma's daily coding sessions. That
+  figure is from use, not from a fixed benchmark. Code repeats more of its context, so more drafts are accepted, and
+  suffix drafting copies more of them.
 - **What the change 123 figure is made of:** a verify step takes 26.2 ms and drafting 2.3 ms. 74% of draft
   tokens are accepted. Against change 122 with its two decode switches off, the same rounds measured 77.6 tok/s and
   26.9 ms a verify step, with identical tokens.

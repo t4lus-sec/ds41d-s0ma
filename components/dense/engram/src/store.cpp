@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 #include <cuda_runtime_api.h>
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstdlib>
 #include <chrono>
@@ -43,10 +44,16 @@ struct ds41_engram_ticket {
 };
 struct ds41_engram_store {
  std::shared_ptr<HashConfig> hash=std::make_shared<HashConfig>();std::array<std::array<Tensor,2>,2> tensors;
- std::vector<int> files;engram::Ring ring;unsigned qd,batch;bool pin;uint64_t capacity,live=0;Memory cache,stage;
+ std::vector<int> files;unsigned qd,batch;bool pin;uint64_t capacity,live=0;Memory cache;
+ // s0ma change 118: readers, each its own ring and staging buffer. A ticket's batches of rows are read by up to
+ // DS41_ENGRAM_READERS of them at once (default 4; 1 is the single reader as before), and each batch's pages that
+ // are consecutive in the file go in one read of up to DS41_ENGRAM_RUN_PAGES pages (default 16; 1: page by page).
+ // The same bytes land in the same rows: the output and the cache are unchanged.
+ struct Reader{engram::Ring ring;Memory stage;Reader(unsigned depth,size_t bytes):ring(depth),stage(bytes,false){}};
+ std::vector<std::unique_ptr<Reader>> readers;unsigned run_pages=16;
  std::unordered_map<uint64_t,std::pair<size_t,std::list<uint64_t>::iterator>> entries;std::list<uint64_t> lru;
  std::mutex mutex;std::condition_variable cv;std::deque<ds41_engram_ticket*> queue;bool stopping=false,active=false;std::thread worker;ds41_engram_stats stats{};
- explicit ds41_engram_store(const ds41_engram_config&c):ring(c.queue_depth?c.queue_depth:48),qd(c.queue_depth?c.queue_depth:48),batch(c.max_batch_rows?c.max_batch_rows:4096),pin(c.pin_memory!=0),capacity(c.cache_rows),cache(c.cache_rows*264,pin),stage(size_t(batch)*4*4096,false){
+ explicit ds41_engram_store(const ds41_engram_config&c):qd(c.queue_depth?c.queue_depth:48),batch(c.max_batch_rows?c.max_batch_rows:4096),pin(c.pin_memory!=0),capacity(c.cache_rows),cache(c.cache_rows*264,pin){
   try{
    auto meta=load_json(c.hash_json);require(meta.at("schema")=="ds41-engram-hash-v1","hash schema");hash->map=meta.at("token_map").get<std::vector<int64_t>>();hash->pad=meta.at("pad_id");require(hash->map.size()==129280&&meta.at("compressed_vocab_size")==99092&&meta.at("layers").size()==2,"hash vocabulary/layout");
    for(auto v:hash->map){require(v>=0&&v<99092,"invalid compressed token");}require(hash->pad>=0&&hash->pad<99092,"invalid pad");
@@ -63,6 +70,9 @@ struct ds41_engram_store {
     auto d=headers.at(shard).at(wanted);auto shape=d.at("shape").get<std::vector<uint64_t>>();require(shape.size()==2&&shape[1]==uint64_t(s?8:256),"Engram row shape");std::string dtype=d.at("dtype");require(s?(dtype=="F8_E8M0"||dtype=="F8_E8M0FNU"):(dtype=="F8_E4M3"||dtype=="F8_E4M3FN"),"Engram dtype");auto offsets=d.at("data_offsets").get<std::array<uint64_t,2>>();uint64_t bytes=shape[0]*shape[1];require(offsets[1]>=offsets[0]&&offsets[1]-offsets[0]==bytes&&starts[shard]+offsets[1]<=sizes[shard],"Engram tensor bounds");
     tensors[l][s]={fds[shard],starts[shard]+offsets[0],shape[0],shape[1],sizes[shard]};require(shape[0]==uint64_t(hash->layers[l].offsets[23]+hash->layers[l].primes[23]),"Engram rows vs layout");
    }
+   {const char*e=std::getenv("DS41_ENGRAM_READERS");const long n=e&&*e?std::atol(e):4;require(n>=1&&n<=16,"DS41_ENGRAM_READERS: 1..16");
+    const char*r=std::getenv("DS41_ENGRAM_RUN_PAGES");const long m=r&&*r?std::atol(r):16;require(m>=1&&m<=256,"DS41_ENGRAM_RUN_PAGES: 1..256");
+    run_pages=unsigned(m);for(long i=0;i<n;++i)readers.push_back(std::make_unique<Reader>(qd,size_t(batch)*4*4096));}
    stats.cache_capacity_rows=capacity;worker=std::thread([this]{run();});
   }catch(...){for(int f:files)close(f);throw;}
  }
@@ -83,15 +93,30 @@ struct ds41_engram_store {
   if(pool_bytes+cap<=pool_limit()){pool.emplace_back(cap,p);pool_bytes+=cap;}else cudaFreeHost(p);}
  bool cached(uint64_t key,uint8_t*out){auto i=entries.find(key);if(i==entries.end())return false;memcpy(out,(char*)cache.p+i->second.first*264,264);lru.splice(lru.begin(),lru,i->second.second);return true;}
  void insert(uint64_t key,const uint8_t*row){if(!capacity)return;size_t slot;if(live<capacity){slot=live++;}else{auto old=lru.back();slot=entries.at(old).first;lru.pop_back();entries.erase(old);}memcpy((char*)cache.p+slot*264,row,264);lru.push_front(key);entries.emplace(key,std::make_pair(slot,lru.begin()));}
+ // one batch of a ticket's sorted misses: its pages, weight rows' first then the scales' (each list in file order, so
+ // neighbours merge into runs), read by this reader, then each row copied out of the staging
+ void read_batch(Reader&rd,int li,const std::vector<std::pair<int64_t,uint32_t>>&misses,size_t start,uint8_t*out,ds41_engram_stats&delta){
+  const size_t count=std::min(size_t(batch),misses.size()-start);std::vector<engram::Page> pages;std::unordered_map<uint64_t,size_t> page_index;pages.reserve(count*3);page_index.reserve(count*3);
+  auto page_key=[](int s,uint64_t off){return (uint64_t(s)<<63)|off;};
+  for(int s=0;s<2;++s)for(size_t j=0;j<count;++j){auto d=tensors[li][s];uint64_t off=d.base+uint64_t(misses[start+j].first)*d.stride,last=off+d.stride-1;for(uint64_t p=off&~4095ull;p<=last;p+=4096){auto[it,added]=page_index.emplace(page_key(s,p),pages.size());if(added)pages.push_back({d.fd,p,uint32_t(std::min(uint64_t(4096),d.file_bytes-p))});}}
+  require(pages.size()*4096<=rd.stage.bytes,"Engram staging overflow");auto io=Clock::now();rd.ring.read(engram::runs_of(pages,run_pages),rd.stage.p,qd);delta.io_ms+=elapsed(io);delta.disk_pages+=pages.size();delta.disk_bytes+=pages.size()*4096;++delta.batches;
+  for(size_t j=0;j<count;++j){auto[row,index]=misses[start+j];auto*dst=out+size_t(index)*264;for(int s=0;s<2;++s){auto d=tensors[li][s];uint64_t off=d.base+uint64_t(row)*d.stride;size_t copied=0;while(copied<d.stride){uint64_t p=off&~4095ull;size_t n=std::min(d.stride-copied,4096-(off&4095));memcpy(dst+(s?256:0)+copied,(char*)rd.stage.p+page_index.at(page_key(s,p))*4096+(off&4095),n);copied+=n;off+=n;}}}
+ }
  void fetch(ds41_engram_ticket&t){auto begin=Clock::now();int li=t.layer==1?0:1;auto*out=(uint8_t*)t.output.p;std::vector<uint32_t> owner(t.rows.size());std::vector<std::pair<int64_t,uint32_t>> misses;std::unordered_map<int64_t,uint32_t> first;first.reserve(t.rows.size());ds41_engram_stats delta{};delta.submitted_rows=t.rows.size();
   for(size_t i=0;i<t.rows.size();++i){auto[it,added]=first.emplace(t.rows[i],uint32_t(i));owner[i]=it->second;if(!added)continue;uint64_t key=(uint64_t(li)<<63)|uint64_t(t.rows[i]);if(cached(key,out+i*264))++delta.cache_hits;else misses.emplace_back(t.rows[i],uint32_t(i));}
   delta.unique_misses=misses.size();std::sort(misses.begin(),misses.end());
-  for(size_t start=0;start<misses.size();start+=batch){size_t count=std::min(size_t(batch),misses.size()-start);std::vector<engram::Page> pages;std::unordered_map<uint64_t,size_t> page_index;pages.reserve(count*3);page_index.reserve(count*3);
-   auto page_key=[](int s,uint64_t off){return (uint64_t(s)<<63)|off;};
-   for(size_t j=0;j<count;++j)for(int s=0;s<2;++s){auto d=tensors[li][s];uint64_t off=d.base+uint64_t(misses[start+j].first)*d.stride,last=off+d.stride-1;for(uint64_t p=off&~4095ull;p<=last;p+=4096){auto[it,added]=page_index.emplace(page_key(s,p),pages.size());if(added)pages.push_back({d.fd,p,uint32_t(std::min(uint64_t(4096),d.file_bytes-p))});}}
-   require(pages.size()*4096<=stage.bytes,"Engram staging overflow");auto io=Clock::now();ring.read(pages,stage.p,qd);delta.io_ms+=elapsed(io);delta.disk_pages+=pages.size();delta.disk_bytes+=pages.size()*4096;++delta.batches;
-   for(size_t j=0;j<count;++j){auto[row,index]=misses[start+j];auto*dst=out+size_t(index)*264;for(int s=0;s<2;++s){auto d=tensors[li][s];uint64_t off=d.base+uint64_t(row)*d.stride;size_t copied=0;while(copied<d.stride){uint64_t p=off&~4095ull;size_t n=std::min(d.stride-copied,4096-(off&4095));memcpy(dst+(s?256:0)+copied,(char*)stage.p+page_index.at(page_key(s,p))*4096+(off&4095),n);copied+=n;off+=n;}}insert((uint64_t(li)<<63)|uint64_t(row),dst);}
-  }
+  // s0ma change 118: the batches on up to readers.size() threads (this one included), each with its own ring and
+  // staging; the rows each batch writes are its own. The cache takes the rows afterwards, in the same order as before.
+  const size_t nb=(misses.size()+batch-1)/batch,threads=std::min(readers.size(),nb);
+  std::vector<ds41_engram_stats> part(std::max<size_t>(threads,1));std::vector<std::string> errors(part.size());
+  std::atomic<size_t> next{0};
+  auto work=[&](size_t r){try{for(size_t b;(b=next.fetch_add(1))<nb;)read_batch(*readers[r],li,misses,b*batch,out,part[r]);}
+                          catch(const std::exception&x){errors[r]=x.what();next=nb;}catch(...){errors[r]="unknown reader exception";next=nb;}};
+  if(threads>1){std::vector<std::thread> helpers;for(size_t r=1;r<threads;++r)helpers.emplace_back(work,r);work(0);for(auto&h:helpers)h.join();}
+  else if(nb)work(0);
+  for(auto&e:errors)if(!e.empty())throw std::runtime_error(e);
+  for(auto&p:part){delta.io_ms+=p.io_ms;delta.disk_pages+=p.disk_pages;delta.disk_bytes+=p.disk_bytes;delta.batches+=p.batches;}
+  for(auto&m:misses)insert((uint64_t(li)<<63)|uint64_t(m.first),out+size_t(m.second)*264);
   for(size_t i=0;i<t.rows.size();++i)if(owner[i]!=i)memcpy(out+i*264,out+size_t(owner[i])*264,264);
   delta.total_ms=elapsed(begin);{std::lock_guard<std::mutex>g(mutex);stats.submitted_rows+=delta.submitted_rows;stats.cache_hits+=delta.cache_hits;stats.unique_misses+=delta.unique_misses;stats.disk_pages+=delta.disk_pages;stats.disk_bytes+=delta.disk_bytes;stats.batches+=delta.batches;stats.io_ms+=delta.io_ms;stats.total_ms+=delta.total_ms;stats.cache_live_rows=live;}
  }

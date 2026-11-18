@@ -405,6 +405,20 @@ def environment(cfg, render=True):
         # token 5.65 -> 6.13 s mean (all of it inside the engine's prefill; lending itself 3-10 ms). A lab
         # --env DS41_PREFILL_LEND_GIB=0 turns it off
         env.setdefault('DS41_PREFILL_LEND_GIB', '2')
+        # s0ma change 120: 16 GiB more of the K3 slots lendable to prompts (change 117; ds41d gives back what full
+        # residency needs, ~9-10 GiB stay). Measured 2026-11-18, lab long at 1M: 128K cold first token 75.35 -> 48.7 s,
+        # 64K 34.1 -> 21.1 s, 32K 15.74 -> 10.6 s, 8K 4.86 -> 3.8 s (segments 6-9K rows -> 33-72K). A lab
+        # --env DS41_PREFILL_LEND_CARVE_GIB=0 turns it off
+        env.setdefault('DS41_PREFILL_LEND_CARVE_GIB', '16')
+        # s0ma change 120: with the carve the RAM tier lost 300-640 experts to the drive by mid-session while holding
+        # 12-13 GiB of copies of VRAM residents: a recently used copy was protected, so an old expert that lived only in
+        # RAM was evicted instead. Change 46's switch makes the copies candidates first. Placement only. A lab
+        # --env DS41_MOE_RAM_DUP_FIRST=0 turns it off
+        env.setdefault('DS41_MOE_RAM_DUP_FIRST', '1')
+        # s0ma change 120: 4M rows of Engram cache (~1.1 GB pinned; 65,536 before). Re-reading 64K of text: 21.0 ->
+        # 18.9-19.1 s first token; it also holds the next segments' rows that change 119 reads ahead. A lab
+        # --env DS41_ENGRAM_CACHE_ROWS=65536 is the old size
+        env.setdefault('DS41_ENGRAM_CACHE_ROWS', '4194304')
         # s0ma change 58: up to 8 GiB a prompt of the experts its last 256 rows routed and its sweep read from the drive,
         # into the RAM tier as they pass (change 57). Seed 22, 48 GiB tier: 41.2-42.8 -> 45.07 tok/s (three runs of
         # the build before), NVMe misses 7,842-7,879 -> 6,527, verify 54.1 -> 51.0 ms a step, tokens 7/7 identical.

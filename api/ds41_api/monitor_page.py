@@ -8,67 +8,85 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ds41d monitor</title>
 <style>
+/* s0ma change 132: the macOS Terminal "Homebrew" profile: bright green on black, a monospaced face, a window */
 :root {
-  --bg: #f6f7f9; --panel: #ffffff; --ink: #1b1f24; --muted: #5d6673; --faint: #8a93a0; --line: #e3e6ea;
-  --accent: #2f6fdf; --accent2: #c2581f; --accent3: #2c9a6a; --accent4: #8b5cd6; --warn: #b7791f; --bad: #c53030;
-  --good: #2c9a6a; --chip: #eef1f5;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0f1215; --panel: #171b20; --ink: #e6e9ed; --muted: #a2abb7; --faint: #6e7783; --line: #262c33;
-    --accent: #6ea1ff; --accent2: #f08a4b; --accent3: #4cc38a; --accent4: #b18cff; --warn: #e0a84a; --bad: #ff6b6b;
-    --good: #4cc38a; --chip: #20262d;
-  }
+  --bg: #000000; --panel: #000000; --ink: #28fe14; --muted: #20c911; --faint: #15870b; --line: #0d3a09;
+  --accent: #28fe14; --accent2: #ffd400; --accent3: #36d8ff; --accent4: #ff6fd8; --warn: #ffb000; --bad: #ff453a;
+  --good: #28fe14; --chip: #062a04; --glow: rgba(40, 254, 20, .28); --desk: #1d1f21;
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--ink);
-  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+::selection { background: var(--ink); color: #000; }
+html { background: var(--desk); }
+body { margin: 0; color: var(--ink); background: var(--desk);
+  font: 13px/1.5 "Andale Mono", Monaco, Menlo, "SF Mono", ui-monospace, "DejaVu Sans Mono", monospace;
+  text-shadow: 0 0 5px var(--glow); }
+.window { width: min(1480px, calc(100% - 36px)); margin: 18px auto; background: var(--bg); border-radius: 10px; overflow: hidden;
+  box-shadow: 0 0 0 1px #3a3a3c, 0 22px 60px rgba(0, 0, 0, .55); }
+.titlebar { position: relative; height: 30px; display: flex; align-items: center; padding: 0 12px;
+  background: linear-gradient(#3b3b3d, #2c2c2e); border-bottom: 1px solid #111; text-shadow: none;
+  font: 13px/1 -apple-system, "SF Pro Text", system-ui, sans-serif; color: #c7c7cc; }
+.lights { display: flex; gap: 8px; }
+.lights i { width: 12px; height: 12px; border-radius: 50%; display: block; box-shadow: inset 0 0 0 .5px rgba(0,0,0,.35); }
+.lights i:nth-child(1) { background: #ff5f57; } .lights i:nth-child(2) { background: #febc2e; } .lights i:nth-child(3) { background: #28c840; }
+.titlebar .title { position: absolute; left: 76px; right: 76px; text-align: center; pointer-events: none;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .mono, td.n, .tile .v { font-variant-numeric: tabular-nums; }
-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; padding: 18px 24px 8px; }
-header h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: .2px; }
-header .meta { color: var(--muted); font-size: 13px; }
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); margin-right: 6px; vertical-align: 1px; }
-.dot.live { background: var(--good); } .dot.busy { background: var(--accent); } .dot.down { background: var(--bad); }
-main { padding: 8px 24px 32px; display: grid; gap: 16px; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
-.tile, .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
-.tile { padding: 12px 14px; }
-.tile .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
-.tile .v { font-size: 26px; font-weight: 650; margin-top: 2px; }
-.tile .v small { font-size: 13px; font-weight: 500; color: var(--muted); margin-left: 3px; }
-.tile .s { color: var(--faint); font-size: 12px; margin-top: 2px; min-height: 17px; }
-.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 18px; padding: 16px 22px 6px; }
+header h1 { font-size: 13px; margin: 0; font-weight: 400; }
+header h1::before { content: "$ "; color: var(--faint); }
+header .meta { color: var(--muted); }
+.cursor { display: inline-block; width: .6em; height: 1.05em; background: var(--ink); vertical-align: -2px; margin-left: 4px;
+  box-shadow: 0 0 6px var(--glow); animation: blink 1.1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .cursor { animation: none; } }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); margin-right: 6px; vertical-align: 0; }
+.dot.live { background: var(--good); box-shadow: 0 0 6px var(--glow); } .dot.busy { background: var(--accent2); } .dot.down { background: var(--bad); }
+main { padding: 6px 22px 24px; display: grid; gap: 14px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.tile, .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 3px; }
+.tile { padding: 10px 12px; }
+.tile .k { color: var(--faint); font-size: 12px; }
+.tile .k::before { content: "> "; }
+.tile .v { font-size: 26px; margin-top: 3px; }
+.tile .v small { font-size: 12px; color: var(--muted); margin-left: 4px; }
+.tile .s { color: var(--faint); font-size: 12px; margin-top: 2px; min-height: 18px; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
-.panel { padding: 14px 16px 12px; min-width: 0; }
-.panel h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .5px;
-  display: flex; justify-content: space-between; gap: 8px; }
-.panel h2 span { text-transform: none; letter-spacing: 0; font-weight: 500; color: var(--faint); }
+.panel { padding: 10px 14px 10px; min-width: 0; }
+.panel h2 { font-size: 13px; margin: 0 0 8px; color: var(--ink); font-weight: 400; display: flex; justify-content: space-between; gap: 8px; }
+.panel h2::before { content: "#"; color: var(--faint); }
+.panel h2 span { color: var(--faint); margin-left: auto; }
 canvas { width: 100%; height: 190px; display: block; }
-.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 4px; }
-.legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: 3px; }
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th { text-align: left; color: var(--muted); font-weight: 600; font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-td { padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 4px; }
+.legend i { display: inline-block; width: 12px; height: 2px; margin-right: 6px; vertical-align: 3px; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th { text-align: left; color: var(--faint); font-weight: 400; padding: 5px 8px; border-bottom: 1px dashed var(--line); white-space: nowrap; }
+td { padding: 4px 8px; border-bottom: 1px dashed var(--line); white-space: nowrap; }
 td.n, th.n { text-align: right; }
 tr:last-child td { border-bottom: 0; }
+tbody tr:hover td, tr:hover td { background: var(--chip); }
 .scroll { overflow-x: auto; }
-.chip { display: inline-block; padding: 0 7px; border-radius: 999px; background: var(--chip); color: var(--muted); font-size: 12px; }
-.chip.err { color: var(--bad); } .chip.warn { color: var(--warn); } .chip.ok { color: var(--good); }
-.empty { color: var(--faint); padding: 10px 0; }
-.bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: var(--chip); margin: 6px 0 4px; }
+.chip { display: inline-block; padding: 0 5px; border: 1px solid var(--line); color: var(--muted); font-size: 12px; border-radius: 2px; }
+.chip.err { color: var(--bad); border-color: currentColor; } .chip.warn { color: var(--warn); border-color: currentColor; } .chip.ok { color: var(--good); border-color: currentColor; }
+.empty { color: var(--faint); padding: 8px 0; }
+.empty::before { content: "-- "; }
+.bar { display: flex; height: 10px; overflow: hidden; background: var(--chip); margin: 6px 0 4px; border: 1px solid var(--line); }
 .bar div { height: 100%; }
-.kv { display: grid; grid-template-columns: 1fr auto; gap: 3px 16px; font-size: 13px; }
+.kv { display: grid; grid-template-columns: 1fr auto; gap: 3px 16px; font-size: 12.5px; }
 .kv div:nth-child(odd) { color: var(--muted); }
 .kv div:nth-child(even) { text-align: right; font-variant-numeric: tabular-nums; }
-footer { color: var(--faint); font-size: 12px; padding: 0 24px 24px; }
-@media (max-width: 520px) { header, main, footer { padding-left: 16px; padding-right: 16px; } }
+footer { color: var(--faint); font-size: 12px; padding: 0 22px 18px; }
+footer::before { content: "// "; }
+@media (max-width: 520px) { .window { width: 100%; margin: 0; border-radius: 0; } header, main, footer { padding-left: 16px; padding-right: 16px; } }
 </style>
 </head>
 <body>
+<div class="window">
+<div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="title" id="wintitle">ds41d — monitor</div></div>
 <header>
   <h1>ds41d monitor</h1>
   <div class="meta" id="status"><span class="dot"></span>connecting…</div>
-  <div class="meta" id="model"></div>
+  <div class="meta" id="model"></div><span class="cursor"></span>
 </header>
 <main>
   <section class="tiles" id="tiles"></section>
@@ -96,6 +114,7 @@ footer { color: var(--faint); font-size: 12px; padding: 0 24px 24px; }
   </section>
 </main>
 <footer>Numbers only: no prompt or completion text is recorded, and conversation ids show as an 8-character hash. Refreshes every 2 s; the GPU is sampled only while this page is open.</footer>
+</div>
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
@@ -115,7 +134,7 @@ function chart(canvas, series, opts = {}) {
   const g = canvas.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
   const L = 40, R = 8, T = 8, B = 22, pw = w - L - R, ph = h - T - B;
   const pts = series.flatMap(s => s.points.filter(p => p[1] != null && isFinite(p[1])));
-  g.font = "11px ui-sans-serif, system-ui, sans-serif"; g.fillStyle = css("--faint"); g.strokeStyle = css("--line"); g.lineWidth = 1;
+  g.font = '11px "Andale Mono", Monaco, Menlo, ui-monospace, monospace'; g.fillStyle = css("--faint"); g.strokeStyle = css("--line"); g.lineWidth = 1;
   if (!pts.length) { g.fillText("no data yet", L, T + ph / 2); return; }
   let x0 = Math.min(...pts.map(p => p[0])), x1 = Math.max(...pts.map(p => p[0]));
   if (x1 - x0 < 60) x0 = x1 - 60;
@@ -131,10 +150,11 @@ function chart(canvas, series, opts = {}) {
   for (let i = 0; i <= 3; ++i) { const t = x0 + (x1 - x0) * i / 3; g.fillText(new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}), Math.min(Math.max(X(t), L + 20), L + pw - 20), h - 6); }
   for (const s of series) {
     const p = s.points.filter(q => q[1] != null && isFinite(q[1]));
-    g.strokeStyle = g.fillStyle = css(s.color); g.lineWidth = 1.75;
+    g.strokeStyle = g.fillStyle = css(s.color); g.lineWidth = 1.5; g.shadowColor = g.strokeStyle; g.shadowBlur = 5;
     if (s.dots) { for (const q of p) { g.beginPath(); g.arc(X(q[0]), Y(Math.min(q[1], y1)), 2.6, 0, 7); g.fill(); } continue; }
     g.beginPath(); p.forEach((q, i) => i ? g.lineTo(X(q[0]), Y(Math.min(q[1], y1))) : g.moveTo(X(q[0]), Y(Math.min(q[1], y1)))); g.stroke();
   }
+  g.shadowBlur = 0;
 }
 
 function tiles(d) {
@@ -214,6 +234,7 @@ async function tick() {
     const state = d.active.length ? `<span class="dot busy"></span>${d.active.length} running` : `<span class="dot live"></span>idle`;
     $("status").innerHTML = `${state} · up ${dur(d.uptime_s)} · updated ${clock(d.now)}`;
     $("model").textContent = d.model;
+    $("wintitle").textContent = `ds41d — monitor — ${d.model}`;
     tiles(d); active(d); recent(d); experts(d); convs(d);
     const r = d.recent.filter(x => !x.probe);
     chart($("c_decode"), [{color: "--accent", dots: true, points: r.filter(x => x.completion_tokens > 8).map(x => [x.t_end, x.decode_tok_s])},

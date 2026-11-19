@@ -1,6 +1,7 @@
 // s0ma change 128: the fused hyper-connection site (DS41_HC_FUSED=1) against the launches it replaces, on random data
 // at the decode shapes (K 5120, 1..8 rows):
 //   ds41_dense_hc_pre_norm: bit for bit hcpre + the decode RMSNorm (a copy of ds41e::hotpath::rms below) + the FP32 copy
+//   s0ma change 139: variants 0 and 1 of both (DS41_HC_FAST) bit for bit, and their times at rows 1-4
 //   ds41_dense_hc_fused_mixes: pre, post and comb within 1e-4 of ds41_dense_hc_mixes (only the order of its 20,480-term
 //     sums differs); every row bit for bit the same alone as among the others; its count left at zero
 //
@@ -64,6 +65,10 @@ int main() {
   float *dfn = upload(fn), *dsc = upload(sc), *dbase = upload(base);
   bf16 *dwn = upload(wn);
   const size_t pf = ds41_dense_hc_fused_floats(K);
+  // timing: 80 copies of fn (157 MB, more than L2), one a launch, as the engine's 80 sites a step read theirs
+  constexpr int SITES = 80; float *fn_sites;
+  CK(cudaMalloc(&fn_sites, size_t(SITES) * fn.size() * 4));
+  for (int i = 0; i < SITES; ++i) CK(cudaMemcpy(fn_sites + size_t(i) * fn.size(), dfn, fn.size() * 4, cudaMemcpyDeviceToDevice));
   float *partial; unsigned *count;
   CK(cudaMalloc(&partial, pf * 4)); CK(cudaMalloc(&count, 4)); CK(cudaMemset(count, 0, 4));
   for (int M = 1; M <= 8; ++M) {
@@ -113,10 +118,47 @@ int main() {
       invariant = invariant && std::memcmp(s0.data(), p1.data() + r * 4, 16) == 0 && std::memcmp(s1.data(), q1.data() + r * 4, 16) == 0 &&
                   std::memcmp(s2.data(), c1.data() + r * 16, 64) == 0;
     }
+    // 4. s0ma change 139: variants 0 and 1 (DS41_HC_FAST) bit for bit, the count back to zero after each
+    bool same_v = true;
+    {
+      std::vector<float> got[2][3]; std::vector<bf16> gy[2]; std::vector<float> gyf[2];
+      for (int v = 0; v < 2; ++v) {
+        CK(cudaMemset(fpre, 0xff, M * 16)); CK(cudaMemset(fpost, 0xff, M * 16)); CK(cudaMemset(fcomb, 0xff, M * 64));
+        CK(cudaMemset(y, 0xff, size_t(M) * K * 2)); CK(cudaMemset(yf, 0xff, size_t(M) * K * 4));
+        for (int rep = 0; rep < 2; ++rep) {
+          CK(ds41_dense_hc_fused_mixes_v(dh, dfn, dsc, dbase, fpre, fpost, fcomb, partial, count, M, K, 1e-20f, 1e-6f, v, 0));
+          CK(ds41_dense_hc_pre_norm_v(dh, dinc, dwn, y, yf, M, K, v, 0));
+        }
+        CK(cudaDeviceSynchronize());
+        got[v][0] = download(fpre, M * 4); got[v][1] = download(fpost, M * 4); got[v][2] = download(fcomb, M * 16);
+        gy[v] = download(y, size_t(M) * K); gyf[v] = download(yf, size_t(M) * K);
+        unsigned c = 1; CK(cudaMemcpy(&c, count, 4, cudaMemcpyDeviceToHost)); same_v = same_v && c == 0;
+      }
+      for (int i = 0; i < 3; ++i) same_v = same_v && std::memcmp(got[0][i].data(), got[1][i].data(), got[0][i].size() * 4) == 0;
+      same_v = same_v && std::memcmp(gy[0].data(), gy[1].data(), gy[0].size() * 2) == 0 &&
+               std::memcmp(gyf[0].data(), gyf[1].data(), gyf[0].size() * 4) == 0 &&
+               std::memcmp(gy[1].data(), a.data(), a.size() * 2) == 0;
+    }
+    // timing, rows 1-4: each variant's two launches, 400 times back to back
+    double us[2] = {0, 0};
+    if (M <= 4) for (int v = 0; v < 2; ++v) {
+      cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+      for (int i = 0; i < 20; ++i) CK(ds41_dense_hc_fused_mixes_v(dh, dfn, dsc, dbase, fpre, fpost, fcomb, partial, count, M, K, 1e-20f, 1e-6f, v, 0));
+      CK(cudaEventRecord(e0));
+      for (int i = 0; i < 400; ++i) CK(ds41_dense_hc_fused_mixes_v(dh, fn_sites + size_t(i % SITES) * fn.size(), dsc, dbase, fpre, fpost, fcomb, partial, count, M, K, 1e-20f, 1e-6f, v, 0));
+      CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); us[v] = ms * 1000 / 400;
+      CK(cudaEventRecord(e0));
+      for (int i = 0; i < 400; ++i) CK(ds41_dense_hc_pre_norm_v(dh, dinc, dwn, y, yf, M, K, v, 0));
+      CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1)); CK(cudaEventElapsedTime(&ms, e0, e1));
+      std::printf("rows %d variant %d: mixes %.1f us, pre+norm %.1f us (back to back; the mixes read 80 sites' weights, more than L2)\n", M, v, us[v], ms * 1000 / 400);
+      cudaEventDestroy(e0); cudaEventDestroy(e1);
+    }
     unsigned left = 1; CK(cudaMemcpy(&left, count, 4, cudaMemcpyDeviceToHost));
-    const bool ok = same_x && worst < 1e-4 && invariant && left == 0;
-    std::printf("rows %d: hcpre+norm+cast %s; pre/post/comb max |diff| %.2e (%zu of %zu bit for bit); rows alone %s; count %u  %s\n",
-                M, same_x ? "bit for bit" : "DIFFERS", worst, equal, total, invariant ? "the same" : "DIFFER", left, ok ? "ok" : "FAIL");
+    const bool ok = same_x && worst < 1e-4 && invariant && left == 0 && same_v;
+    std::printf("rows %d: hcpre+norm+cast %s; pre/post/comb max |diff| %.2e (%zu of %zu bit for bit); rows alone %s; count %u; "
+                "change 139's kernels %s  %s\n",
+                M, same_x ? "bit for bit" : "DIFFERS", worst, equal, total, invariant ? "the same" : "DIFFER", left,
+                same_v ? "bit for bit" : "DIFFER", ok ? "ok" : "FAIL");
     fail += !ok;
     for (void *p : {(void *)dh, (void *)dinc, (void *)rpre, (void *)rpost, (void *)rcomb, (void *)rx, (void *)rmix, (void *)rrstd,
                     (void *)fpre, (void *)fpost, (void *)fcomb, (void *)rpre_x, (void *)ry, (void *)y, (void *)yf, (void *)rf})

@@ -49,6 +49,10 @@ int ds41_dense_hc_fused_mixes(const void* h_bf16,const float* fn,const float* sc
 // s0ma change 128: ds41_dense_hc_pre, the decode RMSNorm (eps 1e-20) and, when y_f32 is given, its FP32 copy in one
 // launch: bit for bit the three launches. y may alias nothing else here (h is [M,4,K], y [M,K]).
 int ds41_dense_hc_pre_norm(const void* h_bf16,const float* pre,const void* norm_weight,void* y_bf16,float* y_f32,int M,int K,cudaStream_t stream);
+// s0ma change 139: the two above by variant (0: change 128's kernels, 1: change 139's, the same bits); the plain
+// entries pick by DS41_HC_FAST (1: variant 1)
+int ds41_dense_hc_fused_mixes_v(const void* h_bf16,const float* fn,const float* scale,const float* base,float* pre,float* post,float* comb,float* partial,unsigned* count,int M,int K,float norm_eps,float hc_eps,int variant,cudaStream_t stream);
+int ds41_dense_hc_pre_norm_v(const void* h_bf16,const float* pre,const void* norm_weight,void* y_bf16,float* y_f32,int M,int K,int variant,cudaStream_t stream);
 int ds41_dense_shared_act(const void* gate_bf16,const void* up_bf16,void* z_bf16,void* a_fp8,void* as_ue8m0,int M,int K,cudaStream_t stream);
 int ds41_dense_promote(const void* x_bf16,float* x_f32,int elements,cudaStream_t stream);
 // wo_a grouped BF16 einsum, token-major x[M,G,K], y[M,G,N], w[G,N,K].

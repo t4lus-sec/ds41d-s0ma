@@ -1,7 +1,8 @@
-# ds41d for s0ma: DeepSeek-V4.1-Flash-1017 at ~80 tok/s (~100 on code) on one RTX PRO 6000
+# ds41d for s0ma: DeepSeek-V4.1-Flash-1017 at ~90 tok/s decode, ~3,000 tok/s prefill, on one RTX PRO 6000
 
 **This is a fork of [ds41d](https://github.com/SSHdotCodes/deepseek-v4.1-flash-pro6000)** (SSHdotCodes, MIT),
-pinned at upstream commit `5b0ce26`, with 123 changes on top. It serves the s0ma agent harness. Upstream's README
+pinned at upstream commit `5b0ce26`, with 149 changes on top, maintained by [t4lus-sec](https://github.com/t4lus-sec).
+It serves the s0ma agent harness. Upstream's README
 follows [below](#upstream-readme), unchanged.
 
 The model quant is **[0xSero's EXL3 2.7 bpw quant of DeepSeek-V4.1-Flash-1017](https://huggingface.co/0xSero/DeepSeek-V4.1-Flash-1017-EXL3-2.7bpw)**.
@@ -29,18 +30,43 @@ and 22.
 | this fork, change 97 | 0xSero 2.7 bpw | ~80 tok/s | 8K cold: ~3.3 s; mean 1.11 s |
 | this fork, change 111 (3 interleaved rounds) | 0xSero 2.7 bpw | 79.2 tok/s | mean 1.13 s |
 | the same, with 2 GiB held for an embedding model on the GPU | 0xSero 2.7 bpw | 78.0 tok/s | mean 1.20 s |
-| **this fork, change 123** (3 interleaved rounds), 2.4 GiB held for an embedding model | **0xSero 2.7 bpw** | **79.3 tok/s** | **mean 1.10 s** |
+| this fork, change 123 (3 interleaved rounds), 2.4 GiB held for an embedding model | 0xSero 2.7 bpw | 79.3 tok/s | mean 1.10 s |
+| this fork, change 138 (3 interleaved rounds), the same | 0xSero 2.7 bpw | 84.8 tok/s | mean 1.09 s |
+| **this fork, change 144** (3 interleaved rounds), the same | **0xSero 2.7 bpw** | **88.3 tok/s** | **mean 1.09 s** |
+| the same, 64K-128K-token prompts (`lab long`) | 0xSero 2.7 bpw | 87-96 tok/s | 128K cold: 40.9 s |
+
+**Prefill** (change 144, cold prompts, measured): ~2,600 tok/s at 8K (2,556 and 2,616 on the two agent prompts),
+~3,400-3,500 tok/s at 64K and ~3,200 tok/s at 128K (`lab long`); a returning conversation prefills only its new
+tokens. With changes 145 and 146 on, estimated ~2,850 tok/s at 8K and ~3,600 tok/s at 128K (not yet measured).
 
 **How to read the table:**
 - **Decode** includes thinking tokens.
-- **Code runs faster than the table:** about 100 tok/s, up to ~110, observed in s0ma's daily coding sessions. That
-  figure is from use, not from a fixed benchmark. Code repeats more of its context, so more drafts are accepted, and
-  suffix drafting copies more of them.
-- **What the change 123 figure is made of:** a verify step takes 26.2 ms and drafting 2.3 ms. 74% of draft
-  tokens are accepted. Against change 122 with its two decode switches off, the same rounds measured 77.6 tok/s and
-  26.9 ms a verify step, with identical tokens.
+- **~90 tok/s** rounds the benchmark's 88.3. **Code runs faster than the table:** about 100 tok/s, up to ~110,
+  observed in s0ma's daily coding sessions. That figure is from use, not from a fixed benchmark. Code repeats more of
+  its context, so more drafts are accepted, and suffix drafting copies more of them.
+- **What the change 144 figure is made of:** a verify step takes 23.56 ms and drafting 2.33 ms; 75.6% of draft
+  tokens are accepted. Changes 124-144 took the verify step from 26.2 ms to 23.56 with identical tokens (14/14 in
+  every A/B), as measured on 2026-11-18 and 19 (3 interleaved rounds each, seeds 21 and 22):
+
+  | change | what | verify a step |
+  |---|---|---|
+  | 128-129 | each decode hyper-connection site in two launches | −3.2% |
+  | 136-138 | EXL3 decode kernels two CTAs an SM for steps of up to 4 rows | −1.4% |
+  | 139 | the hyper-connection kernels rebuilt for latency | −1.9% |
+  | 141 | the router lookahead's uploads capped after the VRAM filter | −1.2% |
+  | 142 | a RAM miss uploaded in two copies, gate+up first, its GEMM started when they land | −1.8% |
+  | 144 | 139, 141 and 142 on together, against all three off | −4.0% (85.2 → 88.3 tok/s) |
+
+  Measured and left off: the lookahead removed (+1.2%), the widest expert jobs first (143, no change), the
+  drafter's hyper-connection sites fused (140: drafts change, acceptance fell).
+- **Long context.** Decode attention reads at most 640 entries a row (the indexer's top 512 plus a 128-token window),
+  so at 64K-128K the attention phase costs what it does at 8K (~7.3 ms a step). Decode at those lengths ran
+  87-96 tok/s.
 - **Long prompts** (changes 117 to 120, `lab long` at a 1M-token context): first token for a cold 128K-token prompt
-  went from 75.4 s to 48.7 s, 64K from 34.1 to 21.1 s, 32K from 15.7 to 10.6 s.
+  went from 75.4 s to 48.7 s, 64K from 34.1 to 21.1 s, 32K from 15.7 to 10.6 s; at change 144, 128K took 40.9 s.
+  Changes 145 (Engram projection 256 rows a launch) and 146 (prefill attention reading the KV caches directly) are
+  built and exact by construction, off by default until their bit-for-bit checks run on the GPU; together they are
+  estimated at ~0.3 s off an 8K prompt and ~5 s off 128K.
 - **Mean first token** averages all six prompts. Upstream reports only cold prompts.
 - **The whole bank lives in VRAM and RAM.** At 128 GB, 0xSero's experts fit in VRAM plus the pinned RAM tier, so
   decode reads no experts from the NVMe drive. Engram's n-gram rows are still read from it.
@@ -81,6 +107,24 @@ calibration set), from his model card:
 We have not re-measured KL on this fork. The engine's `score` verb returns teacher-forced log-probabilities, so it
 can be checked.
 
+## Native MXFP4 experts against EXL3 (measured, change 147-148)
+
+The checkpoint's own MXFP4 experts are exact, so for the widest of 0xSero's experts (K4, K5) they looked like a free
+upgrade. `ds41.sh k2 bench` measured them against EXL3 at each width, on the same jobs (µs an expert, cold):
+
+| | native MXFP4 | K2 | K3 | K4 | K5 |
+|---|---|---|---|---|---|
+| decode, 18 experts of 1 row (gate+up+down) | 15.0 | 10.0 | 10.9 | 12.8 | 19.9 |
+| prefill, 128 rows an expert | 88.1 | 75.9 | 80.6 | 84.8 | 101.1 |
+
+- **Decode reads bytes:** a native expert is 18.8 MB against K4's 17.7, and K4's kernel runs at ~90% of the memory
+  floor, so even a perfect native kernel would only tie it.
+- **Prefill does arithmetic:** both kernels run at ~100-120 TFLOPS, far below the card's tensor rate. The native
+  prefill kernel keeps the reference's per-32 summation order with a separate MMA and four adds per slice, and its
+  bookkeeping, not the FP4 math, sets its speed.
+- Native wins only against K5 (35 experts, 0.17% of decode's demands). The fork keeps EXL3 for every routed expert;
+  the next prefill lever is the EXL3 prefill kernel itself.
+
 ## What the fork changes
 
 The full list is in `git log 5b0ce26..`: one commit per change, each with what it does and what it measured.
@@ -98,7 +142,10 @@ The full list is in `git log 5b0ce26..`: one commit per change, each with what i
 - Drafts copied from the conversation's own tokens (suffix drafting).
 - Row batching.
 - Selective CUDA graphs with PDL.
-- EXL3 decode kernels with deeper weight prefetch, and a layer's gate and up projections in one launch.
+- EXL3 decode kernels with deeper weight prefetch, a layer's gate and up projections in one launch, and two CTAs
+  an SM for small steps.
+- Hyper-connection sites in two launches, with kernels built for latency.
+- RAM misses uploaded in two copies (gate+up first), and the router lookahead's uploads capped after the VRAM filter.
 - GPU route planning.
 - Top-p on the host without a vocabulary sort.
 - Full residency at load whenever the RAM tier can hold the bank.
@@ -110,6 +157,8 @@ The full list is in `git log 5b0ce26..`: one commit per change, each with what i
 - The prefill reserve lent to expert slots during decode, and expert slots carved for long prompts' scratch.
 - Engram reads merged into larger runs over several readers, and read ahead for a prompt's later segments.
 - A prompt's drive reads admitted into the RAM tier as they pass.
+- Opt-in (until checked on the GPU): the Engram projection 256 rows a launch, and attention reading the KV caches
+  directly instead of a gathered copy (both bit for bit).
 
 **Serving:**
 - Every finished prompt's state saved in RAM and on disk, so a returning conversation prefills only its new
@@ -125,7 +174,8 @@ The full list is in `git log 5b0ce26..`: one commit per change, each with what i
 - 120 s keep-alive.
 
 **Tooling:**
-- A lab for A/B benches.
+- A lab for A/B benches, with per-step profiles at any context length (`lab long` after `lab start --profile`).
+- Kernel benches: EXL3 decode launches, and native MXFP4 against EXL3 K2-K5 in decode and prefill.
 - A drafter trainer that trains on s0ma's own requests, against the served target.
 
 ## Running it

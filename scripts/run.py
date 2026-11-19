@@ -430,6 +430,11 @@ def environment(cfg, render=True):
         # below every A run). Change 127's L2 prefetch stays off: with the fusion it was slower (25.24 ms). A lab
         # --env DS41_HC_FUSED=0 turns it off
         env.setdefault('DS41_HC_FUSED', '1')
+        # s0ma change 138: changes 136-137's EXL3 decode kernels two CTAs an SM for steps of at most 4 rows (exact: the
+        # same CTAs, each computing what it did). lab ab 2026-11-18, 3 rounds each, sero, seeds 21 and 22: 83.76 ->
+        # 84.81 tok/s (+1.3%, every B run above every A run), verify 24.98 -> 24.63 ms a step, tokens 14/14 identical.
+        # A lab --env DS41_EXL3_OCC2=0 turns it off
+        env.setdefault('DS41_EXL3_OCC2', '1')
         # s0ma change 58: up to 8 GiB a prompt of the experts its last 256 rows routed and its sweep read from the drive,
         # into the RAM tier as they pass (change 57). Seed 22, 48 GiB tier: 41.2-42.8 -> 45.07 tok/s (three runs of
         # the build before), NVMe misses 7,842-7,879 -> 6,527, verify 54.1 -> 51.0 ms a step, tokens 7/7 identical.

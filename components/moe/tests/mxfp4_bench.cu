@@ -6,9 +6,12 @@
 // For each: cold (after an L2 flush, as decode meets an expert), warm (back to back), the floor (a plain read of as many
 // bytes) and the time an expert. The question it answers: is a native expert faster than a K4 or K5 one, and by how
 // much (the plan assumed ~88% of the floor for native against EXL3's ~75%).
+// s0ma change 148: then prefill, a wave of 8 experts at 32, 128 and 256 rows each (native quantize + grouped_mxfp4_prefill
+// against EXL3 rotate + exl3_prefill_rotated_group at each width), where the rows share each weight and the arithmetic
+// (the trellis decode, the MMA rate) sets the time rather than the bytes.
 //
-//   nvcc -O2 -std=c++17 -arch=sm_120a -Icomponents/exl3/include -Icomponents/moe/include -Icomponents/exl3/src \
-//        components/moe/tests/mxfp4_bench.cu components/exl3/src/exl3.cu components/moe/src/mxfp4.cu \
+//   nvcc -O2 -std=c++17 -gencode arch=compute_120a,code=sm_120a -Icomponents/exl3/include -Icomponents/moe/include \
+//        -Icomponents/exl3/src components/moe/tests/mxfp4_bench.cu components/exl3/src/exl3.cu components/moe/src/mxfp4.cu \
 //        -o /tmp/mxfp4_bench && /tmp/mxfp4_bench
 #include <ds41/exl3.cuh>
 #include <ds41/kernels.cuh>
@@ -152,6 +155,63 @@ int main() {
         }
         std::printf("\n");
         cudaFree(dng); cudaFree(dnu); cudaFree(dnd); cudaFree(dxg); cudaFree(dxu); cudaFree(dxd);
+    }
+    // s0ma change 148: prefill. A wave of 8 experts with R rows each, as the prefill sweep runs a resident wave
+    // (native.inc, change 76): EXL3 rotates each expert's rows once (gate and up together, then down) and multiplies
+    // them in exl3_prefill_rotated_group at the wave's width; native quantizes the rows to E4M3 (and the SwiGLU output
+    // before down) and runs grouped_mxfp4_prefill (block-scaled FP4 x FP8 MMA). SwiGLU itself, the same for both, is
+    // left out. Cold after an L2 flush; the time an expert and the rate in TFLOPS (2 x rows x 3 x 2304 x 5120 an expert).
+    {
+        const int W = 8, RMAX = 256;
+        std::vector<__nv_bfloat16> px(size_t(W) * RMAX * H), pa(size_t(W) * RMAX * I);
+        for (auto& v : px) v = __float2bfloat16_rn(nd(rng)); for (auto& v : pa) v = __float2bfloat16_rn(nd(rng) * 0.1f);
+        __nv_bfloat16 *dpx, *dpa, *pg, *pu, *pd; half *rg, *ru, *rdn;
+        CK(cudaMalloc(&dpx, px.size() * 2)); CK(cudaMalloc(&dpa, pa.size() * 2));
+        CK(cudaMemcpy(dpx, px.data(), px.size() * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(dpa, pa.data(), pa.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&pg, size_t(W) * RMAX * I * 2)); CK(cudaMalloc(&pu, size_t(W) * RMAX * I * 2)); CK(cudaMalloc(&pd, size_t(W) * RMAX * H * 2));
+        CK(cudaMalloc(&rg, size_t(W) * RMAX * H * 2)); CK(cudaMalloc(&ru, size_t(W) * RMAX * H * 2)); CK(cudaMalloc(&rdn, size_t(W) * RMAX * I * 2));
+        uint8_t *pq, *ps, *paq, *pas;
+        CK(cudaMalloc(&pq, size_t(W) * RMAX * H)); CK(cudaMalloc(&ps, size_t(W) * RMAX * H / 32));
+        CK(cudaMalloc(&paq, size_t(W) * RMAX * I)); CK(cudaMalloc(&pas, size_t(W) * RMAX * I / 32));
+        std::printf("prefill: a wave of %d experts, rows each\n%-30s %4s %9s %9s %10s %8s\n", W, "launches", "rows", "cold us",
+                    "warm us", "us/expert", "TFLOPS");
+        for (int R : {32, 128, 256}) {
+            std::vector<ds41::GemmJob> eg(W), eu(W), ed(W), ng(W), nu(W), ndn(W);
+            for (int y = 0; y < W; ++y) {
+                const size_t xr = size_t(y) * R;
+                eg[y] = {ds41::ExpertId(y), R, reinterpret_cast<const uint8_t*>(dpx + xr * H), reinterpret_cast<const uint8_t*>(rg + xr * H), pg + xr * I};
+                eu[y] = {ds41::ExpertId(y), R, reinterpret_cast<const uint8_t*>(dpx + xr * H), reinterpret_cast<const uint8_t*>(ru + xr * H), pu + xr * I};
+                ed[y] = {ds41::ExpertId(y), R, reinterpret_cast<const uint8_t*>(dpa + xr * I), reinterpret_cast<const uint8_t*>(rdn + xr * I), pd + xr * H};
+                ng[y] = {ds41::ExpertId(y), R, pq + xr * H, ps + xr * H / 32, pg + xr * I};
+                nu[y] = {ds41::ExpertId(y), R, pq + xr * H, ps + xr * H / 32, pu + xr * I};
+                ndn[y] = {ds41::ExpertId(y), R, paq + xr * I, pas + xr * I / 32, pd + xr * H};
+            }
+            auto dev = [&](const std::vector<ds41::GemmJob>& j) { ds41::GemmJob* p; CK(cudaMalloc(&p, j.size() * sizeof(j[0])));
+                CK(cudaMemcpy(p, j.data(), j.size() * sizeof(j[0]), cudaMemcpyHostToDevice)); return p; };
+            ds41::GemmJob *deg = dev(eg), *deu = dev(eu), *ded = dev(ed), *dng = dev(ng), *dnu = dev(nu), *dnd = dev(ndn);
+            const double flop = 2.0 * R * 3.0 * I * H * W;
+            auto row = [&](const char* what, auto launch) {
+                double cold, warm; time_it(launch, cold, warm, 20);
+                std::printf("%-30s %4d %9.1f %9.1f %10.2f %8.1f\n", what, R, cold, warm, cold / W, flop / cold / 1e6);
+            };
+            row("native (quantize + 3 GEMMs)", [&] {
+                CK(ds41::quantize_mxfp8(dpx, pq, ps, W * R, H, 0));
+                CK(ds41::grouped_mxfp4_prefill(dntab, dng, W, ds41::Projection::Gate, I, H, R, 0));
+                CK(ds41::grouped_mxfp4_prefill(dntab, dnu, W, ds41::Projection::Up, I, H, R, 0));
+                CK(ds41::quantize_mxfp8(dpa, paq, pas, W * R, I, 0));
+                CK(ds41::grouped_mxfp4_prefill(dntab, dnd, W, ds41::Projection::Down, H, I, R, 0)); });
+            for (auto& b : banks) {
+                char what[48]; std::snprintf(what, sizeof what, "K%d (rotate + 3 GEMMs)", b.bits);
+                row(what, [&] {
+                    CK(ds41::exl3_prefill_rotate_group(b.table, deg, deu, W, ds41::Projection::Gate, ds41::Projection::Up, H, R, 0));
+                    CK(ds41::exl3_prefill_rotated_group(b.table, deg, W, ds41::Projection::Gate, I, H, R, b.bits, 0));
+                    CK(ds41::exl3_prefill_rotated_group(b.table, deu, W, ds41::Projection::Up, I, H, R, b.bits, 0));
+                    CK(ds41::exl3_prefill_rotate_group(b.table, ded, nullptr, W, ds41::Projection::Down, ds41::Projection::Down, I, R, 0));
+                    CK(ds41::exl3_prefill_rotated_group(b.table, ded, W, ds41::Projection::Down, H, I, R, b.bits, 0)); });
+            }
+            std::printf("\n");
+            cudaFree(deg); cudaFree(deu); cudaFree(ded); cudaFree(dng); cudaFree(dnu); cudaFree(dnd);
+        }
     }
     std::printf("done\n");
     return 0;

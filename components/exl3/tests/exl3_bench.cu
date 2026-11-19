@@ -81,7 +81,7 @@ int main() {
     g_flush_n = (size_t(256) << 20) / 16; CK(cudaMalloc(&g_flush, g_flush_n * 16));
     std::mt19937 rng(130);
     // a read buffer for the floor, and inputs/outputs wide enough for every launch
-    uint4* rd; const size_t rd_bytes = size_t(64) << 20; CK(cudaMalloc(&rd, rd_bytes)); CK(cudaMemset(rd, 1, rd_bytes));
+    uint4* rd; const size_t rd_bytes = size_t(192) << 20;   // s0ma change 134: room for the 18-expert floor (it read 64 MiB) CK(cudaMalloc(&rd, rd_bytes)); CK(cudaMemset(rd, 1, rd_bytes));
     unsigned* sink; CK(cudaMalloc(&sink, 4));
     __nv_bfloat16 *x, *y; CK(cudaMalloc(&x, size_t(8) * 32768 * 2)); CK(cudaMalloc(&y, size_t(8) * 32768 * 2));
     CK(cudaMemset(x, 0, size_t(8) * 32768 * 2));

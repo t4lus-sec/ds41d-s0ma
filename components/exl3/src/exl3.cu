@@ -468,10 +468,20 @@ __device__ __forceinline__ void splitk_body(const DeviceExpert& e,const GemmJob&
     if(!*last)return;
     __threadfence();
     float* sum_out=red;   // the sum in z order, then the rotation, as decode_body's epilogue
+    // s0ma change 134: the partials loaded eight at a time, then added in z order as before (the same sum, bit for
+    // bit): one L2 round trip per eight partials instead of one per partial (S is 8..40 for 0xSero's tensors)
     for(int i=threadIdx.x;i<job.tokens*128;i+=512){
         const size_t at=size_t(i/128)*N+blockIdx.x*128+i%128;
         float sum=0;
-        for(int s=0;s<S;++s)sum+=__ldcg(partial+size_t(s)*ROWS*N+at);
+        int s=0;
+        for(;s+8<=S;s+=8){
+            float v[8];
+            #pragma unroll
+            for(int j=0;j<8;++j)v[j]=__ldcg(partial+size_t(s+j)*ROWS*N+at);
+            #pragma unroll
+            for(int j=0;j<8;++j)sum+=v[j];
+        }
+        for(;s<S;++s)sum+=__ldcg(partial+size_t(s)*ROWS*N+at);
         sum_out[i]=sum;
     }
     __syncthreads();

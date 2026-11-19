@@ -149,8 +149,14 @@ __global__ __launch_bounds__(256) void hc_fused_mixes(const bf16*h,const float*f
  __syncthreads();
  if(!last)return;
  __threadfence();
- for(int i=tid;i<M*HCF_OUT;i+=blockDim.x){const int m=i/HCF_OUT,o=i%HCF_OUT;float v=0.f;
-  for(int q=0;q<S;++q)v=__fadd_rn(v,__ldcg(partial+((size_t)q*HCF_OUT+o)*8+m));mix[m][o]=v;}
+ // s0ma change 134: the shares loaded eight at a time, then added in CTA order as before (the same sum, bit for bit)
+ for(int i=tid;i<M*HCF_OUT;i+=blockDim.x){const int m=i/HCF_OUT,o=i%HCF_OUT;float v=0.f;int q=0;
+  for(;q+8<=S;q+=8){float w[8];
+   #pragma unroll
+   for(int j=0;j<8;++j)w[j]=__ldcg(partial+((size_t)(q+j)*HCF_OUT+o)*8+m);
+   #pragma unroll
+   for(int j=0;j<8;++j)v=__fadd_rn(v,w[j]);}
+  for(;q<S;++q)v=__fadd_rn(v,__ldcg(partial+((size_t)q*HCF_OUT+o)*8+m));mix[m][o]=v;}
  __syncthreads();
  if(warp<M){const int row=warp;const float rs=rsqrtf(__fadd_rn(__fmul_rn(mix[row][24],1.f/K4),neps));
   // sinkhorn() line for line, its m[] the mixes above and its rstd rs

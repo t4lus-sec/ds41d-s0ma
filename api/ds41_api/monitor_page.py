@@ -8,28 +8,19 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ds41d monitor</title>
 <style>
-/* s0ma change 132: the macOS Terminal "Homebrew" profile: bright green on black, a monospaced face, a window */
+/* s0ma change 132: the macOS Terminal "Homebrew" profile: bright green on black, a monospaced face (change 133:
+   the full page, no window around it) */
 :root {
   --bg: #000000; --panel: #000000; --ink: #28fe14; --muted: #20c911; --faint: #15870b; --line: #0d3a09;
   --accent: #28fe14; --accent2: #ffd400; --accent3: #36d8ff; --accent4: #ff6fd8; --warn: #ffb000; --bad: #ff453a;
-  --good: #28fe14; --chip: #062a04; --glow: rgba(40, 254, 20, .28); --desk: #1d1f21;
+  --good: #28fe14; --chip: #062a04; --glow: rgba(40, 254, 20, .28);
 }
 * { box-sizing: border-box; }
 ::selection { background: var(--ink); color: #000; }
-html { background: var(--desk); }
-body { margin: 0; color: var(--ink); background: var(--desk);
+html { background: var(--bg); }
+body { margin: 0; color: var(--ink); background: var(--bg);
   font: 13px/1.5 "Andale Mono", Monaco, Menlo, "SF Mono", ui-monospace, "DejaVu Sans Mono", monospace;
   text-shadow: 0 0 5px var(--glow); }
-.window { width: min(1480px, calc(100% - 36px)); margin: 18px auto; background: var(--bg); border-radius: 10px; overflow: hidden;
-  box-shadow: 0 0 0 1px #3a3a3c, 0 22px 60px rgba(0, 0, 0, .55); }
-.titlebar { position: relative; height: 30px; display: flex; align-items: center; padding: 0 12px;
-  background: linear-gradient(#3b3b3d, #2c2c2e); border-bottom: 1px solid #111; text-shadow: none;
-  font: 13px/1 -apple-system, "SF Pro Text", system-ui, sans-serif; color: #c7c7cc; }
-.lights { display: flex; gap: 8px; }
-.lights i { width: 12px; height: 12px; border-radius: 50%; display: block; box-shadow: inset 0 0 0 .5px rgba(0,0,0,.35); }
-.lights i:nth-child(1) { background: #ff5f57; } .lights i:nth-child(2) { background: #febc2e; } .lights i:nth-child(3) { background: #28c840; }
-.titlebar .title { position: absolute; left: 76px; right: 76px; text-align: center; pointer-events: none;
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .mono, td.n, .tile .v { font-variant-numeric: tabular-nums; }
 header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 18px; padding: 16px 22px 6px; }
 header h1 { font-size: 13px; margin: 0; font-weight: 400; }
@@ -77,12 +68,10 @@ tbody tr:hover td, tr:hover td { background: var(--chip); }
 .kv div:nth-child(even) { text-align: right; font-variant-numeric: tabular-nums; }
 footer { color: var(--faint); font-size: 12px; padding: 0 22px 18px; }
 footer::before { content: "// "; }
-@media (max-width: 520px) { .window { width: 100%; margin: 0; border-radius: 0; } header, main, footer { padding-left: 16px; padding-right: 16px; } }
+@media (max-width: 520px) { header, main, footer { padding-left: 16px; padding-right: 16px; } }
 </style>
 </head>
 <body>
-<div class="window">
-<div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="title" id="wintitle">ds41d — monitor</div></div>
 <header>
   <h1>ds41d monitor</h1>
   <div class="meta" id="status"><span class="dot"></span>connecting…</div>
@@ -114,7 +103,6 @@ footer::before { content: "// "; }
   </section>
 </main>
 <footer>Numbers only: no prompt or completion text is recorded, and conversation ids show as an 8-character hash. Refreshes every 2 s; the GPU is sampled only while this page is open.</footer>
-</div>
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
@@ -234,7 +222,6 @@ async function tick() {
     const state = d.active.length ? `<span class="dot busy"></span>${d.active.length} running` : `<span class="dot live"></span>idle`;
     $("status").innerHTML = `${state} · up ${dur(d.uptime_s)} · updated ${clock(d.now)}`;
     $("model").textContent = d.model;
-    $("wintitle").textContent = `ds41d — monitor — ${d.model}`;
     tiles(d); active(d); recent(d); experts(d); convs(d);
     const r = d.recent.filter(x => !x.probe);
     chart($("c_decode"), [{color: "--accent", dots: true, points: r.filter(x => x.completion_tokens > 8).map(x => [x.t_end, x.decode_tok_s])},

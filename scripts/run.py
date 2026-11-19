@@ -425,6 +425,11 @@ def environment(cfg, render=True):
         # --env DS41_EXL3_GU=0 turns one off
         env.setdefault('DS41_EXL3_PF', '8')
         env.setdefault('DS41_EXL3_GU', '1')
+        # s0ma change 129: change 128's fused hyper-connection sites on (rounding order only: the mixes' 20,480-term sums).
+        # lab ab 2026-11-18, 3 rounds each, sero, seeds 21 and 22: verify 25.86 -> 25.04 ms a step (-3.2%, every B run
+        # below every A run). Change 127's L2 prefetch stays off: with the fusion it was slower (25.24 ms). A lab
+        # --env DS41_HC_FUSED=0 turns it off
+        env.setdefault('DS41_HC_FUSED', '1')
         # s0ma change 58: up to 8 GiB a prompt of the experts its last 256 rows routed and its sweep read from the drive,
         # into the RAM tier as they pass (change 57). Seed 22, 48 GiB tier: 41.2-42.8 -> 45.07 tok/s (three runs of
         # the build before), NVMe misses 7,842-7,879 -> 6,527, verify 54.1 -> 51.0 ms a step, tokens 7/7 identical.

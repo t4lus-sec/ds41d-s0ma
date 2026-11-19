@@ -76,8 +76,10 @@ int main() {
     int dev = 0, sms = 0, l2 = 0; CK(cudaGetDevice(&dev));
     CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
     CK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev));
-    std::printf("%d SMs, L2 %.0f MiB; DS41_EXL3_PF=%s DS41_EXL3_DENSE_PF=%s\n", sms, l2 / 1048576.0, std::getenv("DS41_EXL3_PF"),
-                std::getenv("DS41_EXL3_DENSE_PF") ? std::getenv("DS41_EXL3_DENSE_PF") : "4");
+    std::printf("%d SMs, L2 %.0f MiB; DS41_EXL3_PF=%s DS41_EXL3_DENSE_PF=%s DS41_EXL3_OCC2=%s DS41_EXL3_OCC2_PF=%s\n", sms, l2 / 1048576.0,
+                std::getenv("DS41_EXL3_PF"), std::getenv("DS41_EXL3_DENSE_PF") ? std::getenv("DS41_EXL3_DENSE_PF") : "4",
+                std::getenv("DS41_EXL3_OCC2") ? std::getenv("DS41_EXL3_OCC2") : "0",
+                std::getenv("DS41_EXL3_OCC2_PF") ? std::getenv("DS41_EXL3_OCC2_PF") : "2");
     g_flush_n = (size_t(256) << 20) / 16; CK(cudaMalloc(&g_flush, g_flush_n * 16));
     std::mt19937 rng(130);
     // a read buffer for the floor, and inputs/outputs wide enough for every launch
@@ -170,8 +172,8 @@ int main() {
         const std::pair<const char*, size_t> parts[] = {{"gate+up", gu_bytes}, {"down", d_bytes}};
         for (int p = 0; p < 2; ++p) {
             auto launch = [&] {
-                if (p == 0) CK(ds41::grouped_exl3_var_gu(det, dg, du, count, 2304, 5120, dbits, 0));
-                else CK(ds41::grouped_exl3_var(det, dd, count, ds41::Projection::Down, 5120, 2304, dbits, 0));
+                if (p == 0) CK(ds41::grouped_exl3_var_gu(det, dg, du, count, 2304, 5120, dbits, 0, rows));
+                else CK(ds41::grouped_exl3_var(det, dd, count, ds41::Projection::Down, 5120, 2304, dbits, 0, rows));
             };
             double cold, warm, floor_c, floor_w;
             time_it(launch, cold, warm);

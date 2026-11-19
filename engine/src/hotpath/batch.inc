@@ -493,12 +493,12 @@ void bmoe(int l,int m) {
   io_ms+=clock_ms()-t;
   try {
     bgraph(p+".experts."+std::to_string(plan.ids.size()),m,[&]{
-      CK(expert_gemm_gate_up(jobs.as<ds41::GemmJob>(),up_jobs.as<ds41::GemmJob>(),int(gj.size()),stream,l));   // s0ma change 122
+      CK(expert_gemm_gate_up(jobs.as<ds41::GemmJob>(),up_jobs.as<ds41::GemmJob>(),int(gj.size()),stream,l,m));   // s0ma changes 122, 136
       CK(ds41::swiglu(gate.as<Bf16>(),up.as<Bf16>(),broute.as<float>(),
           act.as<Bf16>(),plan.count,I,10,stream));
       if(!exl3) CK(ds41::quantize_mxfp8(act.as<Bf16>(),eq.as<uint8_t>(),es.as<uint8_t>(),
           plan.count,I,stream));
-      CK(expert_gemm(down_jobs.as<ds41::GemmJob>(),int(dj.size()),ds41::Projection::Down,H,I,stream,l));
+      CK(expert_gemm(down_jobs.as<ds41::GemmJob>(),int(dj.size()),ds41::Projection::Down,H,I,stream,l,m));   // s0ma change 136: m rows
       hotpath::scatter_routes(compact_down.p,route_slots.as<int>(),down.p,plan.count,stream);
       bshared(p,m);
       CK(ds41::reduce_experts(down.as<Bf16>(),ids_device.as<int32_t>(),

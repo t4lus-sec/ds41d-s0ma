@@ -317,7 +317,7 @@ static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
         uint8_t* dbits; const uint8_t b8 = uint8_t(bits);
         CK(cudaMalloc(&dbits, 1)); CK(cudaMemcpy(dbits, &b8, 1, cudaMemcpyHostToDevice));
         CK(ds41::exl3_set_bits(bits == 2 ? 3 : 2));   // the global width must not matter
-        CK(ds41::grouped_exl3_var(dt, dj, 1, c.p, N, K, dbits, 0));
+        CK(ds41::grouped_exl3_var(dt, dj, 1, c.p, N, K, dbits, 0, M));   // s0ma change 136: M rows (DS41_EXL3_OCC2)
         CK(cudaDeviceSynchronize());
         // s0ma change 122: gate and up in one launch give grouped_exl3_var's bits (here both read the same weights)
         if (K == 5120 && c.p != ds41::Projection::Down) {
@@ -326,7 +326,7 @@ static double run_case(const Case& c, std::mt19937& rng, bool* invariant) {
             ds41::GemmJob gj{0, M, reinterpret_cast<const uint8_t*>(dx), nullptr, og}, uj{0, M, reinterpret_cast<const uint8_t*>(dx), nullptr, ou};
             CK(cudaMalloc(&dg, sizeof gj)); CK(cudaMalloc(&du, sizeof uj));
             CK(cudaMemcpy(dg, &gj, sizeof gj, cudaMemcpyHostToDevice)); CK(cudaMemcpy(du, &uj, sizeof uj, cudaMemcpyHostToDevice));
-            CK(ds41::grouped_exl3_var_gu(dt, dg, du, 1, N, K, dbits, 0));
+            CK(ds41::grouped_exl3_var_gu(dt, dg, du, 1, N, K, dbits, 0, M));
             CK(cudaDeviceSynchronize());
             std::vector<uint16_t> a(size_t(M) * N), g(a.size()), u(a.size());
             CK(cudaMemcpy(a.data(), dout, a.size() * 2, cudaMemcpyDeviceToHost));
@@ -447,9 +447,10 @@ int main() {
     fail += !f32_case(4, 5120, 2048, 6, rng);
     fail += !f32_case(4, 5120, 1280, 1, rng);
     fail += !f32_case(5, 8192, 1024, 4, rng);
-    std::printf("output digest %016llx (DS41_EXL3_PF=%s, DS41_EXL3_DENSE_PF=%s)\n", (unsigned long long)g_digest,
+    std::printf("output digest %016llx (DS41_EXL3_PF=%s, DS41_EXL3_DENSE_PF=%s, DS41_EXL3_OCC2=%s)\n", (unsigned long long)g_digest,
                 std::getenv("DS41_EXL3_PF") ? std::getenv("DS41_EXL3_PF") : "4",
-                std::getenv("DS41_EXL3_DENSE_PF") ? std::getenv("DS41_EXL3_DENSE_PF") : "4");
+                std::getenv("DS41_EXL3_DENSE_PF") ? std::getenv("DS41_EXL3_DENSE_PF") : "4",
+                std::getenv("DS41_EXL3_OCC2") ? std::getenv("DS41_EXL3_OCC2") : "0");
     std::printf(fail ? "%d FAILED\n" : "all passed\n", fail);
     return fail ? 1 : 0;
 }

@@ -436,8 +436,10 @@ class Native final : public Forward, public hotpath::GateEvidence {
     splitk_counts[lane].resize(size_t(splitk_jobs) * 40 * 4);
     CK(cudaMemset(splitk_counts[lane].p, 0, splitk_counts[lane].bytes));
   }
+  // s0ma change 136: rows, the most rows any job holds (the step's rows); with DS41_EXL3_OCC2=1 and rows <= 4 the
+  // mixed-width kernels run two CTAs to an SM
   cudaError_t expert_gemm(const ds41::GemmJob *jobs, int count, ds41::Projection p,
-                          int n, int k, cudaStream_t s, int layer) {
+                          int n, int k, cudaStream_t s, int layer, int rows = 8) {
     if (exl3 && exl3_splitk_on() && count <= splitk_jobs) {
       const int lane = lane_b_active ? 1 : 0;
       if (splitk_partial[lane].bytes)
@@ -447,7 +449,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
                                          splitk_counts[lane].as<unsigned>(), splitk_counts[lane].bytes / 4, s);
     }
     if (exl3 && !expert_bits(layer))   // s0ma change 15: a layer whose experts differ in width
-      return ds41::grouped_exl3_var(experts->table(), jobs, count, p, n, k, expert_width_dev.as<uint8_t>(), s);
+      return ds41::grouped_exl3_var(experts->table(), jobs, count, p, n, k, expert_width_dev.as<uint8_t>(), s, rows);
     return exl3 ? ds41::grouped_exl3_bits(experts->table(), jobs, count, p, n, k, expert_bits(layer), s)
                 : ds41::grouped_mxfp4_native_parallel(experts->table(), jobs, count, p, n, k, s);
   }
@@ -458,12 +460,12 @@ class Native final : public Forward, public hotpath::GateEvidence {
     return on;
   }
   cudaError_t expert_gemm_gate_up(const ds41::GemmJob *gate_jobs, const ds41::GemmJob *up_jobs, int count, cudaStream_t s,
-                                  int layer) {
+                                  int layer, int rows = 8) {
     const bool splitk = exl3 && exl3_splitk_on() && count <= splitk_jobs && splitk_partial[lane_b_active ? 1 : 0].bytes;
     if (exl3 && !expert_bits(layer) && exl3_gu_on() && !splitk)
-      return ds41::grouped_exl3_var_gu(experts->table(), gate_jobs, up_jobs, count, I, H, expert_width_dev.as<uint8_t>(), s);
-    if (const cudaError_t e = expert_gemm(gate_jobs, count, ds41::Projection::Gate, I, H, s, layer); e != cudaSuccess) return e;
-    return expert_gemm(up_jobs, count, ds41::Projection::Up, I, H, s, layer);
+      return ds41::grouped_exl3_var_gu(experts->table(), gate_jobs, up_jobs, count, I, H, expert_width_dev.as<uint8_t>(), s, rows);
+    if (const cudaError_t e = expert_gemm(gate_jobs, count, ds41::Projection::Gate, I, H, s, layer, rows); e != cudaSuccess) return e;
+    return expert_gemm(up_jobs, count, ds41::Projection::Up, I, H, s, layer, rows);
   }
   std::unique_ptr<hotpath::FusedOps> fused;
   std::unique_ptr<ds41::DirectReader> reader;

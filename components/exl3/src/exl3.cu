@@ -74,7 +74,7 @@ __device__ __forceinline__ void decode_body(const DeviceExpert* table,const Gemm
             #pragma unroll
             for(int f=0;f<2;++f){
                 int c=wn*32+t*16+f*8+2*(lane&3);
-                red[(wk*8+r)*128+c]=acc[t][f][0];red[(wk*8+r)*128+c+1]=acc[t][f][1];
+                red[(wk*ROWS+r)*128+c]=acc[t][f][0];red[(wk*ROWS+r)*128+c+1]=acc[t][f][1];   // s0ma change 136: ROWS a partition (8 as before)
             }
         }
     }
@@ -84,7 +84,7 @@ __device__ __forceinline__ void decode_body(const DeviceExpert* table,const Gemm
     for(int i=threadIdx.x;i<job.tokens*128;i+=512){
         float sum=0;
         #pragma unroll
-        for(int w=0;w<4;++w)sum+=red[w*8*128+i];
+        for(int w=0;w<4;++w)sum+=red[w*ROWS*128+i];
         out[i]=sum;
     }
     __syncthreads();
@@ -96,10 +96,11 @@ __global__ __launch_bounds__(512,1) void decode(const DeviceExpert* table,const 
     decode_body<K,BITS,ROWS,__nv_bfloat16,PF>(table,jobs[blockIdx.y],projection,N);
 }
 // s0ma change 34 (N1): one job passed by value (a dense tensor: no device job array, and a captured graph keeps it)
-template<int K,int BITS,int ROWS=8,typename OutT=__nv_bfloat16,int PF=4>
+template<int K,int BITS,int ROWS=8,typename OutT=__nv_bfloat16,int PF=4,int MINB=1>
 // blockIdx.y = g of a set of tensors at consecutive table entries, reading x + g*gx and writing output + g*go
 // s0ma change 127: PF as decode()'s (DS41_EXL3_DENSE_PF=8 for the dense tensors; exact)
-__global__ __launch_bounds__(512,1) void decode_one(const DeviceExpert* table,const GemmJob job,int N,int xs,int os,int gx,int go) {DS41_PDL_WAIT();
+// s0ma change 136: MINB 2 (DS41_EXL3_OCC2=1): two CTAs an SM, at most 64 registers a thread (exact)
+__global__ __launch_bounds__(512,MINB) void decode_one(const DeviceExpert* table,const GemmJob job,int N,int xs,int os,int gx,int go) {DS41_PDL_WAIT();
     GemmJob mine=job;
     mine.expert=job.expert+blockIdx.y;
     mine.x=job.x+size_t(blockIdx.y)*gx*2;
@@ -108,13 +109,13 @@ __global__ __launch_bounds__(512,1) void decode_one(const DeviceExpert* table,co
 }
 // s0ma change 15: one launch for jobs of several widths. Each CTA reads its job's expert's width from `bits` and
 // runs that width's decode, so the work per CTA is exactly decode<K,BITS>'s (block-uniform branch, same shared memory).
-template<int K,int PF=4>
+template<int K,int PF=4,int ROWS=8>
 __device__ __forceinline__ void decode_var_body(const DeviceExpert* table,const GemmJob job,int projection,int N,const uint8_t* bits) {
     switch(bits[job.expert]){
-        case 2: decode_body<K,2,8,__nv_bfloat16,PF>(table,job,projection,N); break;
-        case 3: decode_body<K,3,8,__nv_bfloat16,PF>(table,job,projection,N); break;
-        case 4: decode_body<K,4,8,__nv_bfloat16,PF>(table,job,projection,N); break;
-        case 5: decode_body<K,5,8,__nv_bfloat16,PF>(table,job,projection,N); break;
+        case 2: decode_body<K,2,ROWS,__nv_bfloat16,PF>(table,job,projection,N); break;
+        case 3: decode_body<K,3,ROWS,__nv_bfloat16,PF>(table,job,projection,N); break;
+        case 4: decode_body<K,4,ROWS,__nv_bfloat16,PF>(table,job,projection,N); break;
+        case 5: decode_body<K,5,ROWS,__nv_bfloat16,PF>(table,job,projection,N); break;
         default: asm volatile("trap;");
     }
 }
@@ -130,6 +131,20 @@ __global__ __launch_bounds__(512,1) void decode_var_gu(const DeviceExpert* table
     const int y=blockIdx.y;
     if(y<count)decode_var_body<K,PF>(table,gate[y],0,N,bits);
     else decode_var_body<K,PF>(table,up[y-count],1,N,bits);
+}
+// s0ma change 136 (DS41_EXL3_OCC2=1): the same CTAs two to an SM. At most 4 rows a job, so the input and the
+// partitions' partial sums take 4*K*2 + 8 KiB of shared memory (48 KiB at K 5120), and at most 64 registers a thread.
+// Each CTA computes exactly what its decode_var / decode_var_gu CTA computes (ROWS sets only where rows are kept).
+template<int K,int PF>
+__global__ __launch_bounds__(512,2) void decode_var_occ2(const DeviceExpert* table,const GemmJob* jobs,int projection,int N,const uint8_t* bits) {DS41_PDL_WAIT();
+    decode_var_body<K,PF,4>(table,jobs[blockIdx.y],projection,N,bits);
+}
+template<int K,int PF>
+__global__ __launch_bounds__(512,2) void decode_var_gu_occ2(const DeviceExpert* table,const GemmJob* gate,const GemmJob* up,int count,
+                                                            int N,const uint8_t* bits) {DS41_PDL_WAIT();
+    const int y=blockIdx.y;
+    if(y<count)decode_var_body<K,PF,4>(table,gate[y],0,N,bits);
+    else decode_var_body<K,PF,4>(table,up[y-count],1,N,bits);
 }
 // s0ma: the same tile computed by a cluster of four CTAs, one per K partition (blockIdx.z), four warps each. Every
 // warp does exactly what warp (wn, wk) of decode() does: the same rotated inputs (each CTA rotates only the 128-wide
@@ -492,8 +507,8 @@ __device__ __forceinline__ void splitk_body(const DeviceExpert& e,const GemmJob&
 // 128, wq_a 10, shared w1/w3 18, wo_b 40) so one CTA a tile left most of the 188 SMs idle. blockIdx.z takes K range
 // [z*KC, z*KC + KC); the last CTA of a tile to arrive (an atomic count) adds the partials in z order 0..S-1, so the
 // result does not depend on arrival order, rotates the sum and writes BF16, then resets the count.
-template<int KC,int BITS,int PF=4>
-__global__ __launch_bounds__(512,1) void decode_splitk(const DeviceExpert* table,const GemmJob job,int N,int K,int xs,int os,
+template<int KC,int BITS,int PF=4,int MINB=1>   // s0ma change 136: MINB as decode_one's
+__global__ __launch_bounds__(512,MINB) void decode_splitk(const DeviceExpert* table,const GemmJob job,int N,int K,int xs,int os,
                                                       int gx,int go,float* partial,unsigned* counts) {DS41_PDL_WAIT();
     constexpr int ROWS=8;
     __shared__ __align__(16) half A[ROWS*KC<2048?2048:ROWS*KC];
@@ -583,6 +598,14 @@ bool split_on(){static const bool on=[]{const char*v=std::getenv("DS41_EXL3_SPLI
 bool split_failed=false;
 // s0ma change 122: DS41_EXL3_PF=8 keeps 8 slices a warp in flight in the decode kernels (4 before): twice the bytes in
 // flight an SM, for the latency-bound tail waves and small batches. Exact either way.
+// s0ma change 136: DS41_EXL3_OCC2=1: the decode kernels two CTAs to an SM (at most 64 registers a thread) when every
+// job has at most 4 rows: decode_var/decode_var_gu (max_tokens from the caller), decode_one (K 1280, 5120) and
+// decode_splitk. Nsight Compute: one 512-thread CTA an SM (16 warps, 33% occupancy, held by registers and shared
+// memory), 0.8-1.4 eligible warps a scheduler, and the last partial wave up to a third of a launch. Exact: the same
+// CTAs, each computing what it did.
+bool occ2_on(){static const bool on=[]{const char*v=std::getenv("DS41_EXL3_OCC2");return v&&std::string(v)=="1";}();return on;}
+// DS41_EXL3_OCC2_PF: slices a warp keeps in flight in those kernels, 2 (no spills at 64 registers) or 4 (a few spilled)
+int occ2_pf(){static const int d=[]{const char*v=std::getenv("DS41_EXL3_OCC2_PF");return v&&std::string(v)=="4"?4:2;}();return d;}
 int pf_depth(){static const int d=[]{const char*v=std::getenv("DS41_EXL3_PF");return v&&std::string(v)=="8"?8:4;}();return d;}
 // s0ma change 127: DS41_EXL3_DENSE_PF=8: the same for the dense tensors' decode (decode_one, decode_splitk). Exact.
 int dense_pf_depth(){static const int d=[]{const char*v=std::getenv("DS41_EXL3_DENSE_PF");return v&&std::string(v)=="8"?8:4;}();return d;}
@@ -634,17 +657,43 @@ template<int BITS> cudaError_t launch_k(const DeviceExpert* t,const GemmJob* j,i
     if(k==128)return launch_decode<128,BITS>(t,j,count,p,n,s);
     return cudaErrorNotSupported;
 }
-template<int K,int PF> cudaError_t launch_var_pf(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,const uint8_t* bits,cudaStream_t s){
+template<int K,int PF> cudaError_t launch_var_pf(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,const uint8_t* bits,int max_tokens,cudaStream_t s){
+    if(occ2_on()&&max_tokens<=4){   // s0ma change 136
+        constexpr int ob=(4*K*2<4096?4096:4*K*2)+4*4*128*4;
+        if(occ2_pf()==4){
+            auto e=smem_once<exl3_detail::decode_var_occ2<K,4>>(ob);
+            if(e!=cudaSuccess)return e;
+            exl3_detail::decode_var_occ2<K,4><<<dim3(n/128,count),512,ob,s>>>(t,j,int(p),n,bits);
+        }else{
+            auto e=smem_once<exl3_detail::decode_var_occ2<K,2>>(ob);
+            if(e!=cudaSuccess)return e;
+            exl3_detail::decode_var_occ2<K,2><<<dim3(n/128,count),512,ob,s>>>(t,j,int(p),n,bits);
+        }
+        return cudaGetLastError();
+    }
     constexpr int bytes=(8*K*2<4096?4096:8*K*2)+4*8*128*4;
     auto err=smem_once<exl3_detail::decode_var<K,PF>>(bytes);
     if(err!=cudaSuccess)return err;
     exl3_detail::decode_var<K,PF><<<dim3(n/128,count),512,bytes,s>>>(t,j,int(p),n,bits);
     return cudaGetLastError();
 }
-template<int K> cudaError_t launch_var(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,const uint8_t* bits,cudaStream_t s){
-    return pf_depth()==8?launch_var_pf<K,8>(t,j,count,p,n,bits,s):launch_var_pf<K,4>(t,j,count,p,n,bits,s);
+template<int K> cudaError_t launch_var(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,const uint8_t* bits,int max_tokens,cudaStream_t s){
+    return pf_depth()==8?launch_var_pf<K,8>(t,j,count,p,n,bits,max_tokens,s):launch_var_pf<K,4>(t,j,count,p,n,bits,max_tokens,s);
 }
-template<int K,int PF> cudaError_t launch_var_gu(const DeviceExpert* t,const GemmJob* g,const GemmJob* u,int count,int n,const uint8_t* bits,cudaStream_t s){
+template<int K,int PF> cudaError_t launch_var_gu(const DeviceExpert* t,const GemmJob* g,const GemmJob* u,int count,int n,const uint8_t* bits,int max_tokens,cudaStream_t s){
+    if(occ2_on()&&max_tokens<=4){   // s0ma change 136
+        constexpr int ob=(4*K*2<4096?4096:4*K*2)+4*4*128*4;
+        if(occ2_pf()==4){
+            auto e=smem_once<exl3_detail::decode_var_gu_occ2<K,4>>(ob);
+            if(e!=cudaSuccess)return e;
+            exl3_detail::decode_var_gu_occ2<K,4><<<dim3(n/128,2*count),512,ob,s>>>(t,g,u,count,n,bits);
+        }else{
+            auto e=smem_once<exl3_detail::decode_var_gu_occ2<K,2>>(ob);
+            if(e!=cudaSuccess)return e;
+            exl3_detail::decode_var_gu_occ2<K,2><<<dim3(n/128,2*count),512,ob,s>>>(t,g,u,count,n,bits);
+        }
+        return cudaGetLastError();
+    }
     constexpr int bytes=(8*K*2<4096?4096:8*K*2)+4*8*128*4;
     auto err=smem_once<exl3_detail::decode_var_gu<K,PF>>(bytes);
     if(err!=cudaSuccess)return err;
@@ -652,16 +701,16 @@ template<int K,int PF> cudaError_t launch_var_gu(const DeviceExpert* t,const Gem
     return cudaGetLastError();
 }
 // s0ma change 122: gate and up of `count` experts in one launch (k 5120 only: the routed experts' gate and up)
-cudaError_t grouped_exl3_var_gu(const DeviceExpert* t,const GemmJob* g,const GemmJob* u,int count,int n,int k,const uint8_t* bits,cudaStream_t s){
+cudaError_t grouped_exl3_var_gu(const DeviceExpert* t,const GemmJob* g,const GemmJob* u,int count,int n,int k,const uint8_t* bits,cudaStream_t s,int max_tokens){
     if(!valid(t,g,count,Projection::Gate,n,k)||!u||!bits||count>32767||k!=5120)return cudaErrorInvalidValue;if(!count)return cudaSuccess;
-    return pf_depth()==8?launch_var_gu<5120,8>(t,g,u,count,n,bits,s):launch_var_gu<5120,4>(t,g,u,count,n,bits,s);
+    return pf_depth()==8?launch_var_gu<5120,8>(t,g,u,count,n,bits,max_tokens,s):launch_var_gu<5120,4>(t,g,u,count,n,bits,max_tokens,s);
 }
-cudaError_t grouped_exl3_var(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,const uint8_t* bits,cudaStream_t s){
+cudaError_t grouped_exl3_var(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,const uint8_t* bits,cudaStream_t s,int max_tokens){
     if(!valid(t,j,count,p,n,k) || !bits || k>5120)return cudaErrorInvalidValue;if(!count)return cudaSuccess;
-    if(k==5120)return launch_var<5120>(t,j,count,p,n,bits,s);
-    if(k==2304)return launch_var<2304>(t,j,count,p,n,bits,s);
-    if(k==256)return launch_var<256>(t,j,count,p,n,bits,s);
-    if(k==128)return launch_var<128>(t,j,count,p,n,bits,s);
+    if(k==5120)return launch_var<5120>(t,j,count,p,n,bits,max_tokens,s);
+    if(k==2304)return launch_var<2304>(t,j,count,p,n,bits,max_tokens,s);
+    if(k==256)return launch_var<256>(t,j,count,p,n,bits,max_tokens,s);
+    if(k==128)return launch_var<128>(t,j,count,p,n,bits,max_tokens,s);
     return cudaErrorNotSupported;
 }
 cudaError_t grouped_exl3_bits(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,int k,int bits,cudaStream_t s){
@@ -693,7 +742,17 @@ template<int K,int BITS,typename OutT,int PF> cudaError_t launch_one_pf(const De
     exl3_detail::decode_one<K,BITS,ROWS,OutT,PF><<<dim3(n/128,groups),512,bytes,s>>>(t,j,n,xs,os,gx,go);
     return cudaGetLastError();
 }
+template<int K,int BITS,typename OutT,int PF> cudaError_t launch_one_occ2(const DeviceExpert* t,const GemmJob& j,int n,int xs,int os,int groups,int gx,int go,cudaStream_t s){
+    constexpr int bytes=(4*K*2<4096?4096:4*K*2)+4*4*128*4;   // s0ma change 136: 4 rows, two CTAs an SM
+    auto err=smem_once<exl3_detail::decode_one<K,BITS,4,OutT,PF,2>>(bytes);
+    if(err!=cudaSuccess)return err;
+    exl3_detail::decode_one<K,BITS,4,OutT,PF,2><<<dim3(n/128,groups),512,bytes,s>>>(t,j,n,xs,os,gx,go);
+    return cudaGetLastError();
+}
 template<int K,int BITS,typename OutT=__nv_bfloat16> cudaError_t launch_one(const DeviceExpert* t,const GemmJob& j,int n,int xs,int os,int groups,int gx,int go,cudaStream_t s){
+    if constexpr(K==1280||K==5120)   // s0ma change 136: wq_b and the head
+        if(occ2_on()&&j.tokens>=1&&j.tokens<=4)
+            return occ2_pf()==4?launch_one_occ2<K,BITS,OutT,4>(t,j,n,xs,os,groups,gx,go,s):launch_one_occ2<K,BITS,OutT,2>(t,j,n,xs,os,groups,gx,go,s);
     if constexpr(K==1280||K==2304||K==4096||K==5120||K==8192)   // the dense tensors' decode widths
         if(dense_pf_depth()==8)return launch_one_pf<K,BITS,OutT,8>(t,j,n,xs,os,groups,gx,go,s);
     return launch_one_pf<K,BITS,OutT,4>(t,j,n,xs,os,groups,gx,go,s);
@@ -716,6 +775,20 @@ template<int KC> cudaError_t launch_splitk(const DeviceExpert* t,const GemmJob& 
                                            int groups,int gx,int go,float* partial,unsigned* counts,cudaStream_t s){
     const dim3 grid(n/128,groups,k/KC);
     const bool pf8=dense_pf_depth()==8;   // s0ma change 127
+    if(occ2_on()){   // s0ma change 136: two CTAs an SM (32 KiB of shared memory each at most)
+        switch(bits){
+            case 2: if(occ2_pf()==4)exl3_detail::decode_splitk<KC,2,4,2><<<grid,512,0,s>>>(t,j,n,k,xs,os,gx,go,partial,counts);
+                    else exl3_detail::decode_splitk<KC,2,2,2><<<grid,512,0,s>>>(t,j,n,k,xs,os,gx,go,partial,counts); break;
+            case 3: if(occ2_pf()==4)exl3_detail::decode_splitk<KC,3,4,2><<<grid,512,0,s>>>(t,j,n,k,xs,os,gx,go,partial,counts);
+                    else exl3_detail::decode_splitk<KC,3,2,2><<<grid,512,0,s>>>(t,j,n,k,xs,os,gx,go,partial,counts); break;
+            case 4: if(occ2_pf()==4)exl3_detail::decode_splitk<KC,4,4,2><<<grid,512,0,s>>>(t,j,n,k,xs,os,gx,go,partial,counts);
+                    else exl3_detail::decode_splitk<KC,4,2,2><<<grid,512,0,s>>>(t,j,n,k,xs,os,gx,go,partial,counts); break;
+            case 5: if(occ2_pf()==4)exl3_detail::decode_splitk<KC,5,4,2><<<grid,512,0,s>>>(t,j,n,k,xs,os,gx,go,partial,counts);
+                    else exl3_detail::decode_splitk<KC,5,2,2><<<grid,512,0,s>>>(t,j,n,k,xs,os,gx,go,partial,counts); break;
+            default: return cudaErrorInvalidValue;
+        }
+        return cudaGetLastError();
+    }
     switch(bits){
         case 2: if(pf8)exl3_detail::decode_splitk<KC,2,8><<<grid,512,0,s>>>(t,j,n,k,xs,os,gx,go,partial,counts);
                 else exl3_detail::decode_splitk<KC,2><<<grid,512,0,s>>>(t,j,n,k,xs,os,gx,go,partial,counts); break;

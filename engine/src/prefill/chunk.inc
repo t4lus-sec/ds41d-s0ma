@@ -171,14 +171,15 @@ void cproject(const ds41e::prefill::Layer& work,int64_t first,int rows,const cha
   size_t base=size_t(first-pf.begin);auto p="layers."+std::to_string(l),a=p+".attn";
   pcopy(c.h.p,pf.hidden.as<char>(base*HC*H*2),size_t(rows)*HC*H*2);
   pcopy(c.pre.p,pf.previous_pre.as<char>(base*4*4),size_t(rows)*4*4);
-  if((l==1||l==14) && raw && prefill_engram_batch()) {   // s0ma change 67: 8 rows a projection
-    int group[8],count=0;
+  if((l==1||l==14) && raw && prefill_engram_batch()) {   // s0ma change 67: 8 rows a projection (145: up to 256)
+    const int cap=engram_rows_cap();
+    std::vector<int> group(cap);int count=0;
     for(int r=0;r<rows;++r) {
       if(pf.image[base+r])continue; // image rows pass Engram layers untouched
       group[count++]=r;
-      if(count==8){pengram_rows(l,raw,group,count,c.h);count=0;}
+      if(count==cap){pengram_rows(l,raw,group.data(),count,c.h);count=0;}
     }
-    if(count)pengram_rows(l,raw,group,count,c.h);
+    if(count)pengram_rows(l,raw,group.data(),count,c.h);
   } else if(l==1||l==14) {
     for(int r=0;r<rows;++r) {
       if(pf.image[base+r])continue; // image rows pass Engram layers untouched

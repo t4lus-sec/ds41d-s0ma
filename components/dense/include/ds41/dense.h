@@ -15,6 +15,10 @@ int ds41_dense_fp8(const void* a_fp8, const void* as_ue8m0, const void* w_fp8,
 // variant 2: native block-scaled MMA with parallel dot and serial carry (fixture-gated separately).
 // variants 3/4/5/6: native (warps, output columns) = (4,8)/(4,4)/(8,4)/(4,2).
 // M in 1..8, N/K positive multiples of 32. Weight scales [N/32,K/32], activation scales [M,K/32].
+// s0ma change 145: any M rows of the native variants (2-6), bit for bit what each 8-row slice gives there, reading
+// the weight once for every 64 rows instead of every 8. K=6144 only (else cudaErrorInvalidValue).
+int ds41_dense_fp8_rows(const void* a_fp8, const void* as_ue8m0, const void* w_fp8,
+                        const void* ws_ue8m0, void* y_bf16, int M, int N, int K, cudaStream_t stream);
 int ds41_dense_dequant(const void* w_fp8, const void* ws_ue8m0, void* w_bf16, int N,int K,cudaStream_t stream);
 int ds41_dense_roundtrip(const void* a_fp8,const void* as_ue8m0,void* x_bf16,int M,int K,cudaStream_t stream);
 int ds41_dense_rms(const void* x_bf16,const void* weight_bf16,void* y_bf16,int M,int K,float eps,cudaStream_t stream);

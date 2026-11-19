@@ -606,6 +606,10 @@ bool split_failed=false;
 bool occ2_on(){static const bool on=[]{const char*v=std::getenv("DS41_EXL3_OCC2");return v&&std::string(v)=="1";}();return on;}
 // DS41_EXL3_OCC2_PF: slices a warp keeps in flight in those kernels, 2 (no spills at 64 registers) or 4 (a few spilled)
 int occ2_pf(){static const int d=[]{const char*v=std::getenv("DS41_EXL3_OCC2_PF");return v&&std::string(v)=="4"?4:2;}();return d;}
+// s0ma change 137: DS41_EXL3_OCC2_EXPERT_PF: the same for the expert kernels (decode_var_occ2, decode_var_gu_occ2),
+// 4 by default ("2" for 2). The bench: experts are fastest at 4 (13 jobs gate+up 98 us against 115 at 2), the dense
+// tensors at 2 (wo_a 25 us against 34 at 4).
+int expert_occ2_pf(){static const int d=[]{const char*v=std::getenv("DS41_EXL3_OCC2_EXPERT_PF");return v&&std::string(v)=="2"?2:4;}();return d;}
 int pf_depth(){static const int d=[]{const char*v=std::getenv("DS41_EXL3_PF");return v&&std::string(v)=="8"?8:4;}();return d;}
 // s0ma change 127: DS41_EXL3_DENSE_PF=8: the same for the dense tensors' decode (decode_one, decode_splitk). Exact.
 int dense_pf_depth(){static const int d=[]{const char*v=std::getenv("DS41_EXL3_DENSE_PF");return v&&std::string(v)=="8"?8:4;}();return d;}
@@ -658,9 +662,9 @@ template<int BITS> cudaError_t launch_k(const DeviceExpert* t,const GemmJob* j,i
     return cudaErrorNotSupported;
 }
 template<int K,int PF> cudaError_t launch_var_pf(const DeviceExpert* t,const GemmJob* j,int count,Projection p,int n,const uint8_t* bits,int max_tokens,cudaStream_t s){
-    if(occ2_on()&&max_tokens<=4){   // s0ma change 136
+    if(occ2_on()&&max_tokens<=4){   // s0ma changes 136, 137
         constexpr int ob=(4*K*2<4096?4096:4*K*2)+4*4*128*4;
-        if(occ2_pf()==4){
+        if(expert_occ2_pf()==4){
             auto e=smem_once<exl3_detail::decode_var_occ2<K,4>>(ob);
             if(e!=cudaSuccess)return e;
             exl3_detail::decode_var_occ2<K,4><<<dim3(n/128,count),512,ob,s>>>(t,j,int(p),n,bits);
@@ -681,9 +685,9 @@ template<int K> cudaError_t launch_var(const DeviceExpert* t,const GemmJob* j,in
     return pf_depth()==8?launch_var_pf<K,8>(t,j,count,p,n,bits,max_tokens,s):launch_var_pf<K,4>(t,j,count,p,n,bits,max_tokens,s);
 }
 template<int K,int PF> cudaError_t launch_var_gu(const DeviceExpert* t,const GemmJob* g,const GemmJob* u,int count,int n,const uint8_t* bits,int max_tokens,cudaStream_t s){
-    if(occ2_on()&&max_tokens<=4){   // s0ma change 136
+    if(occ2_on()&&max_tokens<=4){   // s0ma changes 136, 137
         constexpr int ob=(4*K*2<4096?4096:4*K*2)+4*4*128*4;
-        if(occ2_pf()==4){
+        if(expert_occ2_pf()==4){
             auto e=smem_once<exl3_detail::decode_var_gu_occ2<K,4>>(ob);
             if(e!=cudaSuccess)return e;
             exl3_detail::decode_var_gu_occ2<K,4><<<dim3(n/128,2*count),512,ob,s>>>(t,g,u,count,n,bits);

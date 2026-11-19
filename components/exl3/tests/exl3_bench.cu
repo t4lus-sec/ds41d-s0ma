@@ -76,10 +76,11 @@ int main() {
     int dev = 0, sms = 0, l2 = 0; CK(cudaGetDevice(&dev));
     CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
     CK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev));
-    std::printf("%d SMs, L2 %.0f MiB; DS41_EXL3_PF=%s DS41_EXL3_DENSE_PF=%s DS41_EXL3_OCC2=%s DS41_EXL3_OCC2_PF=%s\n", sms, l2 / 1048576.0,
+    std::printf("%d SMs, L2 %.0f MiB; DS41_EXL3_PF=%s DS41_EXL3_DENSE_PF=%s DS41_EXL3_OCC2=%s DS41_EXL3_OCC2_PF=%s DS41_EXL3_OCC2_EXPERT_PF=%s\n", sms, l2 / 1048576.0,
                 std::getenv("DS41_EXL3_PF"), std::getenv("DS41_EXL3_DENSE_PF") ? std::getenv("DS41_EXL3_DENSE_PF") : "4",
                 std::getenv("DS41_EXL3_OCC2") ? std::getenv("DS41_EXL3_OCC2") : "0",
-                std::getenv("DS41_EXL3_OCC2_PF") ? std::getenv("DS41_EXL3_OCC2_PF") : "2");
+                std::getenv("DS41_EXL3_OCC2_PF") ? std::getenv("DS41_EXL3_OCC2_PF") : "2",
+                std::getenv("DS41_EXL3_OCC2_EXPERT_PF") ? std::getenv("DS41_EXL3_OCC2_EXPERT_PF") : "4");
     g_flush_n = (size_t(256) << 20) / 16; CK(cudaMalloc(&g_flush, g_flush_n * 16));
     std::mt19937 rng(130);
     // a read buffer for the floor, and inputs/outputs wide enough for every launch

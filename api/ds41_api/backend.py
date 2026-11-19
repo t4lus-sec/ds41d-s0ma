@@ -131,21 +131,29 @@ class FinishEvent:
     finish_reason: str  # "stop" | "length" | "cancelled" | "error"
     usage: Usage = field(default_factory=Usage)
     error: Optional[str] = None
+    # s0ma change 131: the engine's own stats object for the request (timings, counters), when it sends one: read by
+    # the monitor (ds41_api.monitor), never put into a response
+    stats: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "type": "finish",
             "finish_reason": self.finish_reason,
             "usage": self.usage.to_dict(),
             "error": self.error,
         }
+        if self.stats is not None:
+            d["stats"] = self.stats
+        return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "FinishEvent":
+        stats = d.get("stats")
         return cls(
             finish_reason=d["finish_reason"],
             usage=Usage.from_dict(d.get("usage", {})),
             error=d.get("error"),
+            stats=stats if isinstance(stats, dict) else None,
         )
 
 

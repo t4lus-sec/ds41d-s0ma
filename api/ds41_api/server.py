@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from . import encoding as enc
 from .backend import Backend, FinishEvent, SamplingParams, TokenEvent
@@ -47,6 +47,8 @@ from .encoder import CharTokenizer, DEFAULT_MODEL_ID, Encoder
 from .vision import expand_prompt_async
 from .fake_backend import FakeBackend
 from .loopguard import LoopGuardBackend
+from .monitor import Monitor, MonitorBackend, enabled as monitor_enabled
+from .monitor_page import PAGE as MONITOR_PAGE
 from .parser import StreamParser
 from .schemas import ChatCompletionRequest, resolve_thinking_mode
 from .socket_backend import SocketBackend
@@ -127,8 +129,29 @@ def create_app(
 ) -> FastAPI:
     cfg = config or ServerConfig()
     gate = RequestGate(cfg)
+    # s0ma change 131: the monitor sees each engine request (inside the loop guard, so a restart shows as its own)
+    monitor = Monitor() if monitor_enabled() else None
+    if monitor is not None:
+        backend = MonitorBackend(backend, monitor)
+        monitor.queued = lambda: gate._waiting
     backend = LoopGuardBackend.wrap(backend, encoder)   # s0ma change 114
     app = FastAPI(title="DS41 API", version="0.2.0")
+    app.state.monitor = monitor
+    quiet = []
+
+    def quiet_monitor_polls() -> None:
+        # s0ma change 131: the page polls every 2 s; keep those requests out of the access log (added at the first
+        # poll, once uvicorn has set its loggers up)
+        if quiet:
+            return
+        import logging
+
+        class _NoMonitor(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                return "/monitor" not in record.getMessage()
+
+        logging.getLogger("uvicorn.access").addFilter(_NoMonitor())
+        quiet.append(True)
 
     @app.middleware("http")
     async def body_size_limit(request: Request, call_next):
@@ -174,6 +197,21 @@ def create_app(
     @app.get("/health")
     async def health() -> Dict[str, Any]:
         return {"ok": True, "model": model_id}
+
+    # s0ma change 131: live engine analytics (ds41_api.monitor); numbers only
+    @app.get("/monitor")
+    async def monitor_page():
+        if monitor is None:
+            raise HTTPException(status_code=404, detail="the monitor is off (DS41_MONITOR=0)")
+        return HTMLResponse(MONITOR_PAGE, headers={"Cache-Control": "no-store"})
+
+    @app.get("/monitor/data")
+    async def monitor_data():
+        if monitor is None:
+            raise HTTPException(status_code=404, detail="the monitor is off (DS41_MONITOR=0)")
+        quiet_monitor_polls()
+        monitor.poll(backend)
+        return JSONResponse(monitor.snapshot(model_id), headers={"Cache-Control": "no-store"})
 
     # s0ma change 109: a finished conversation's saved prompt states go
     # (RAM, disk), so the live ones keep the room.

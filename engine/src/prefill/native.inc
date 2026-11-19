@@ -1081,6 +1081,20 @@ static bool prefill_engram_batch() {
   static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_ENGRAM_BATCH"); return !v || std::string(v) != "0"; }();
   return on;
 }
+// s0ma change 145: with DS41_PREFILL_ENGRAM_WIDE=1 a chunk's Engram rows go to the projection together (up to 256),
+// through ds41_dense_fp8_rows: it reads the 157 MB wkv matrix once a 64 rows instead of once every 8 (the 8K bench
+// prompt: 2,000 passes, 236 ms of its 3.07 s prefill). Bit for bit the 8-row calls (k2 check: fp8_rows_check).
+// s0ma change 146: with DS41_PREFILL_FUSED_GATHER=1 a chunk's attention reads the window ring and the compressed cache
+// itself (components/attn/src/kv_source.cuh) instead of a gathered BF16 copy ([rows, width+k, 512]: 168 MB a chunk at
+// k 512, written and read again). Bit for bit (k2 check: fused_gather_check).
+static bool prefill_fused_gather() {
+  static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_FUSED_GATHER"); return v && v[0] == '1'; }();
+  return on;
+}
+static int engram_rows_cap() {
+  static const int cap = [] { const char *v = std::getenv("DS41_PREFILL_ENGRAM_WIDE"); return v && v[0] == '1' ? 256 : 8; }();
+  return cap;
+}
 void pengram_rows(int layer,const char* raw,const int* rows,int count,Device& chunk_h) {
   auto p="layers."+std::to_string(layer)+".engram";
   auto &weight=w(p+".wkv.weight");
@@ -1093,16 +1107,23 @@ void pengram_rows(int layer,const char* raw,const int* rows,int count,Device& ch
     return;
   }
   constexpr size_t R=24*264;
-  for(int i=0;i<count;++i)
-    CK(cudaMemcpyAsync(pe_raw.as<char>(size_t(i)*R),raw+size_t(rows[i])*R,R,cudaMemcpyHostToDevice,stream));
+  if(count>engram_rows_cap())throw std::logic_error("pengram_rows: more rows than the Engram buffers hold");
+  for(int i=0;i<count;) {   // s0ma change 145: a run of consecutive prompt rows in one copy (the same bytes)
+    int j=i+1;while(j<count&&rows[j]==rows[j-1]+1)++j;
+    CK(cudaMemcpyAsync(pe_raw.as<char>(size_t(i)*R),raw+size_t(rows[i])*R,R*size_t(j-i),cudaMemcpyHostToDevice,stream));
+    i=j;
+  }
   async_engram->dequant(pe_raw.p,pe_bf.p,24*count,stream);
   CK(ds41_dense_quant(pe_bf.p,pe_aq.p,pe_as.p,count,6144,stream));
-  CK(ds41_dense_fp8(pe_aq.p,pe_as.p,weight.data.p,w(p+".wkv.scale").data.p,pe_kv.p,count,(HC+1)*H,6144,2,stream));
+  if(count>8)   // s0ma change 145: bit for bit the 8-row variant-2 calls, w read once a 64 rows (k2 check: fp8_rows_check)
+    CK(ds41_dense_fp8_rows(pe_aq.p,pe_as.p,weight.data.p,w(p+".wkv.scale").data.p,pe_kv.p,count,(HC+1)*H,6144,stream));
+  else CK(ds41_dense_fp8(pe_aq.p,pe_as.p,weight.data.p,w(p+".wkv.scale").data.p,pe_kv.p,count,(HC+1)*H,6144,2,stream));
   // s0ma change 94: every row's gate in one launch, in place (the per-row call's geometry: bit for bit)
   static const bool batched=[]{const char* v=std::getenv("DS41_PREFILL_ENGRAM_ROWS");return !(v&&v[0]=='0');}();
   if(batched) {
-    CK(ds41e::prefill::engram_gate_rows(chunk_h.p,rows,count,pe_kv.p,w(p+".q_weight").data.p,w(p+".k_weight").data.p,
-                                         H,1e-20f,stream));
+    for(int i=0;i<count;i+=8)   // the gate takes 8 rows a launch; each row's block computes what it did
+      CK(ds41e::prefill::engram_gate_rows(chunk_h.p,rows+i,std::min(8,count-i),pe_kv.as<char>(size_t(i)*(HC+1)*H*2),
+                                           w(p+".q_weight").data.p,w(p+".k_weight").data.p,H,1e-20f,stream));
     return;
   }
   for(int i=0;i<count;++i) {
@@ -1687,13 +1708,25 @@ PrefillResult prefill(const std::vector<int>& input,const PrefillOptions& option
   auto mark=[&](const char* name){phase_marks.push_back({name,clock_ms()});};
   const void* initial_h=h.p;
   prefill_warm_counts.clear();
+  // s0ma change 126: an image's encoder and rows need VRAM begin_prompt did not count. Borrowed here, before the
+  // residency snapshot: lending moves and drops experts, so lent after it (as change 51 did) the prompt failed its
+  // tier check ("prefill changed decode tier membership") and poisoned the Spark adapter. With change 117's carve
+  // there are ~36 lendable chunks, so a prompt that had not already borrowed them all always failed. And only what the
+  // segment's images and the prefill need, not every chunk (36 would take ~18 GB of experts out of VRAM).
+  if(options.images&&!options.images->empty()) {
+    size_t need=prefill_lend_need(input.size());
+    for(const auto &img:*options.images) {
+      const int64_t b=std::max<int64_t>(img.start,committed),e=std::min<int64_t>(img.end(),committed+int64_t(input.size()));
+      if(b<e)need+=VisionEncoder::workspace_bytes(img);
+    }
+    prefill_lend(need);
+  }
   std::vector<uint8_t> residency_before;
   try{residency_before=p_residency(*experts);}catch(...){poisoned=true;throw;}
   mark("residency");
   auto plan=ds41e::prefill::plan(committed,int64_t(input.size()),int64_t(options.logits_tail),
       train_all?int64_t(input.size()):128);   // s0ma change 99: a training capture keeps every row's captures
-  // s0ma change 51: an image's encoder and rows need VRAM begin_prompt did not count: every lendable chunk
-  if(options.images&&!options.images->empty())prefill_lend(~size_t(0)>>1);
+  // (s0ma change 126: an image prompt's VRAM is borrowed above, before the residency snapshot)
   // Image rows of this segment. Each image the segment touches is encoded first, before the prefill arena
   // takes free VRAM; only its aligner rows (10 MB at most) stay allocated until the prefill returns.
   struct Rows {void* p=nullptr;~Rows(){if(p)cudaFree(p);}};

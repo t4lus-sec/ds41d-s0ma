@@ -75,6 +75,17 @@ void bhc(const std::string &p, const char *kind, Device &target_pre, int m) {
         mixes.as<float>(r*24*4), rstd.as<float>(r*4),
         1, H, 1e-20f, 1e-6f, stream));
 }
+// s0ma change 128 (DS41_HC_FUSED=1, rows 1..8): bhc, ds41_dense_hc_pre, the norm and (f32_out) bf16_float in two
+// launches. The coefficients' long sums in another order (rounding only); the mix, norm and copy bit for bit.
+bool hc_fused_ok(int m) const { return hc_fused && m>=1 && m<=8; }
+void hc_site(const std::string &p,const char *kind,Device &target_pre,const Device &incoming,const std::string &norm,
+             int m,bool f32_out) {
+  const int i=lane_b_active?1:0;
+  CK(ds41_dense_hc_fused_mixes(h.p,w(p+".hc_"+kind+"_fn").data.as<float>(),w(p+".hc_"+kind+"_scale").data.as<float>(),
+      w(p+".hc_"+kind+"_base").data.as<float>(),target_pre.as<float>(),post.as<float>(),comb.as<float>(),
+      hc_part[i].as<float>(),hc_count[i].as<unsigned>(),m,H,1e-20f,1e-6f,stream));
+  CK(ds41_dense_hc_pre_norm(h.p,incoming.as<float>(),w(norm+".weight").data.p,x.p,f32_out?f32.as<float>():nullptr,m,H,stream));
+}
 void bfused_prepare(const std::string &p,const char *kind,Device &new_pre,
                     Device &incoming,const std::string &norm,int m,bool quant) {
   CK(fused->prepare(blas,h.p,w(p+".hc_"+kind+"_fn").data.as<float>(),
@@ -482,12 +493,12 @@ void bmoe(int l,int m) {
   io_ms+=clock_ms()-t;
   try {
     bgraph(p+".experts."+std::to_string(plan.ids.size()),m,[&]{
-      CK(expert_gemm_gate_up(jobs.as<ds41::GemmJob>(),up_jobs.as<ds41::GemmJob>(),int(gj.size()),stream,l));   // s0ma change 122
+      CK(expert_gemm_gate_up(jobs.as<ds41::GemmJob>(),up_jobs.as<ds41::GemmJob>(),int(gj.size()),stream,l,m));   // s0ma changes 122, 136
       CK(ds41::swiglu(gate.as<Bf16>(),up.as<Bf16>(),broute.as<float>(),
           act.as<Bf16>(),plan.count,I,10,stream));
       if(!exl3) CK(ds41::quantize_mxfp8(act.as<Bf16>(),eq.as<uint8_t>(),es.as<uint8_t>(),
           plan.count,I,stream));
-      CK(expert_gemm(down_jobs.as<ds41::GemmJob>(),int(dj.size()),ds41::Projection::Down,H,I,stream,l));
+      CK(expert_gemm(down_jobs.as<ds41::GemmJob>(),int(dj.size()),ds41::Projection::Down,H,I,stream,l,m));   // s0ma change 136: m rows
       hotpath::scatter_routes(compact_down.p,route_slots.as<int>(),down.p,plan.count,stream);
       bshared(p,m);
       CK(ds41::reduce_experts(down.as<Bf16>(),ids_device.as<int32_t>(),
@@ -606,10 +617,12 @@ void batch_front(int l,BatchLane &lane) {
     if(l==20 && !multi.active) candidate_count=std::min(2048,(scan+7)/8)*8;
     auto attention_body=[&]{
     bgraph(p+".query",m,[&]{
+      l2_prefetch_begin(l);   // s0ma change 127: the layer's dense tensors into L2 on a side stream
       size_t base=size_t(l)*hotpath::GateLayout::LayerBytes;
       bgate(base+hotpath::GateLayout::Input,h.p,hotpath::GateLayout::hc_bytes,m);
       bgate(base+hotpath::GateLayout::IncomingPre,pre.p,16,m);
       if(fused) bfused_prepare(p,"attn",att_pre,pre,p+".attn_norm",m,true);
+      else if(hc_fused_ok(m)) hc_site(p,"attn",att_pre,pre,p+".attn_norm",m,false);   // s0ma change 128
       else {
         bhc(p,"attn",att_pre,m);
         CK(ds41_dense_hc_pre(h.p,pre.as<float>(),x.p,m,H,stream));
@@ -629,6 +642,7 @@ void batch_front(int l,BatchLane &lane) {
       bgate(base+hotpath::GateLayout::AttnPre,att_pre.p,16,m);
       bgate(base+hotpath::GateLayout::AttnPost,post.p,16,m);
       bgate(base+hotpath::GateLayout::AttnComb,comb.p,64,m);
+      l2_prefetch_end(l);   // s0ma change 127: the side stream joins back
     });
     btrace(pos,m,l,"attn_input",x,H);
     if(multi.active) battention_multi(l); else battention(l,pos,m);   // s0ma change 91
@@ -646,6 +660,7 @@ void batch_front(int l,BatchLane &lane) {
     size_t base=size_t(l)*hotpath::GateLayout::LayerBytes;
     bgate(base+hotpath::GateLayout::AfterAttn,h.p,hotpath::GateLayout::hc_bytes,m);
     if(fused) bfused_prepare(p,"ffn",ffn_pre,att_pre,p+".ffn_norm",m,false);
+    else if(hc_fused_ok(m)) hc_site(p,"ffn",ffn_pre,att_pre,p+".ffn_norm",m,true);   // s0ma change 128
     else {
       bhc(p,"ffn",ffn_pre,m);
       CK(ds41_dense_hc_pre(h.p,att_pre.as<float>(),x.p,m,H,stream));
@@ -682,6 +697,8 @@ void batch_head(BatchLane &lane,int row) {
     bgate(hotpath::GateLayout::final_h,h.p,hotpath::GateLayout::hc_bytes,m);
     bgate(hotpath::GateLayout::final_pre,pre.p,16,m);
     if(fused) CK(fused->norm(h.p,pre.as<float>(),w("norm.weight").data.p,x.p,f32.as<float>(),nullptr,nullptr,m,H,1e-20f,stream));
+    else if(hc_fused_ok(m))   // s0ma change 128: the mix, the final norm and the FP32 copy in one launch (exact)
+      CK(ds41_dense_hc_pre_norm(h.p,pre.as<float>(),w("norm.weight").data.p,x.p,f32.as<float>(),m,H,stream));
     else {
       CK(ds41_dense_hc_pre(h.p,pre.as<float>(),x.p,m,H,stream));
       bnorm("norm",x.p,x.p,H,m);

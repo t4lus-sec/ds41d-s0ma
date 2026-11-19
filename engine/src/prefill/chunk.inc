@@ -155,6 +155,17 @@ void cattention(const ds41e::prefill::Layer& work,int64_t first,int rows,int64_t
     CK(cudaMemcpy2DAsync(c.top.p,size_t(k)*4,pf.selected.as<char>(row*512*4),512*4,size_t(k)*4,qn,cudaMemcpyDeviceToDevice,stream));
   auto* g=owner<0?nullptr:globals.at(owner).get();
   const int width=pf.cold?int(std::min<int64_t>(128,pf.end)):128;
+  if(prefill_fused_gather()) {   // s0ma change 146: the attention kernels read the caches; only the local index is written
+    if(pf.cold)upload(c.start,&qb,8);
+    ds41_attn_kv_source s{pf.window.p,int(pf.rows+128),g?g->kv.p:nullptr,g?g->capacity:0,k?c.top.as<int32_t>():nullptr,k,
+                          pf.cold?0:qb,pf.cold?c.start.as<int64_t>():nullptr,ratio,width,pf.cold?1:0};
+    CK(ds41_attn_gather_index(&s,qn,c.local.as<int32_t>(),stream));
+    if(!pf.cold&&owner>=0)CK(ds41_attn_sparse_split_fused(c.q.p,&s,w(p+".attn_sink").data.as<float>(),c.local.as<int32_t>(),
+        c.o.p,c.attn_scores.as<float>(),qn,width+k,16,stream));
+    else CK(ds41_attn_sparse_fused(c.q.p,&s,w(p+".attn_sink").data.as<float>(),c.local.as<int32_t>(),c.o.p,qn,width+k,16,stream));
+    crope(c.o.p,64,512,freqs(l,qb),qn,true);CK(ds41_attn_roundtrip(c.o.p,qn,32768,DS41_SWA_FP8,stream));
+    return;
+  }
   if(pf.cold) {
     upload(c.start,&qb,8);
     CK(ds41_attn_gather_prefill_at(pf.window.p,int(pf.rows+128),g?g->kv.p:nullptr,g?g->capacity:0,
@@ -171,14 +182,15 @@ void cproject(const ds41e::prefill::Layer& work,int64_t first,int rows,const cha
   size_t base=size_t(first-pf.begin);auto p="layers."+std::to_string(l),a=p+".attn";
   pcopy(c.h.p,pf.hidden.as<char>(base*HC*H*2),size_t(rows)*HC*H*2);
   pcopy(c.pre.p,pf.previous_pre.as<char>(base*4*4),size_t(rows)*4*4);
-  if((l==1||l==14) && raw && prefill_engram_batch()) {   // s0ma change 67: 8 rows a projection
-    int group[8],count=0;
+  if((l==1||l==14) && raw && prefill_engram_batch()) {   // s0ma change 67: 8 rows a projection (145: up to 256)
+    const int cap=engram_rows_cap();
+    std::vector<int> group(cap);int count=0;
     for(int r=0;r<rows;++r) {
       if(pf.image[base+r])continue; // image rows pass Engram layers untouched
       group[count++]=r;
-      if(count==8){pengram_rows(l,raw,group,count,c.h);count=0;}
+      if(count==cap){pengram_rows(l,raw,group.data(),count,c.h);count=0;}
     }
-    if(count)pengram_rows(l,raw,group,count,c.h);
+    if(count)pengram_rows(l,raw,group.data(),count,c.h);
   } else if(l==1||l==14) {
     for(int r=0;r<rows;++r) {
       if(pf.image[base+r])continue; // image rows pass Engram layers untouched

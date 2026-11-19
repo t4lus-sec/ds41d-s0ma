@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdint>
 // s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
 // predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
 #ifndef DS41_PDL_WAIT
@@ -114,6 +116,189 @@ __global__ void shared_act(const bf16*g,const bf16*u,bf16*z,uint8_t*a,uint8_t*s,
  value=__bfloat162float(zz);float mx=fabsf(value);for(int d=16;d;d>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,d));uint32_t bits=__float_as_uint(__fmul_rn(fmaxf(mx,1e-4f),1.f/448.f));unsigned exponent=(bits>>23)+((bits&0x7fffff)!=0);float inv=__uint_as_float((254-exponent)<<23);a[i]=__nv_cvt_float_to_fp8(fminf(448.f,fmaxf(-448.f,__fmul_rn(value,inv))),__NV_SATFINITE,__NV_E4M3);if(!lane)s[group]=exponent;
 }
 __global__ void routerweights(const float*s,const int32_t*ids,float*w,int M,int N,int topk,float scale){DS41_PDL_WAIT();int row=blockIdx.x,lane=threadIdx.x;float v[6]={0,0,0,0,0,0};if(lane>=topk)return;for(int i=0;i<topk;++i)v[i]=s[row*N+ids[row*topk+i]];float sum=topk==6?__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[4]),v[2]),__fadd_rn(__fadd_rn(v[1],v[5]),v[3])):__fadd_rn(__fadd_rn(v[0],v[2]),v[1]);w[row*topk+lane]=__fmul_rn(v[lane]/__fadd_rn(sum,1e-20f),scale);}
+// s0ma change 128: a hyper-connection site's coefficients in one launch. Each of S CTAs takes 512 of the row's 4*K
+// promoted inputs and, for every row, its share of the 24 mixes (fn . h) and of sum(h*h): each lane over its 16
+// inputs in order, then a butterfly. The last CTA to arrive adds the S shares in CTA order, takes rstd from the sum
+// and runs the Sinkhorn exactly as sinkhorn() does with those mixes and rstd. One row's arithmetic never depends on
+// how many rows the launch has. Against ds41_dense_hc_mixes only the order of the 20,480-term sums changes (cuBLAS's
+// GEMV and promote_stats' tree): a rounding-order change. No promoted copy and no host-side per-row calls.
+constexpr int HCF_CH=512,HCF_OUT=25;
+__global__ __launch_bounds__(256) void hc_fused_mixes(const bf16*h,const float*fn,const float*s,const float*b,float*pre,
+    float*post,float*comb,float*partial,unsigned*count,int M,int K4,float neps,float heps){DS41_PDL_WAIT();
+ __shared__ float hs[8][HCF_CH];
+ __shared__ float mix[8][HCF_OUT];
+ __shared__ int last;
+ const int S=gridDim.x,c0=blockIdx.x*HCF_CH,tid=threadIdx.x,lane=tid&31,warp=tid>>5;
+ for(int i=tid;i<M*HCF_CH;i+=blockDim.x){const int m=i/HCF_CH,k=i%HCF_CH;hs[m][k]=__bfloat162float(h[(size_t)m*K4+c0+k]);}
+ __syncthreads();
+ for(int o=warp;o<HCF_OUT;o+=8){
+  float acc[8]={0,0,0,0,0,0,0,0};
+  if(o<24){const float*f=fn+(size_t)o*K4+c0;
+   for(int k=lane;k<HCF_CH;k+=32){const float wv=f[k];
+    #pragma unroll
+    for(int m=0;m<8;++m)if(m<M)acc[m]=__fmaf_rn(wv,hs[m][k],acc[m]);}
+  }else{
+   for(int k=lane;k<HCF_CH;k+=32){
+    #pragma unroll
+    for(int m=0;m<8;++m)if(m<M){const float a=hs[m][k];acc[m]=__fmaf_rn(a,a,acc[m]);}}
+  }
+  #pragma unroll
+  for(int m=0;m<8;++m)if(m<M){float v=acc[m];for(int d=16;d;d>>=1)v=__fadd_rn(v,__shfl_xor_sync(0xffffffff,v,d));
+   if(!lane)partial[((size_t)blockIdx.x*HCF_OUT+o)*8+m]=v;}
+ }
+ __threadfence();__syncthreads();
+ if(!tid)last=atomicAdd(count,1u)==unsigned(S-1);
+ __syncthreads();
+ if(!last)return;
+ __threadfence();
+ // s0ma change 134: the shares loaded eight at a time, then added in CTA order as before (the same sum, bit for bit)
+ for(int i=tid;i<M*HCF_OUT;i+=blockDim.x){const int m=i/HCF_OUT,o=i%HCF_OUT;float v=0.f;int q=0;
+  for(;q+8<=S;q+=8){float w[8];
+   #pragma unroll
+   for(int j=0;j<8;++j)w[j]=__ldcg(partial+((size_t)(q+j)*HCF_OUT+o)*8+m);
+   #pragma unroll
+   for(int j=0;j<8;++j)v=__fadd_rn(v,w[j]);}
+  for(;q<S;++q)v=__fadd_rn(v,__ldcg(partial+((size_t)q*HCF_OUT+o)*8+m));mix[m][o]=v;}
+ __syncthreads();
+ if(warp<M){const int row=warp;const float rs=rsqrtf(__fadd_rn(__fmul_rn(mix[row][24],1.f/K4),neps));
+  // sinkhorn() line for line, its m[] the mixes above and its rstd rs
+  float z=lane<24?mix[row][lane]:0.f;z=__fmul_rn(z,rs);
+  if(lane<4){pre[row*4+lane]=__fadd_rn(1.f/(1.f+expf(-__fmaf_rn(z,s[0],b[lane]))),heps);float p=mix[row][4+lane];p=__fmul_rn(p,rs);post[row*4+lane]=__fmul_rn(2.f,1.f/(1.f+expf(-__fmaf_rn(p,s[1],b[4+lane]))));}
+  float q=lane<16?mix[row][8+lane]:0.f;q=__fmul_rn(q,rs);float v=__fmaf_rn(q,s[2],b[8+(lane&15)]);
+  float mx=fmaxf(v,__shfl_xor_sync(0xffffffff,v,1));mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,2));
+  v=expf(v-mx);v=__fadd_rn(v/sum4(v),heps);v=v/__fadd_rn(colsum4(v),heps);
+  for(int it=1;it<20;++it){v=v/__fadd_rn(sum4(v),heps);v=v/__fadd_rn(colsum4(v),heps);}
+  if(lane<16)comb[row*16+lane]=v;
+ }
+ if(!tid)*count=0u;
+}
+// s0ma change 128: hcpre, then the decode RMSNorm (ds41e::hotpath::rms, eps 1e-20, its launch geometry), then optionally
+// the FP32 copy (bf16_float): one block a row, the mixed row kept in shared memory. The same operations in the same
+// order as the three launches, so the same bits.
+__global__ void hc_pre_norm(const bf16*h,const float*p,const bf16*w,bf16*y,float*yf,int M,int K){DS41_PDL_WAIT();
+ extern __shared__ bf16 mixed[];__shared__ float sh[512];
+ const int r=blockIdx.x,t=threadIdx.x;if(r>=M)return;
+ for(int k=t;k<K;k+=blockDim.x){float v[4];for(int j=0;j<4;++j)v[j]=__fmul_rn(p[r*4+j],__bfloat162float(h[((size_t)r*4+j)*K+k]));
+  mixed[k]=__float2bfloat16_rn(__fadd_rn(__fadd_rn(__fadd_rn(__fadd_rn(0.f,v[0]),v[1]),v[2]),v[3]));}
+ __syncthreads();
+ float v[4]={0,0,0,0};
+ for(int i=t*4;i<K;i+=blockDim.x*4)for(int j=0;j<4;++j)if(i+j<K){float z=__bfloat162float(mixed[i+j]);v[j]=__fadd_rn(v[j],__fmul_rn(z,z));}
+ float sum=__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[1]),v[2]),v[3]);
+ sh[t]=sum;__syncthreads();
+ for(int d=blockDim.x/2;d>=32;d>>=1){if(t<d){sum=__fadd_rn(sum,sh[t+d]);sh[t]=sum;}__syncthreads();}
+ if(t<32){for(int d=16;d;d>>=1)sum=__fadd_rn(sum,__shfl_down_sync(0xffffffff,sum,d));if(!t)sh[0]=rsqrtf(__fadd_rn(__fmul_rn(sum,1.f/K),1e-20f));}
+ __syncthreads();
+ for(int i=t;i<K;i+=blockDim.x){const bf16 o=__float2bfloat16_rn(__fmul_rn(__fmul_rn(__bfloat162float(mixed[i]),sh[0]),__bfloat162float(w[i])));
+  y[(size_t)r*K+i]=o;if(yf)yf[(size_t)r*K+i]=__bfloat162float(o);}
+}
+// s0ma change 139: the same two kernels for latency (DS41_HC_FAST=1), the same bits.
+// hc_fused_mixes made each warp's 3-4 outputs one after another, the 16 weights a lane four loads at a time: 12-16 DRAM
+// round trips in a row (~0.7 us each) for 2 MB a site. Here a CTA makes 5 outputs, one a warp (grid S x 5), and each
+// lane loads its 16 weights at once, before the grid dependency wait (the weights are never written, so with DS41_PDL
+// the loads overlap the kernel before). Each (chunk, output) share is the same sum of the same products in the same
+// order, by the same lanes, then the same butterfly; the last CTA loads the S shares at once and adds them in CTA order.
+constexpr int HCF2_OPC=5,HCF2_SMAX=64;
+__global__ __launch_bounds__(32*HCF2_OPC) void hc_fused_mixes2(const bf16*h,const float*fn,const float*s,const float*b,
+    float*pre,float*post,float*comb,float*partial,unsigned*count,int M,int K4,float neps,float heps){
+ __shared__ float hs[8][HCF_CH];
+ __shared__ float mix[8][HCF_OUT];
+ __shared__ int last;
+ const int S=gridDim.x,c0=blockIdx.x*HCF_CH,tid=threadIdx.x,lane=tid&31,warp=tid>>5,o=blockIdx.y*HCF2_OPC+warp;
+ float wv[16];
+ if(o<24){const float*f=fn+(size_t)o*K4+c0;
+  #pragma unroll
+  for(int i=0;i<16;++i)wv[i]=__ldg(f+lane+32*i);}
+ DS41_PDL_WAIT();
+ for(int i=tid;i<M*(HCF_CH/8);i+=blockDim.x){const int m=i/(HCF_CH/8),k=(i%(HCF_CH/8))*8;
+  const uint4 u=*reinterpret_cast<const uint4*>(h+(size_t)m*K4+c0+k);const bf16*e=reinterpret_cast<const bf16*>(&u);
+  #pragma unroll
+  for(int j=0;j<8;++j)hs[m][k+j]=__bfloat162float(e[j]);}
+ __syncthreads();
+ if(o<HCF_OUT){
+  float acc[8]={0,0,0,0,0,0,0,0};
+  if(o<24){
+   #pragma unroll
+   for(int i=0;i<16;++i){const int k=lane+32*i;
+    #pragma unroll
+    for(int m=0;m<8;++m)if(m<M)acc[m]=__fmaf_rn(wv[i],hs[m][k],acc[m]);}
+  }else{
+   #pragma unroll
+   for(int i=0;i<16;++i){const int k=lane+32*i;
+    #pragma unroll
+    for(int m=0;m<8;++m)if(m<M){const float a=hs[m][k];acc[m]=__fmaf_rn(a,a,acc[m]);}}
+  }
+  #pragma unroll
+  for(int m=0;m<8;++m)if(m<M){float v=acc[m];for(int d=16;d;d>>=1)v=__fadd_rn(v,__shfl_xor_sync(0xffffffff,v,d));
+   if(!lane)partial[((size_t)blockIdx.x*HCF_OUT+o)*8+m]=v;}
+ }
+ __threadfence();__syncthreads();
+ if(!tid)last=atomicAdd(count,1u)==unsigned(S*gridDim.y-1);
+ __syncthreads();
+ if(!last)return;
+ __threadfence();
+ for(int i=tid;i<M*HCF_OUT;i+=blockDim.x){const int m=i/HCF_OUT,o2=i%HCF_OUT;float v=0.f;
+  if(S<=HCF2_SMAX){float w[HCF2_SMAX];
+   #pragma unroll
+   for(int j=0;j<HCF2_SMAX;++j)if(j<S)w[j]=__ldcg(partial+((size_t)j*HCF_OUT+o2)*8+m);
+   #pragma unroll
+   for(int j=0;j<HCF2_SMAX;++j)if(j<S)v=__fadd_rn(v,w[j]);
+  }else for(int q=0;q<S;++q)v=__fadd_rn(v,__ldcg(partial+((size_t)q*HCF_OUT+o2)*8+m));
+  mix[m][o2]=v;}
+ __syncthreads();
+ for(int row=warp;row<M;row+=HCF2_OPC){const float rs=rsqrtf(__fadd_rn(__fmul_rn(mix[row][24],1.f/K4),neps));
+  // sinkhorn() line for line, as in hc_fused_mixes
+  float z=lane<24?mix[row][lane]:0.f;z=__fmul_rn(z,rs);
+  if(lane<4){pre[row*4+lane]=__fadd_rn(1.f/(1.f+expf(-__fmaf_rn(z,s[0],b[lane]))),heps);float p=mix[row][4+lane];p=__fmul_rn(p,rs);post[row*4+lane]=__fmul_rn(2.f,1.f/(1.f+expf(-__fmaf_rn(p,s[1],b[4+lane]))));}
+  float q=lane<16?mix[row][8+lane]:0.f;q=__fmul_rn(q,rs);float v=__fmaf_rn(q,s[2],b[8+(lane&15)]);
+  float mx=fmaxf(v,__shfl_xor_sync(0xffffffff,v,1));mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,2));
+  v=expf(v-mx);v=__fadd_rn(v/sum4(v),heps);v=v/__fadd_rn(colsum4(v),heps);
+  for(int it=1;it<20;++it){v=v/__fadd_rn(sum4(v),heps);v=v/__fadd_rn(colsum4(v),heps);}
+  if(lane<16)comb[row*16+lane]=v;
+ }
+ if(!tid)*count=0u;
+}
+// s0ma change 139: hc_pre_norm with its loads issued together: the norm weight (never written) read before the grid
+// dependency wait, the four streams eight columns at a time. The same operations on the same values in the same order.
+constexpr int HCPN_PRE=16;
+__global__ void hc_pre_norm2(const bf16*h,const float*p,const bf16*w,bf16*y,float*yf,int M,int K){
+ extern __shared__ bf16 mixed[];__shared__ float sh[512];
+ const int r=blockIdx.x,t=threadIdx.x,B=blockDim.x,nI=(K+B-1)/B;
+ float wr[HCPN_PRE];
+ if(nI<=HCPN_PRE){
+  #pragma unroll
+  for(int u=0;u<HCPN_PRE;++u){const int i=t+u*B;wr[u]=u<nI&&i<K?__bfloat162float(w[i]):0.f;}}
+ DS41_PDL_WAIT();
+ if(r>=M)return;
+ float pr[4];
+ #pragma unroll
+ for(int j=0;j<4;++j)pr[j]=p[r*4+j];
+ for(int k0=t;k0<K;k0+=B*8){float hv[8][4];
+  #pragma unroll
+  for(int u=0;u<8;++u){const int k=k0+u*B;
+   #pragma unroll
+   for(int j=0;j<4;++j)hv[u][j]=k<K?__bfloat162float(h[((size_t)r*4+j)*K+k]):0.f;}
+  #pragma unroll
+  for(int u=0;u<8;++u){const int k=k0+u*B;if(k<K){float v[4];
+   #pragma unroll
+   for(int j=0;j<4;++j)v[j]=__fmul_rn(pr[j],hv[u][j]);
+   mixed[k]=__float2bfloat16_rn(__fadd_rn(__fadd_rn(__fadd_rn(__fadd_rn(0.f,v[0]),v[1]),v[2]),v[3]));}}
+ }
+ __syncthreads();
+ float v[4]={0,0,0,0};
+ for(int i=t*4;i<K;i+=B*4)for(int j=0;j<4;++j)if(i+j<K){float z=__bfloat162float(mixed[i+j]);v[j]=__fadd_rn(v[j],__fmul_rn(z,z));}
+ float sum=__fadd_rn(__fadd_rn(__fadd_rn(v[0],v[1]),v[2]),v[3]);
+ sh[t]=sum;__syncthreads();
+ for(int d=B/2;d>=32;d>>=1){if(t<d){sum=__fadd_rn(sum,sh[t+d]);sh[t]=sum;}__syncthreads();}
+ if(t<32){for(int d=16;d;d>>=1)sum=__fadd_rn(sum,__shfl_down_sync(0xffffffff,sum,d));if(!t)sh[0]=rsqrtf(__fadd_rn(__fmul_rn(sum,1.f/K),1e-20f));}
+ __syncthreads();
+ if(nI<=HCPN_PRE){
+  #pragma unroll
+  for(int u=0;u<HCPN_PRE;++u){const int i=t+u*B;if(u<nI&&i<K){
+   const bf16 o=__float2bfloat16_rn(__fmul_rn(__fmul_rn(__bfloat162float(mixed[i]),sh[0]),wr[u]));
+   y[(size_t)r*K+i]=o;if(yf)yf[(size_t)r*K+i]=__bfloat162float(o);}}
+ }else for(int i=t;i<K;i+=B){const bf16 o=__float2bfloat16_rn(__fmul_rn(__fmul_rn(__bfloat162float(mixed[i]),sh[0]),__bfloat162float(w[i])));
+  y[(size_t)r*K+i]=o;if(yf)yf[(size_t)r*K+i]=__bfloat162float(o);}
+}
 __global__ void hcmean(const bf16*h,bf16*y,int M,int K){DS41_PDL_WAIT();int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=M*K)return;int row=i/K,k=i%K;float sum=0.f;for(int j=0;j<4;++j)sum=__fadd_rn(sum,__bfloat162float(h[(row*4+j)*K+k]));y[i]=__float2bfloat16_rn(__fmul_rn(sum,.25f));}
 }
 // s0ma change 39: cublasSetStream resets the handle's workspace to cuBLAS's default pool, which allocates with
@@ -169,6 +354,29 @@ extern "C" int ds41_dense_hc_mixes_rows(void* handle,const void*h,const float*fn
 extern "C" int ds41_dense_norm_quant(const void*x,const float*pre,const void*w,void*out,void*a,void*s,int M,int K,float eps,cudaStream_t st){if(!x||!w||!a||!s||M<1||M>8||K<128||K%32||K>20480)return cudaErrorInvalidValue;int width,threads=geometry(M,K,width);
  normquant<<<M,threads,K*sizeof(bf16),st>>>((const bf16*)x,pre,(const bf16*)w,(bf16*)out,(uint8_t*)a,(uint8_t*)s,M,K,eps,width);return cudaGetLastError();}
 extern "C" int ds41_dense_hc_mixes(void* handle,const void*h,const float*fn,const float*s,const float*b,float*pre,float*post,float*comb,float*x,float*mixes,float*rstd,int M,int K,float neps,float heps,cudaStream_t st){if(!handle||!h||!fn||!s||!b||!pre||!post||!comb||!x||!mixes||!rstd||M<1||M>8||K<32||K%32)return cudaErrorInvalidValue;int width,threads=geometry(M,K*4,width);promote_stats<<<M,threads,0,st>>>((const bf16*)h,x,rstd,M,K*4,neps,width);int rc=cudaGetLastError();if(rc)return rc;rc=ds41_dense_cublas(handle,x,fn,mixes,M,24,K*4,1,1,st);if(rc)return rc;sinkhorn<<<M,32,0,st>>>(mixes,s,b,pre,post,comb,M,heps,rstd);return cudaGetLastError();}
+// s0ma change 128: see hc_fused_mixes and hc_pre_norm above
+extern "C" size_t ds41_dense_hc_fused_floats(int K){return K>0&&(4*K)%HCF_CH==0?size_t(4*K/HCF_CH)*HCF_OUT*8:0;}
+// s0ma change 139: variant 0 the change-128 kernels, 1 the change-139 ones (the same bits); the plain entries take
+// DS41_HC_FAST (1: variant 1)
+static int hc_fast(){static const int v=[]{const char*e=std::getenv("DS41_HC_FAST");return e&&e[0]=='1'?1:0;}();return v;}
+extern "C" int ds41_dense_hc_fused_mixes_v(const void*h,const float*fn,const float*s,const float*b,float*pre,float*post,
+    float*comb,float*partial,unsigned*count,int M,int K,float neps,float heps,int variant,cudaStream_t st){
+ if(!h||!fn||!s||!b||!pre||!post||!comb||!partial||!count||M<1||M>8||K<1||(4*K)%HCF_CH)return cudaErrorInvalidValue;
+ if(variant==1&&!(reinterpret_cast<uintptr_t>(h)&15)&&4*K/HCF_CH<=65535)
+  hc_fused_mixes2<<<dim3(4*K/HCF_CH,(HCF_OUT+HCF2_OPC-1)/HCF2_OPC),32*HCF2_OPC,0,st>>>((const bf16*)h,fn,s,b,pre,post,comb,partial,count,M,4*K,neps,heps);
+ else hc_fused_mixes<<<4*K/HCF_CH,256,0,st>>>((const bf16*)h,fn,s,b,pre,post,comb,partial,count,M,4*K,neps,heps);
+ return cudaGetLastError();}
+extern "C" int ds41_dense_hc_fused_mixes(const void*h,const float*fn,const float*s,const float*b,float*pre,float*post,
+    float*comb,float*partial,unsigned*count,int M,int K,float neps,float heps,cudaStream_t st){
+ return ds41_dense_hc_fused_mixes_v(h,fn,s,b,pre,post,comb,partial,count,M,K,neps,heps,hc_fast(),st);}
+extern "C" int ds41_dense_hc_pre_norm_v(const void*h,const float*p,const void*w,void*y,float*yf,int M,int K,int variant,cudaStream_t st){
+ if(!h||!p||!w||!y||M<1||K<128||K%4||K>16384)return cudaErrorInvalidValue;
+ int threads=1;while(threads*2<=K/4&&threads*2<=512)threads*=2;   // as ds41e::hotpath::rms_decode
+ if(variant==1)hc_pre_norm2<<<M,threads,K*sizeof(bf16),st>>>((const bf16*)h,p,(const bf16*)w,(bf16*)y,yf,M,K);
+ else hc_pre_norm<<<M,threads,K*sizeof(bf16),st>>>((const bf16*)h,p,(const bf16*)w,(bf16*)y,yf,M,K);
+ return cudaGetLastError();}
+extern "C" int ds41_dense_hc_pre_norm(const void*h,const float*p,const void*w,void*y,float*yf,int M,int K,cudaStream_t st){
+ return ds41_dense_hc_pre_norm_v(h,p,w,y,yf,M,K,hc_fast(),st);}
 extern "C" int ds41_dense_shared_act(const void*g,const void*u,void*z,void*a,void*s,int M,int K,cudaStream_t st){if(!g||!u||!a||!s||M<1||K<32||K%32)return cudaErrorInvalidValue;shared_act<<<(M*K+127)/128,128,0,st>>>((const bf16*)g,(const bf16*)u,(bf16*)z,(uint8_t*)a,(uint8_t*)s,M*K/32);return cudaGetLastError();}
 extern "C" int ds41_dense_promote(const void*x,float*y,int n,cudaStream_t st){if(!x||!y||n<1)return cudaErrorInvalidValue;promote<<<(n+255)/256,256,0,st>>>((const bf16*)x,y,n);return cudaGetLastError();}
 extern "C" int ds41_dense_wo_a(void*raw,const void*x,const void*w,void*y,int M,int N,int K,int G,cudaStream_t st){if(!raw||!x||!w||!y||M<1||M>8||N<1||K<1||G<1)return cudaErrorInvalidValue;auto h=(cublasHandle_t)raw;auto status=ds41_same_stream(h,st);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;status=cublasSetMathMode(h,CUBLAS_DEFAULT_MATH);if(status!=CUBLAS_STATUS_SUCCESS)return 10000+status;float alpha=1.f,beta=0.f;

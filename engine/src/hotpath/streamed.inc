@@ -1,6 +1,7 @@
 // v0.2 callbacks execute on the store worker. All per-batch scratch is owned by
 // Native and reused only through its ordered consumer stream. Callbacks never
 // reenter the store or wait for GPU work.
+// (s0ma change 142: rest_event is the one store call they make, a worker-local read with no lock or queue.)
 void bmoe_streamed(const std::string &p,int m,const hotpath::RoutePlan &plan,
                   const std::vector<ds41::GemmJob> &gj,
                   const std::vector<ds41::GemmJob> &uj,
@@ -18,11 +19,21 @@ void bmoe_streamed(const std::string &p,int m,const hotpath::RoutePlan &plan,
     if(readiness) consumer_readiness->arrived(layer,stream);
     std::array<ds41::GemmJob,36> gates{},ups{},downs{};
     std::array<int,36> rows{}; int count=0,n=int(ready.size());
-    for(int i=0;i<n;++i) {
+    // s0ma change 143 (DS41_EXL3_LPT=1): the widest experts' jobs first. A mixed-width launch's CTAs take time in
+    // proportion to their expert's bits, and the GPU hands out CTAs in grid order, so the last wave holds the
+    // narrowest ones (longest-processing-time-first). Each job keeps its own rows and output: the same arithmetic.
+    std::array<int,36> order{};
+    for(int i=0;i<n;++i) order[i]=i;
+    if(exl3_lpt && exl3_mixed && n>1 && n<=36)
+      std::stable_sort(order.begin(),order.begin()+n,[&](int a,int b){
+        return width_of[ready[a]]>width_of[ready[b]];
+      });
+    for(int i0=0;i0<n;++i0) {
+      const int i=order[i0];
       auto it=std::lower_bound(plan.ids.begin(),plan.ids.end(),ready[i]);
       if(it==plan.ids.end() || *it!=ready[i]) throw std::logic_error("foreign ready expert");
       size_t ix=size_t(it-plan.ids.begin());
-      gates[i]=gj[ix]; ups[i]=uj[ix]; downs[i]=dj[ix];
+      gates[i0]=gj[ix]; ups[i0]=uj[ix]; downs[i0]=dj[ix];
       const auto &e=plan.experts[ix];
       for(int j=0;j<e.count;++j) rows[count++]=e.begin+j;
     }
@@ -45,14 +56,27 @@ void bmoe_streamed(const std::string &p,int m,const hotpath::RoutePlan &plan,
     }
     // The device job descriptors carry every layer/expert/output address.
     // Reuse this body across layers; dimensions and scratch addresses are fixed.
-    bgraph("experts.stream."+std::to_string(n)+"."+std::to_string(count),m,[&]{
-      CK(expert_gemm_gate_up(work_jobs.as<ds41::GemmJob>(),work_up_jobs.as<ds41::GemmJob>(),n,stream,layer));   // s0ma change 122
+    // s0ma change 142: an expert uploaded from RAM in two copies (DS41_MOE_SPLIT_UPLOAD=1) reached this callback when
+    // its gate and up landed; its down projection waits for the rest (rest_event: worker-local, takes no store lock)
+    std::array<cudaEvent_t,36> rest{}; int rests=0;
+    for(int i=0;i<n;++i) if(cudaEvent_t e=experts->rest_event(ready[i])) rest[rests++]=e;
+    auto gate_up=[&]{
+      CK(expert_gemm_gate_up(work_jobs.as<ds41::GemmJob>(),work_up_jobs.as<ds41::GemmJob>(),n,stream,layer,m));   // s0ma changes 122, 136
       if(exl3) hotpath::activate_routes_bf16(gate.p,up.p,broute.as<float>(),work_rows.as<int>(),
           act.p,count,stream);
       else hotpath::activate_routes(gate.p,up.p,broute.as<float>(),work_rows.as<int>(),
           eq.as<uint8_t>(),es.as<uint8_t>(),count,stream);
-      CK(expert_gemm(work_down_jobs.as<ds41::GemmJob>(),n,ds41::Projection::Down,H,I,stream,layer));
-    });
+    };
+    auto down_proj=[&]{
+      CK(expert_gemm(work_down_jobs.as<ds41::GemmJob>(),n,ds41::Projection::Down,H,I,stream,layer,m));   // s0ma change 136: m rows
+    };
+    if(!rests) bgraph("experts.stream."+std::to_string(n)+"."+std::to_string(count),m,[&]{ gate_up(); down_proj(); });
+    else {
+      bgraph("experts.stream.gu."+std::to_string(n)+"."+std::to_string(count),m,gate_up);
+      for(int i=0;i<rests;++i) CK(cudaStreamWaitEvent(stream,rest[i],0));
+      bgraph("experts.stream.down."+std::to_string(n),m,down_proj);
+      ++split_callbacks;
+    }
     if(event) {
       CK(cudaEventRecord(event->end,stream));
       consumer_readiness->expert_done(layer,event->end);
@@ -96,9 +120,13 @@ void bmoe_streamed(const std::string &p,int m,const hotpath::RoutePlan &plan,
         for(int e:rank(scores+r*384,lookahead_k)) cand.push_back({scores[r*384+e],e});
       std::stable_sort(cand.begin(),cand.end(),[](const auto &a,const auto &b){return a.first>b.first;});
       std::vector<ds41::ExpertId> predicted; std::set<int> seen;
-      for(auto &c:cand) if(seen.insert(c.second).second && int(predicted.size())<lookahead_n)
+      // s0ma change 141: with DS41_LOOKAHEAD_RAM_FIRST=1 every distinct candidate goes, best first, and the store uploads
+      // at most lookahead_n of those not already in VRAM. Before, the cap took the best lookahead_n candidates, and at
+      // full residency (~93% of demands from VRAM) those were nearly always resident already, so little was uploaded
+      for(auto &c:cand) if(seen.insert(c.second).second && (lookahead_ram_first || int(predicted.size())<lookahead_n))
         predicted.push_back(ds41::ExpertId((layer+1)*384+c.second));
-      prefetch_ram_experts(predicted);
+      if(lookahead_ram_first) prefetch_ram_experts(predicted,size_t(lookahead_n));
+      else prefetch_ram_experts(predicted);
     }
     if(lookahead_far_layer>=0) {
       // s0ma change 11: layer far's predicted experts, NVMe-only ones read ahead into pinned slots

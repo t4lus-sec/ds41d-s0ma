@@ -318,6 +318,18 @@ class Native final : public Forward, public hotpath::GateEvidence {
   struct DenseExl3 { int index = 0, k = 0, n = 0, bits = 0; };
   std::map<std::string, DenseExl3> dense_exl3;      // the tensor's name without ".weight"
   std::vector<Device> dense_records;
+  // s0ma change 127 (DS41_L2_PREFETCH=1, or 2 for evict_last): each layer's Sero dense tensors in the order the layer
+  // reads them, brought into L2 by a side stream as the layer's query projections start
+  Device l2_ranges;                        // [40][l2_slots] ds41::L2Range
+  std::array<int, 40> l2_count{};
+  int l2_policy = 0, l2_ctas = 0;
+  static constexpr int l2_slots = 16;
+  std::array<cudaStream_t, 2> l2_side{};
+  std::array<cudaEvent_t, 2> l2_fork{}, l2_join{};
+  // s0ma change 128 (DS41_HC_FUSED=1): each decode hyper-connection site in two launches (the coefficients; the mix, its
+  // norm and the FP32 copy) instead of five to eleven; per lane, the coefficients' partial sums and arrival count
+  bool hc_fused = false;
+  Device hc_part[2], hc_count[2];
   Device dense_table;
   double dense_extra_gib = 0;                         // VRAM the swap gave back, for expert slots
   // s0ma change 49: the drafter's 384 routed experts as EXL3 records (DS41_MTP_EXL3=DIR), one width for all
@@ -424,8 +436,10 @@ class Native final : public Forward, public hotpath::GateEvidence {
     splitk_counts[lane].resize(size_t(splitk_jobs) * 40 * 4);
     CK(cudaMemset(splitk_counts[lane].p, 0, splitk_counts[lane].bytes));
   }
+  // s0ma change 136: rows, the most rows any job holds (the step's rows); with DS41_EXL3_OCC2=1 and rows <= 4 the
+  // mixed-width kernels run two CTAs to an SM
   cudaError_t expert_gemm(const ds41::GemmJob *jobs, int count, ds41::Projection p,
-                          int n, int k, cudaStream_t s, int layer) {
+                          int n, int k, cudaStream_t s, int layer, int rows = 8) {
     if (exl3 && exl3_splitk_on() && count <= splitk_jobs) {
       const int lane = lane_b_active ? 1 : 0;
       if (splitk_partial[lane].bytes)
@@ -435,7 +449,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
                                          splitk_counts[lane].as<unsigned>(), splitk_counts[lane].bytes / 4, s);
     }
     if (exl3 && !expert_bits(layer))   // s0ma change 15: a layer whose experts differ in width
-      return ds41::grouped_exl3_var(experts->table(), jobs, count, p, n, k, expert_width_dev.as<uint8_t>(), s);
+      return ds41::grouped_exl3_var(experts->table(), jobs, count, p, n, k, expert_width_dev.as<uint8_t>(), s, rows);
     return exl3 ? ds41::grouped_exl3_bits(experts->table(), jobs, count, p, n, k, expert_bits(layer), s)
                 : ds41::grouped_mxfp4_native_parallel(experts->table(), jobs, count, p, n, k, s);
   }
@@ -446,12 +460,12 @@ class Native final : public Forward, public hotpath::GateEvidence {
     return on;
   }
   cudaError_t expert_gemm_gate_up(const ds41::GemmJob *gate_jobs, const ds41::GemmJob *up_jobs, int count, cudaStream_t s,
-                                  int layer) {
+                                  int layer, int rows = 8) {
     const bool splitk = exl3 && exl3_splitk_on() && count <= splitk_jobs && splitk_partial[lane_b_active ? 1 : 0].bytes;
     if (exl3 && !expert_bits(layer) && exl3_gu_on() && !splitk)
-      return ds41::grouped_exl3_var_gu(experts->table(), gate_jobs, up_jobs, count, I, H, expert_width_dev.as<uint8_t>(), s);
-    if (const cudaError_t e = expert_gemm(gate_jobs, count, ds41::Projection::Gate, I, H, s, layer); e != cudaSuccess) return e;
-    return expert_gemm(up_jobs, count, ds41::Projection::Up, I, H, s, layer);
+      return ds41::grouped_exl3_var_gu(experts->table(), gate_jobs, up_jobs, count, I, H, expert_width_dev.as<uint8_t>(), s, rows);
+    if (const cudaError_t e = expert_gemm(gate_jobs, count, ds41::Projection::Gate, I, H, s, layer, rows); e != cudaSuccess) return e;
+    return expert_gemm(up_jobs, count, ds41::Projection::Up, I, H, s, layer, rows);
   }
   std::unique_ptr<hotpath::FusedOps> fused;
   std::unique_ptr<ds41::DirectReader> reader;
@@ -527,8 +541,11 @@ class Native final : public Forward, public hotpath::GateEvidence {
   Device scores, top{512 * 4}, visible{4}, position_device{8}, blocks,
       block_visible{4}, chosen_blocks{2048 * 4}, candidate_ids{16384 * 4},
       candidate_top{512 * 4}, top_scratch;
-  // s0ma change 67: prefill's Engram projection batched, 8 prompt rows a call (pengram_rows)
-  Device pe_raw{8 * 24 * 264}, pe_bf{8 * 6144 * 2}, pe_kv{8 * (HC + 1) * H * 2}, pe_aq{8 * 6144}, pe_as{8 * 6144 / 32};
+  // s0ma change 67: prefill's Engram projection batched, 8 prompt rows a call (pengram_rows); change 145: up to 256
+  // (a prefill chunk) with DS41_PREFILL_ENGRAM_WIDE=1, ~20 MB more
+  Device pe_raw{size_t(engram_rows_cap()) * 24 * 264}, pe_bf{size_t(engram_rows_cap()) * 6144 * 2},
+      pe_kv{size_t(engram_rows_cap()) * (HC + 1) * H * 2}, pe_aq{size_t(engram_rows_cap()) * 6144},
+      pe_as{size_t(engram_rows_cap()) * 6144 / 32};
   Device rows_raw{24 * 256}, scales_raw{24 * 8}, rows_bf{24 * 256 * 2},
       engram_kv{(HC + 1) * H * 2}, rows_interleaved{24 * 264};
   Device braw_kv{6*512*4}, braw_score{6*512*4}, batch_tokens{6*4};
@@ -683,6 +700,9 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::unique_ptr<ds41::HostBuffer> lookahead_host;
   std::unique_ptr<Phase> lookahead_sync;
   int lookahead_layer = -1, lookahead_k = 6;
+  bool lookahead_ram_first = false;   // s0ma change 141
+  // s0ma change 143: DS41_EXL3_LPT=1, the widest experts' jobs first in each streamed launch
+  const bool exl3_lpt = [] { const char *v = std::getenv("DS41_EXL3_LPT"); return v && v[0] == '1'; }();
   // s0ma change 11: DS41_LOOKAHEAD_NVME_DEPTH=D (2..3; default 0 = off) also scores layer l+D's router on layer l's
   // input and hands its top DS41_LOOKAHEAD_K a row to the store's NVMe read-ahead (DS41_MOE_SPEC_NVME), so an NVMe
   // read gets D layers of lead instead of one. A transfer hint like the lookahead: routing and outputs are unchanged.
@@ -717,7 +737,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::map<ds41::ExpertId, int> prefill_warm_counts;
   std::vector<std::future<void>> retirement_futures;
   size_t retirement_observed=0;
-  uint64_t stream_callbacks=0, stream_hit_batches=0;
+  uint64_t stream_callbacks=0, stream_hit_batches=0, split_callbacks=0;   // split: s0ma change 142
   Device batch_frequencies{12*64*4}, compressed_frequencies{6*64*4},
       lengths1{6*4}, lengths2{6*4}, packed_keys{6*68}, packed_globals{6*288};
   bool hotpath_capturing=false;
@@ -1015,7 +1035,12 @@ public:
       fused_head = reinterpret_cast<FusedHead>(dlsym(fused_head_handle, "ds41_fuse_head_decode"));
       if (!fused_head) throw std::runtime_error("fused head: missing ds41_fuse_head_decode");
     }
-    if (c.prefetch_lookahead) {
+    // s0ma change 141: DS41_LOOKAHEAD=0 turns the lookahead off (its router GEMVs, copies and prefetch), for an A/B
+    // against --prefetch-lookahead without editing run.py; DS41_LOOKAHEAD_RAM_FIRST=1 caps its uploads, not its
+    // candidates (see streamed.inc)
+    const bool lookahead_off = [] { const char *v = std::getenv("DS41_LOOKAHEAD"); return v && std::string(v) == "0"; }();
+    lookahead_ram_first = [] { const char *v = std::getenv("DS41_LOOKAHEAD_RAM_FIRST"); return v && std::string(v) == "1"; }();
+    if (c.prefetch_lookahead && !lookahead_off) {
       if (!c.streamed_experts)
         throw std::invalid_argument("--prefetch-lookahead requires --streamed-experts");
       if (const char *k = std::getenv("DS41_LOOKAHEAD_K")) lookahead_k = std::stoi(k);
@@ -1055,6 +1080,18 @@ public:
     vram_checkpoint("native_after_native_weights");   // s0ma change 48
     load_sero_dense();
     vram_checkpoint("native_after_sero_dense");
+    setup_l2_prefetch();   // s0ma change 127
+    if (const char *v = std::getenv("DS41_HC_FUSED"); v && std::string(v) == "1") {   // s0ma change 128
+      const size_t floats = ds41_dense_hc_fused_floats(H);
+      if (!floats) throw std::runtime_error("DS41_HC_FUSED: the hidden size does not split into the fused launch's chunks");
+      for (int i = 0; i < 2; ++i) {
+        hc_part[i].resize(floats * 4);
+        hc_count[i].resize(4);
+        CK(cudaMemset(hc_count[i].p, 0, 4));
+      }
+      hc_fused = true;
+      std::cerr << "hyper-connections fused (DS41_HC_FUSED=1): two launches a decode site\n";
+    }
     splitk_scratch(0);   // s0ma change 40
     if (fused_head && !dense_of("head")) {   // s0ma change 43: unless Sero's head replaced it
       const auto &head = w("head.weight");
@@ -1256,6 +1293,11 @@ public:
   ~Native() override {
     if (stream)
       cudaStreamSynchronize(stream);
+    for (int i = 0; i < 2; ++i) {   // s0ma change 127
+      if (l2_side[i]) { cudaStreamSynchronize(l2_side[i]); cudaStreamDestroy(l2_side[i]); }
+      if (l2_fork[i]) cudaEventDestroy(l2_fork[i]);
+      if (l2_join[i]) cudaEventDestroy(l2_join[i]);
+    }
     if (lane_stream)
       cudaStreamSynchronize(lane_stream);
     for (auto &ticket : engram_tickets)
@@ -1421,14 +1463,16 @@ public:
     } catch(...) { poisoned=true; throw; }
   }
   // RAM-resident subset only: a wrong guess costs one host-to-device copy, never an NVMe read.
-  void prefetch_ram_experts(const std::vector<ds41::ExpertId> &ids) {
+  void prefetch_ram_experts(const std::vector<ds41::ExpertId> &ids, size_t max_uploads = SIZE_MAX) {
     try {
       for(auto it=prefetch_tickets.begin();it!=prefetch_tickets.end();) {
         if(it->completion.wait_for(std::chrono::seconds(0))==std::future_status::ready) {
           it->completion.get(); it=prefetch_tickets.erase(it);
         } else ++it;
       }
-      prefetch_tickets.push_back(experts->prefetch_ram(ids,ds41::OffloadStore::PrefetchPriority::NextLayer));
+      prefetch_tickets.push_back(max_uploads == SIZE_MAX
+          ? experts->prefetch_ram(ids,ds41::OffloadStore::PrefetchPriority::NextLayer)
+          : experts->prefetch_ram_capped(ids,max_uploads,ds41::OffloadStore::PrefetchPriority::NextLayer));   // change 141
     } catch(...) { poisoned=true; throw; }
   }
   void cancel_prefetch(uint64_t id) override {
@@ -1452,7 +1496,7 @@ public:
     io_ms = route_ms = engram_ms = total_ms = 0;
     measured.clear();prefill_summary=Json::object();
     host_plan_ms=callback_enqueue_ms=0; profile_steps=Json::array();
-    stream_callbacks=stream_hit_batches=0;
+    stream_callbacks=stream_hit_batches=split_callbacks=0;
     gpu_route_layers=gpu_route_mismatches=0;   // s0ma change 83
     initial_stats = sample_expert_stats();
     initial_demand = experts->demand_totals();
@@ -1911,6 +1955,11 @@ public:
               {"expert_spec_hits", s.spec_hits - initial_stats.spec_hits},
               {"expert_spec_waits", s.spec_waits - initial_stats.spec_waits},
               {"expert_spec_dropped", s.spec_dropped - initial_stats.spec_dropped},
+              {"expert_split_uploads", s.split_uploads - initial_stats.split_uploads},   // s0ma change 142
+              {"expert_split_callbacks", split_callbacks},
+              {"expert_prefetch_used", s.prefetch_used - initial_stats.prefetch_used},   // s0ma change 141
+              {"expert_prefetch_wasted", s.prefetch_wasted - initial_stats.prefetch_wasted},
+              {"expert_prefetch_h2d_bytes", s.prefetch_h2d_bytes - initial_stats.prefetch_h2d_bytes},
               {"need_host_ms", io_ms},
               {"h1_cut_steps", h1_cuts}, {"h1_rows_cut", h1_rows_cut},   // s0ma change 47
               {"route_wait_ms", route_ms},
@@ -2697,6 +2746,70 @@ private:
               << used / 1e9 << " GB in place of " << freed / 1e9 << " GB of FP8 (" << skipped << " left native):";
     for (const auto &[kind, count] : kinds) std::cerr << " " << kind << " x" << count;
     std::cerr << "; " << dense_extra_gib << " GiB more expert slots\n";
+  }
+  // s0ma change 127: DS41_L2_PREFETCH=1|2: per layer, the ranges of its Sero dense records in the order the layer reads
+  // them (wq_a, wkv, wq_b, wo_a's slices, wo_b, the shared expert's w1, w3, w2), up to DS41_L2_PREFETCH_MIB (default
+  // three quarters of the L2) a layer. Weights only: nothing they compute changes.
+  void setup_l2_prefetch() {
+    const char *v = std::getenv("DS41_L2_PREFETCH");
+    if (!v || (std::string(v) != "1" && std::string(v) != "2") || dense_exl3.empty()) return;
+    int dev = 0, l2 = 0, sms = 0;
+    CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev));
+    CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    size_t cap = size_t(l2) / 4 * 3;
+    if (const char *c = std::getenv("DS41_L2_PREFETCH_MIB"); c && *c) cap = size_t(std::stoul(c)) << 20;
+    std::vector<ds41::L2Range> all(size_t(40) * l2_slots, ds41::L2Range{nullptr, 0});
+    size_t most = 0, ranges = 0;
+    for (int l = 0; l < 40; ++l) {
+      const std::string a = "layers." + std::to_string(l) + ".attn", f = "layers." + std::to_string(l) + ".ffn";
+      std::vector<std::string> names = {a + ".wq_a", a + ".wkv", a + ".wq_b"};
+      for (int g = 0; g < 8; ++g) names.push_back(a + ".wo_a.slice." + std::to_string(g));
+      for (const char *t : {".wo_b"}) names.push_back(a + t);
+      for (const char *t : {".shared_experts.w1", ".shared_experts.w3", ".shared_experts.w2"}) names.push_back(f + t);
+      size_t used = 0;
+      int n = 0;
+      for (const auto &name : names) {
+        const DenseExl3 *d = dense_of(name);
+        if (!d || n == l2_slots) continue;
+        const Device &r = dense_records[size_t(d->index)];
+        if (used + r.bytes > cap) break;
+        all[size_t(l) * l2_slots + n++] = ds41::L2Range{r.p, uint64_t(r.bytes)};
+        used += r.bytes;
+      }
+      l2_count[size_t(l)] = n;
+      most = std::max(most, used);
+      ranges += size_t(n);
+    }
+    if (!ranges) return;
+    l2_ranges.resize(all.size() * sizeof(ds41::L2Range));
+    CK(cudaMemcpy(l2_ranges.p, all.data(), all.size() * sizeof(ds41::L2Range), cudaMemcpyHostToDevice));
+    for (int i = 0; i < 2; ++i) {
+      CK(cudaStreamCreateWithFlags(&l2_side[i], cudaStreamNonBlocking));
+      CK(cudaEventCreateWithFlags(&l2_fork[i], cudaEventDisableTiming));
+      CK(cudaEventCreateWithFlags(&l2_join[i], cudaEventDisableTiming));
+    }
+    l2_policy = std::string(v) == "2" ? 2 : 1;
+    l2_ctas = std::max(1, sms);
+    std::cerr << "L2 prefetch (DS41_L2_PREFETCH=" << l2_policy << (l2_policy == 2 ? ", evict_last" : "") << "): "
+              << ranges << " dense tensors over 40 layers, at most " << double(most) / double(1 << 20)
+              << " MiB a layer of an L2 of " << double(l2) / double(1 << 20) << " MiB (cap " << double(cap) / double(1 << 20)
+              << " MiB), " << l2_ctas << " CTAs a layer\n";
+  }
+  // The side stream forks from the lane's stream as layer l's query projections start, and joins it back when they
+  // end (a captured graph must join every stream it forks)
+  void l2_prefetch_begin(int l) {
+    if (!l2_policy || l < 0 || l >= 40 || !l2_count[size_t(l)]) return;
+    const int i = lane_b_active ? 1 : 0;
+    CK(cudaEventRecord(l2_fork[i], stream));
+    CK(cudaStreamWaitEvent(l2_side[i], l2_fork[i], 0));
+    CK(ds41::exl3_l2_prefetch(l2_ranges.as<ds41::L2Range>(size_t(l) * l2_slots * sizeof(ds41::L2Range)), l2_count[size_t(l)], l2_policy, l2_ctas,
+                              l2_side[i]));
+    CK(cudaEventRecord(l2_join[i], l2_side[i]));
+  }
+  void l2_prefetch_end(int l) {
+    if (!l2_policy || l < 0 || l >= 40 || !l2_count[size_t(l)]) return;
+    CK(cudaStreamWaitEvent(stream, l2_join[lane_b_active ? 1 : 0], 0));
   }
   const DenseExl3 *dense_of(const std::string &prefix) const {
     if (dense_exl3.empty()) return nullptr;

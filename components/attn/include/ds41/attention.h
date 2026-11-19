@@ -68,6 +68,26 @@ int ds41_attn_sparse(const void* q, const void* gathered, const float* sink,
 int ds41_attn_sparse_split(const void* q, const void* gathered, const float* sink,
                           const int32_t* local_idx, void* o, float* scores,
                           int rows, int topk, int tile_heads, void* stream);
+/* s0ma change 146: the selected entries read straight from the caches. A source names what a gather would read:
+ * the window ring (swa, capacity), the compressed cache (global_kv, global_capacity, top_idx[rows,k], ratio), the
+ * first query position (start, or *dynamic_start when not NULL), the window width (128; the cold prefill's own
+ * min(prompt, 128)) and prefill (1: ds41_attn_gather_prefill_at's trailing-mask window, 0: ds41_attn_gather's).
+ * ds41_attn_gather_index writes only the local index [rows, width+k] a gather writes. The _fused attention entries
+ * then take the source in place of the gathered BF16 and compute bit for bit what ds41_attn_sparse and
+ * ds41_attn_sparse_split compute on the gather's output (same values, same order); topk = width + k. */
+typedef struct ds41_attn_kv_source {
+  const void* swa; int capacity;
+  const void* global_kv; int global_capacity;
+  const int32_t* top_idx; int k;
+  int64_t start; const int64_t* dynamic_start;
+  int ratio; int width; int prefill;
+} ds41_attn_kv_source;
+int ds41_attn_gather_index(const ds41_attn_kv_source* source, int rows, int32_t* local_idx, void* stream);
+int ds41_attn_sparse_fused(const void* q, const ds41_attn_kv_source* source, const float* sink,
+                           const int32_t* local_idx, void* o, int rows, int topk, int tile_heads, void* stream);
+int ds41_attn_sparse_split_fused(const void* q, const ds41_attn_kv_source* source, const float* sink,
+                                 const int32_t* local_idx, void* o, float* scores,
+                                 int rows, int topk, int tile_heads, void* stream);
 /* Index q BF16[p,32,128] already MXFP4 roundtripped. k records68B, weights
  * BF16[p,32] includes 1/64 scaling. out BF16[p,nscan]. key_ids may be NULL
  * for full scan; otherwise int32[p,nscan] absolute compressed indices.

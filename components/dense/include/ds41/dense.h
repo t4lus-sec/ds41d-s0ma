@@ -15,6 +15,10 @@ int ds41_dense_fp8(const void* a_fp8, const void* as_ue8m0, const void* w_fp8,
 // variant 2: native block-scaled MMA with parallel dot and serial carry (fixture-gated separately).
 // variants 3/4/5/6: native (warps, output columns) = (4,8)/(4,4)/(8,4)/(4,2).
 // M in 1..8, N/K positive multiples of 32. Weight scales [N/32,K/32], activation scales [M,K/32].
+// s0ma change 145: any M rows of the native variants (2-6), bit for bit what each 8-row slice gives there, reading
+// the weight once for every 64 rows instead of every 8. K=6144 only (else cudaErrorInvalidValue).
+int ds41_dense_fp8_rows(const void* a_fp8, const void* as_ue8m0, const void* w_fp8,
+                        const void* ws_ue8m0, void* y_bf16, int M, int N, int K, cudaStream_t stream);
 int ds41_dense_dequant(const void* w_fp8, const void* ws_ue8m0, void* w_bf16, int N,int K,cudaStream_t stream);
 int ds41_dense_roundtrip(const void* a_fp8,const void* as_ue8m0,void* x_bf16,int M,int K,cudaStream_t stream);
 int ds41_dense_rms(const void* x_bf16,const void* weight_bf16,void* y_bf16,int M,int K,float eps,cudaStream_t stream);
@@ -41,6 +45,18 @@ int ds41_dense_hc_mixes(void* blas_handle,const void* h_bf16,const float* fn,con
 // s0ma leg 26 (DS41_ROWS_BATCHED=1): M=1 problems for `rows` rows in one launch each, the same per-row math.
 int ds41_dense_cublas_rows(void* handle,const void* x,const void* w,void* y,int rows,int N,int K,int f32,cudaStream_t stream);
 int ds41_dense_hc_mixes_rows(void* blas_handle,const void* h_bf16,const float* fn,const float* scale,const float* base,float* pre,float* post,float* comb,float* promoted_x,float* mixes,float* rstd,int M,int K,float norm_eps,float hc_eps,int batched_gemv,cudaStream_t stream);
+// s0ma change 128 (DS41_HC_FUSED=1): one site's coefficients (pre, post, comb) in one launch, M <= 8 rows. Scratch:
+// partial (ds41_dense_hc_fused_floats(K) floats) and count (one zeroed unsigned, left zero). The mixes' and rstd's
+// 20,480-term sums in another order than ds41_dense_hc_mixes (rounding only); a row's result never depends on M.
+size_t ds41_dense_hc_fused_floats(int K);
+int ds41_dense_hc_fused_mixes(const void* h_bf16,const float* fn,const float* scale,const float* base,float* pre,float* post,float* comb,float* partial,unsigned* count,int M,int K,float norm_eps,float hc_eps,cudaStream_t stream);
+// s0ma change 128: ds41_dense_hc_pre, the decode RMSNorm (eps 1e-20) and, when y_f32 is given, its FP32 copy in one
+// launch: bit for bit the three launches. y may alias nothing else here (h is [M,4,K], y [M,K]).
+int ds41_dense_hc_pre_norm(const void* h_bf16,const float* pre,const void* norm_weight,void* y_bf16,float* y_f32,int M,int K,cudaStream_t stream);
+// s0ma change 139: the two above by variant (0: change 128's kernels, 1: change 139's, the same bits); the plain
+// entries pick by DS41_HC_FAST (1: variant 1)
+int ds41_dense_hc_fused_mixes_v(const void* h_bf16,const float* fn,const float* scale,const float* base,float* pre,float* post,float* comb,float* partial,unsigned* count,int M,int K,float norm_eps,float hc_eps,int variant,cudaStream_t stream);
+int ds41_dense_hc_pre_norm_v(const void* h_bf16,const float* pre,const void* norm_weight,void* y_bf16,float* y_f32,int M,int K,int variant,cudaStream_t stream);
 int ds41_dense_shared_act(const void* gate_bf16,const void* up_bf16,void* z_bf16,void* a_fp8,void* as_ue8m0,int M,int K,cudaStream_t stream);
 int ds41_dense_promote(const void* x_bf16,float* x_f32,int elements,cudaStream_t stream);
 // wo_a grouped BF16 einsum, token-major x[M,G,K], y[M,G,N], w[G,N,K].

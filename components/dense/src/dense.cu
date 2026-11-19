@@ -83,6 +83,60 @@ __global__ void __launch_bounds__(Warps*32,1) parallel(const uint8_t* x,const ui
    else for(int hr=0;hr<2;++hr)for(int cc=0;cc<2;++cc){int token=t*2+cc;if(n0+g+hr*8<N&&token<M)y[token*N+n0+g+hr*8]=__float2bfloat16_rn(acc[hr*2+cc]);}}
  }__syncthreads();}
 }
+// s0ma change 145: the native (block-scaled) FP8 projection for many rows at once, bit for bit what parallel<K,*,true>
+// gives a row. parallel's output for (row, col) is 0.f + d0 + d1 + ... + d(ng-1), each + __fadd_rn in ascending K
+// (the warp carry walks the groups in order whatever the warp or column count, change 48), and each d is c[0] or
+// c[1] of one mma_scaled over that row's 32 bytes and scale and that column's 32 bytes and scale. Here a block
+// takes 64 columns (a warp each 8, as parallel's 8-column tiles) by 64 rows (eight groups of 8, the mma's row
+// slots 0-7 as parallel fills them, rows 8-15 zero and scale 127) and walks K in the same order, staging 4 groups
+// of 32 at a time in shared memory: the same operands, the same instruction, the same adds. What changes is
+// traffic: parallel reads all of w once for every 8 rows; this reads it once for every 64.
+template<int K>
+__global__ void __launch_bounds__(256) rows_native(const uint8_t* x,const uint8_t* xs,const uint8_t* w,const uint8_t* ws,bf16* y,int M,int N){DS41_PDL_WAIT();
+ constexpr int ng=K/32,KG=4,Pitch=KG*32+16;   // +16: rows land on different banks (row*36+t words)
+ static_assert(K%32==0,"K is a multiple of 32");
+ __shared__ __align__(16) uint8_t sx[64*Pitch],sw[64*Pitch];
+ __shared__ uint8_t sxs[64*KG],sws[64*KG];
+ const int lane=threadIdx.x&31,warp=threadIdx.x>>5,g=lane>>2,t=lane&3;
+ const int m0=blockIdx.x*64,n0=blockIdx.y*64;   // rows fastest: a column tile's row blocks run together and share w in L2
+ float acc[8][2];
+ #pragma unroll
+ for(int r=0;r<8;++r){acc[r][0]=0.f;acc[r][1]=0.f;}
+ for(int k0=0;k0<ng;k0+=KG){
+  __syncthreads();
+  for(int i=threadIdx.x;i<64*KG*2;i+=256){   // 64 rows x KG*32 bytes, 16 bytes a thread a turn, for x and for w
+   const int r=i/(KG*2),c=i%(KG*2),grp=k0+c/2;
+   uint4 vx=make_uint4(0,0,0,0),vw=make_uint4(0,0,0,0);
+   if(m0+r<M&&grp<ng)vx=*(const uint4*)(x+(size_t)(m0+r)*K+(size_t)k0*32+c*16);
+   if(n0+r<N&&grp<ng)vw=*(const uint4*)(w+(size_t)(n0+r)*K+(size_t)k0*32+c*16);
+   *(uint4*)(sx+r*Pitch+c*16)=vx;*(uint4*)(sw+r*Pitch+c*16)=vw;
+  }
+  for(int i=threadIdx.x;i<64*KG;i+=256){
+   const int r=i/KG,kg=i%KG,grp=k0+kg;
+   sxs[i]=(m0+r<M&&grp<ng)?xs[(size_t)(m0+r)*ng+grp]:127;
+   sws[i]=(n0+r<N&&grp<ng)?ws[(size_t)((n0+r)/32)*ng+grp]:127;
+  }
+  __syncthreads();
+  #pragma unroll
+  for(int kg=0;kg<KG;++kg){
+   if(k0+kg>=ng)break;
+   const int col=warp*8+g;   // parallel: g<Cols&&n0+g<N ? w : 0, scale 127 otherwise
+   uint32_t b[2]={0,0},sb=127;
+   if(n0+col<N){b[0]=*(const uint32_t*)(sw+col*Pitch+kg*32+t*4);b[1]=*(const uint32_t*)(sw+col*Pitch+kg*32+16+t*4);sb=sws[col*KG+kg];}
+   #pragma unroll
+   for(int rg=0;rg<8;++rg){
+    const int row=rg*8+g;   // parallel: g<M ? x : 0; the scale from even t only, 127 otherwise
+    uint32_t a[4]={0,0,0,0},sa=127;
+    if(m0+row<M){a[0]=*(const uint32_t*)(sx+row*Pitch+kg*32+t*4);a[2]=*(const uint32_t*)(sx+row*Pitch+kg*32+16+t*4);if(!(t&1))sa=sxs[row*KG+kg];}
+    float c[4]={0,0,0,0};mma_scaled(c,a,b,sa,sb);
+    acc[rg][0]=__fadd_rn(acc[rg][0],c[0]);acc[rg][1]=__fadd_rn(acc[rg][1],c[1]);
+   }
+  }
+ }
+ #pragma unroll
+ for(int rg=0;rg<8;++rg){const int row=m0+rg*8+g,col=n0+warp*8+t*2;
+  if(row<M){if(col<N)y[(size_t)row*N+col]=__float2bfloat16_rn(acc[rg][0]);if(col+1<N)y[(size_t)row*N+col+1]=__float2bfloat16_rn(acc[rg][1]);}}
+}
 __global__ void dequant(const uint8_t*w,const uint8_t*ws,bf16*y,int N,int K,bool activation){DS41_PDL_WAIT();size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(size_t)N*K)return;
  __nv_fp8_e4m3 f;f.__x=w[i];int row=i/K,col=i%K,si=(activation?row:row/32)*(K/32)+col/32;y[i]=__float2bfloat16_rn(__fmul_rn(float(f),e8(ws[si])));
 }
@@ -102,6 +156,15 @@ extern "C" int ds41_dense_fp8(const void*x,const void*xs,const void*w,const void
  switch(K){LAUNCH(128);LAUNCH(256);LAUNCH(512);LAUNCH(1280);LAUNCH(2304);LAUNCH(4096);LAUNCH(5120);LAUNCH(6144);LAUNCH(8192);LAUNCH8(15360);default:basic<<<(N+63)/64,128,0,stream>>>(a,as,b,bs,c,M,N,K);}
  #undef LAUNCH8
  #undef LAUNCH
+ return cudaGetLastError();
+}
+extern "C" int ds41_dense_fp8_rows(const void*x,const void*xs,const void*w,const void*ws,void*y,int M,int N,int K,cudaStream_t stream){
+ // s0ma change 145: M rows (any count) of the native-variant projection, bit for bit ds41_dense_fp8's native variants
+ // (2-6) on each 8-row slice. K=6144 only (the Engram projection); other K: cudaErrorInvalidValue, the caller keeps its path.
+ if(!x||!xs||!w||!ws||!y||M<1||N<32||N%32||K!=6144)return cudaErrorInvalidValue;
+ const dim3 grid((M+63)/64,(N+63)/64);
+ if(grid.x>65535u*32768u||grid.y>65535u)return cudaErrorInvalidValue;
+ rows_native<6144><<<grid,256,0,stream>>>((const uint8_t*)x,(const uint8_t*)xs,(const uint8_t*)w,(const uint8_t*)ws,(bf16*)y,M,N);
  return cudaGetLastError();
 }
 extern "C" int ds41_dense_dequant(const void*w,const void*s,void*y,int N,int K,cudaStream_t stream){if(!w||!s||!y||N<1||N%32||K<32||K%32)return cudaErrorInvalidValue;dequant<<<((size_t)N*K+255)/256,256,0,stream>>>((const uint8_t*)w,(const uint8_t*)s,(bf16*)y,N,K,false);return cudaGetLastError();}

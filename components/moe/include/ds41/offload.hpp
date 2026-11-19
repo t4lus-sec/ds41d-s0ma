@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "ds41/store.hpp"
 #include <cuda_runtime.h>
 #include <future>
@@ -92,6 +93,9 @@ public:
     std::future<void> prefetch(std::vector<ExpertId> ids);
     PrefetchTicket prefetch(std::vector<ExpertId> ids,PrefetchPriority priority);
     PrefetchTicket prefetch_ram(std::vector<ExpertId> ids,PrefetchPriority priority=PrefetchPriority::NextLayer);
+    // s0ma change 141: prefetch_ram that drops the VRAM-resident ids too, then uploads at most max_uploads of the rest in
+    // the order given (best first): the cap counts uploads, not candidates
+    PrefetchTicket prefetch_ram_capped(std::vector<ExpertId> ids,size_t max_uploads,PrefetchPriority priority=PrefetchPriority::NextLayer);
     // s0ma change 11: hand predicted experts to the NVMe read-ahead (DS41_MOE_SPEC_NVME); only those on NVMe alone are
     // read, into its pinned slots, never into VRAM or the RAM tier. A no-op when the read-ahead is off.
     void read_ahead(std::vector<ExpertId> ids);
@@ -151,9 +155,12 @@ public:
     void place(const Placement& placement); // startup, before graph/consumer submission
     const DeviceExpert* table() const;
     int residency(ExpertId id);
+    // s0ma change 142: inside a ready-batch callback only (the store worker): the event that completes a split upload
+    // of id still in flight, else nullptr. A consumer waits on it before reading the expert's down projection.
+    cudaEvent_t rest_event(ExpertId id);
     Stats stats();
 private:
-    PrefetchTicket prefetch_impl(std::vector<ExpertId> ids,PrefetchPriority priority,bool ram_only);
+    PrefetchTicket prefetch_impl(std::vector<ExpertId> ids,PrefetchPriority priority,bool ram_only,size_t max_uploads=SIZE_MAX);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

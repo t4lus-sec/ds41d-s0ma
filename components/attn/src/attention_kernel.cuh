@@ -25,14 +25,15 @@
 #include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>
 #endif
 
-extern "C" __global__ void ds41_sparse_kernel(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk, int rows_in_y);
-extern "C" __global__ void __launch_bounds__(256, 1) ds41_sparse_kernel(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk, int rows_in_y) {DS41_PDL_WAIT();
+#include "kv_source.cuh"   // s0ma change 146
+// s0ma change 146: the kernel body, plain (the gathered BF16 copy) or Fused (the caches, kv_source.cuh)
+template<bool Fused> __device__ __forceinline__ void ds41_sparse_body(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk, int rows_in_y, const ds41_attn_kv_source& fs) {DS41_PDL_WAIT();
   // s0ma change 75: with rows_in_y the grid is (head groups, rows): a row's head-group CTAs run next to each other
   // and share its gathered KV through L2. Each CTA computes what it did before.
   const int sparse_row = rows_in_y ? int(blockIdx.y) : int(blockIdx.x), sparse_group = rows_in_y ? int(blockIdx.x) : int(blockIdx.y);
   q += int64_t(sparse_group)*b*512;
   o += int64_t(sparse_group)*b*512;
-  kv += int64_t(sparse_row)*topk*512;
+  if constexpr(!Fused) kv += int64_t(sparse_row)*topk*512;
   attn_sink += sparse_group*b;
   extern __shared__ __align__(1024) uchar buf_dyn_shmem[];
   void* o_shared = ((void*)((char*)buf_dyn_shmem + 0));
@@ -80,7 +81,7 @@ extern "C" __global__ void __launch_bounds__(256, 1) ds41_sparse_kernel(const fl
       int r=v/64,c=v%64;
       int src=(t*64+r<topk)?topk_idxs[int64_t(sparse_row)*topk+t*64+r]:-1;
       uint4 value=make_uint4(0,0,0,0);
-      if(src>=0 && src<n) value=*(const uint4*)(kv+int64_t(src)*512+c*8);
+      if(src>=0 && src<n) { if constexpr(Fused) value=ds41_kv_load8(fs,sparse_row,src,c); else value=*(const uint4*)(kv+int64_t(src)*512+c*8); }
       int dst=(c/8)*4096+r*64+((c^r)&7)*8;
       *(uint4*)(((bfloat16_t*)kv_shared)+dst)=value;
     }
@@ -184,4 +185,9 @@ extern "C" __global__ void __launch_bounds__(256, 1) ds41_sparse_kernel(const fl
     if(i_16*2048+int(threadIdx.x)*8 < b*512) *(uint4*)(o + ((((((int64_t)sparse_row) * (int64_t)32768) + ((((int64_t)0) * ((int64_t)m)) * (int64_t)8192)) + (((int64_t)i_16) * (int64_t)2048)) + (((int64_t)((int)threadIdx.x)) * (int64_t)8))) = *(uint4*)(((bfloat16_t*)o_shared) + ((i_16 * 2048) + (((int)threadIdx.x) * 8)));
   }
 }
-
+extern "C" __global__ void __launch_bounds__(256, 1) ds41_sparse_kernel(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk, int rows_in_y) {
+  ds41_sparse_body<false>(attn_sink, kv, o, q, topk_idxs, b, m, n, topk, rows_in_y, ds41_attn_kv_source{});
+}
+extern "C" __global__ void __launch_bounds__(256, 1) ds41_sparse_fused_kernel(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk, int rows_in_y, const ds41_attn_kv_source fs) {
+  ds41_sparse_body<true>(attn_sink, kv, o, q, topk_idxs, b, m, n, topk, rows_in_y, fs);
+}

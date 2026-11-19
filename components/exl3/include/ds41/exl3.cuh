@@ -84,9 +84,17 @@ cudaError_t exl3_dense_prefill(const DeviceExpert* table, GemmJob job, int n, in
 cudaError_t exl3_dense_f32(const DeviceExpert* table, GemmJob job, int n, int k, int bits, cudaStream_t stream,
                            int x_stride = 0, int out_stride = 0);
 cudaError_t grouped_exl3_var(const DeviceExpert* table, const GemmJob* jobs, int count,
-                             Projection projection, int n, int k, const uint8_t* bits, cudaStream_t stream);
+                             Projection projection, int n, int k, const uint8_t* bits, cudaStream_t stream, int max_tokens = 8);
 // s0ma change 122: gate (gate_jobs) and up (up_jobs) of the same `count` experts in one launch, k 5120: each CTA the
 // same work as grouped_exl3_var's. DS41_EXL3_PF=8 (read once) doubles the decode kernels' loads in flight; exact.
 cudaError_t grouped_exl3_var_gu(const DeviceExpert* table, const GemmJob* gate_jobs, const GemmJob* up_jobs, int count,
-                                int n, int k, const uint8_t* bits, cudaStream_t stream);
+                                int n, int k, const uint8_t* bits, cudaStream_t stream, int max_tokens = 8);
+// s0ma change 127: device memory ranges brought into L2 ahead of the kernels that read them (cp.async.bulk.prefetch),
+// range 0 first; policy 1 plain, 2 evict_last. ranges is a device array of `count` (1..64) entries, 16-byte aligned
+// starts (a tail under 16 bytes is skipped). A hint: nothing computed changes. DS41_EXL3_DENSE_PF=8 (read once) keeps 8
+// slices a warp in flight in the dense decode kernels (exl3_dense, exl3_dense_f32), 4 otherwise; exact.
+struct L2Range { const void* p; uint64_t bytes; };
+// s0ma change 136: max_tokens on grouped_exl3_var and grouped_exl3_var_gu is the most rows any job of the launch has
+// (default 8); with DS41_EXL3_OCC2=1 and max_tokens <= 4 the kernels run two CTAs to an SM. Exact.
+cudaError_t exl3_l2_prefetch(const L2Range* ranges, int count, int policy, int ctas, cudaStream_t stream);
 }

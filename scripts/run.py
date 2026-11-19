@@ -435,6 +435,19 @@ def environment(cfg, render=True):
         # 84.81 tok/s (+1.3%, every B run above every A run), verify 24.98 -> 24.63 ms a step, tokens 14/14 identical.
         # A lab --env DS41_EXL3_OCC2=0 turns it off
         env.setdefault('DS41_EXL3_OCC2', '1')
+        # s0ma change 144: the three exact winners of the 2026-11-19 A/Bs on (3 rounds each, sero, seeds 21 and 22,
+        # tokens 14/14 identical in every run; the lab's A/A runs read B ~0.7% slow, so these are if anything low):
+        # - change 139's hyper-connection kernels (DS41_HC_FAST): verify 24.97 -> 24.50 ms a step (-1.9%)
+        # - change 141's lookahead uploads capped after the VRAM filter, every candidate considered (DS41_LOOKAHEAD_RAM_
+        #   FIRST, cap DS41_LOOKAHEAD_N=2 as above): 24.74 -> 24.45 ms (-1.2%); a cap of 4 measured no different
+        # - change 142's RAM-miss uploads in two copies, gate+up first (DS41_MOE_SPLIT_UPLOAD): 24.77 -> 24.31 ms
+        #   (-1.8%, every B run below every A run)
+        # Measured and left off: DS41_LOOKAHEAD=0 (+1.2%), change 143's DS41_EXL3_LPT (+0.5%, within spread), change
+        # 140's DS41_SPARK_HC_FUSED (drafter forward 0.29 -> 0.26 ms, but drafts change: acceptance 0.756 -> 0.725 on
+        # the different text, steps +1.1%). A lab --env NAME=0 turns one of the three off
+        env.setdefault('DS41_HC_FAST', '1')
+        env.setdefault('DS41_LOOKAHEAD_RAM_FIRST', '1')
+        env.setdefault('DS41_MOE_SPLIT_UPLOAD', '1')
         # s0ma change 58: up to 8 GiB a prompt of the experts its last 256 rows routed and its sweep read from the drive,
         # into the RAM tier as they pass (change 57). Seed 22, 48 GiB tier: 41.2-42.8 -> 45.07 tok/s (three runs of
         # the build before), NVMe misses 7,842-7,879 -> 6,527, verify 54.1 -> 51.0 ms a step, tokens 7/7 identical.

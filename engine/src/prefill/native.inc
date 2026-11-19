@@ -1084,6 +1084,13 @@ static bool prefill_engram_batch() {
 // s0ma change 145: with DS41_PREFILL_ENGRAM_WIDE=1 a chunk's Engram rows go to the projection together (up to 256),
 // through ds41_dense_fp8_rows: it reads the 157 MB wkv matrix once a 64 rows instead of once every 8 (the 8K bench
 // prompt: 2,000 passes, 236 ms of its 3.07 s prefill). Bit for bit the 8-row calls (k2 check: fp8_rows_check).
+// s0ma change 146: with DS41_PREFILL_FUSED_GATHER=1 a chunk's attention reads the window ring and the compressed cache
+// itself (components/attn/src/kv_source.cuh) instead of a gathered BF16 copy ([rows, width+k, 512]: 168 MB a chunk at
+// k 512, written and read again). Bit for bit (k2 check: fused_gather_check).
+static bool prefill_fused_gather() {
+  static const bool on = [] { const char *v = std::getenv("DS41_PREFILL_FUSED_GATHER"); return v && v[0] == '1'; }();
+  return on;
+}
 static int engram_rows_cap() {
   static const int cap = [] { const char *v = std::getenv("DS41_PREFILL_ENGRAM_WIDE"); return v && v[0] == '1' ? 256 : 8; }();
   return cap;

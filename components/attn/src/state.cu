@@ -69,6 +69,24 @@ extern "C" int ds41_attn_gather_prefill_at(const void*swa,int cap,const void*g,i
  if(!swa||!out||!local||!start||width<1||width>128||cap<width||rows<1||k<0||k>512||gcap<0||(k&&(!g||!ids||ratio<1)))return cudaErrorInvalidValue;
  gather<<<dim3(width+k,rows),128,0,(cudaStream_t)st>>>((const uint8_t*)swa,cap,(const uint8_t*)g,gcap,ids,k,0,rows,ratio,(bf*)out,local,start,width,true);return cudaGetLastError();
 }
+// s0ma change 146: the gather's local index alone (its id rule, line for line), for the attention kernels that read
+// the caches themselves (kv_source.cuh). One thread a slot.
+__global__ void gather_index(const uint8_t*swa,int cap,const uint8_t*global,int gcap,const int*ids,int k,int64_t start,int rows,int ratio,int*local,const int64_t* dynamic_start,int width,bool prefill){DS41_PDL_WAIT();
+ int slot=blockIdx.x*blockDim.x+threadIdx.x, row=blockIdx.y;
+ int count=width+k;if(slot>=count)return;int64_t pos=(dynamic_start?*dynamic_start:start)+row;int id=-1;bool sw=slot<width;
+ if(sw){int64_t p=prefill?max(int64_t(0),pos-127)+slot:pos-127+slot;if(p>=0&&p<=pos){id=slot;}}
+ else {int j=ids[row*k+slot-width];if(j>=0&&j<gcap&&int64_t(j+1)*ratio<=pos+1){id=slot;}}
+ local[row*count+slot]=id;
+}
+extern "C" int ds41_attn_gather_index(const ds41_attn_kv_source*s,int rows,int32_t*local,void*st){
+ if(!s||!local||!s->swa||rows<1||s->k<0||s->k>512||s->global_capacity<0||(s->k&&(!s->global_kv||!s->top_idx||s->ratio<1)))return cudaErrorInvalidValue;
+ if(s->prefill){if(!s->dynamic_start||s->width<1||s->width>128||s->capacity<s->width)return cudaErrorInvalidValue;}   // as ds41_attn_gather_prefill_at
+ else if(s->width!=128||s->capacity<128+rows||(!s->dynamic_start&&s->start<0))return cudaErrorInvalidValue;          // as ds41_attn_gather(_at)
+ const int count=s->width+s->k;
+ gather_index<<<dim3((count+127)/128,rows),128,0,(cudaStream_t)st>>>((const uint8_t*)s->swa,s->capacity,(const uint8_t*)s->global_kv,
+   s->global_capacity,s->top_idx,s->k,s->start,rows,s->ratio,local,s->dynamic_start,s->width,s->prefill!=0);
+ return cudaGetLastError();
+}
 __global__ void poolprefill(const float*kv,const float*sc,bf*out,int pairs){DS41_PDL_WAIT();
  int pair=blockIdx.x,d=threadIdx.x;for(;d<512;d+=blockDim.x){int a=pair*1024+d,b=a+512;float mx=fmaxf(sc[a],sc[b]);float p0=expf(sc[a]-mx),p1=expf(sc[b]-mx),denom=__fadd_rn(p0,p1);float v=__fadd_rn(__fmul_rn(kv[a],__fdiv_rn(p0,denom)),__fmul_rn(kv[b],__fdiv_rn(p1,denom)));out[pair*512+d]=__float2bfloat16_rn(v);}
 }

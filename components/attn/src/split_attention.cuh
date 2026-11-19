@@ -25,11 +25,13 @@
 #include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>
 #endif
 
-extern "C" __global__ void __launch_bounds__(256,1) ds41_qk_kernel(
+#include "kv_source.cuh"   // s0ma change 146
+// s0ma change 146: both kernels' bodies, plain (the gathered BF16 copy) or Fused (the caches, kv_source.cuh)
+template<bool Fused> __device__ __forceinline__ void ds41_qk_body(
  const bfloat16_t* q,const bfloat16_t* kv,const int* topk_idxs,float* scores,
- int b,int m,int n,int topk){DS41_PDL_WAIT();
+ int b,int m,int n,int topk,const ds41_attn_kv_source& fs){DS41_PDL_WAIT();
  q += int64_t(blockIdx.y)*b*512;
- kv += int64_t(blockIdx.x)*topk*512;
+ if constexpr(!Fused) kv += int64_t(blockIdx.x)*topk*512;
  extern __shared__ __align__(1024) uchar sm[];
  void* q_shared=sm;void* kv_shared=sm+16384;
  int idxs[2];float acc_s[4];int t=blockIdx.z;
@@ -53,7 +55,7 @@ extern "C" __global__ void __launch_bounds__(256,1) ds41_qk_kernel(
       int r=v/64,c=v%64;
       int src=(t*64+r<topk)?topk_idxs[int64_t(blockIdx.x)*topk+t*64+r]:-1;
       uint4 value=make_uint4(0,0,0,0);
-      if(src>=0 && src<n) value=*(const uint4*)(kv+int64_t(src)*512+c*8);
+      if(src>=0 && src<n) { if constexpr(Fused) value=ds41_kv_load8(fs,int(blockIdx.x),src,c); else value=*(const uint4*)(kv+int64_t(src)*512+c*8); }
       int dst=(c/8)*4096+r*64+((c^r)&7)*8;
       *(uint4*)(((bfloat16_t*)kv_shared)+dst)=value;
     }
@@ -90,11 +92,10 @@ extern "C" __global__ void __launch_bounds__(256,1) ds41_qk_kernel(
  }
 }
 
-extern "C" __global__ void ds41_pv_kernel(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk, const float* scores);
-extern "C" __global__ void __launch_bounds__(256, 1) ds41_pv_kernel(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk, const float* scores) {DS41_PDL_WAIT();
+template<bool Fused> __device__ __forceinline__ void ds41_pv_body(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk, const float* scores, const ds41_attn_kv_source& fs) {DS41_PDL_WAIT();
   q += int64_t(blockIdx.y)*b*512;
   o += int64_t(blockIdx.y)*b*512;
-  kv += int64_t(blockIdx.x)*topk*512;
+  if constexpr(!Fused) kv += int64_t(blockIdx.x)*topk*512;
   attn_sink += blockIdx.y*b;
   extern __shared__ __align__(1024) uchar buf_dyn_shmem[];
   void* o_shared = ((void*)((char*)buf_dyn_shmem + 0));
@@ -138,7 +139,7 @@ extern "C" __global__ void __launch_bounds__(256, 1) ds41_pv_kernel(const float*
       int r=v/64,c=v%64;
       int src=(t*64+r<topk)?topk_idxs[int64_t(blockIdx.x)*topk+t*64+r]:-1;
       uint4 value=make_uint4(0,0,0,0);
-      if(src>=0 && src<n) value=*(const uint4*)(kv+int64_t(src)*512+c*8);
+      if(src>=0 && src<n) { if constexpr(Fused) value=ds41_kv_load8(fs,int(blockIdx.x),src,c); else value=*(const uint4*)(kv+int64_t(src)*512+c*8); }
       int dst=(c/8)*4096+r*64+((c^r)&7)*8;
       *(uint4*)(((bfloat16_t*)kv_shared)+dst)=value;
     }
@@ -235,4 +236,19 @@ extern "C" __global__ void __launch_bounds__(256, 1) ds41_pv_kernel(const float*
     if(i_16*2048+int(threadIdx.x)*8 < b*512) *(uint4*)(o + ((((((int64_t)((int)blockIdx.x)) * (int64_t)32768) + ((((int64_t)0) * ((int64_t)m)) * (int64_t)8192)) + (((int64_t)i_16) * (int64_t)2048)) + (((int64_t)((int)threadIdx.x)) * (int64_t)8))) = *(uint4*)(((bfloat16_t*)o_shared) + ((i_16 * 2048) + (((int)threadIdx.x) * 8)));
   }
 }
-
+extern "C" __global__ void __launch_bounds__(256,1) ds41_qk_kernel(
+ const bfloat16_t* q,const bfloat16_t* kv,const int* topk_idxs,float* scores,
+ int b,int m,int n,int topk){
+ ds41_qk_body<false>(q, kv, topk_idxs, scores, b, m, n, topk, ds41_attn_kv_source{});
+}
+extern "C" __global__ void __launch_bounds__(256,1) ds41_qk_fused_kernel(
+ const bfloat16_t* q,const bfloat16_t* kv,const int* topk_idxs,float* scores,
+ int b,int m,int n,int topk,const ds41_attn_kv_source fs){
+ ds41_qk_body<true>(q, kv, topk_idxs, scores, b, m, n, topk, fs);
+}
+extern "C" __global__ void __launch_bounds__(256, 1) ds41_pv_kernel(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk, const float* scores) {
+  ds41_pv_body<false>(attn_sink, kv, o, q, topk_idxs, b, m, n, topk, scores, ds41_attn_kv_source{});
+}
+extern "C" __global__ void __launch_bounds__(256, 1) ds41_pv_fused_kernel(const float* __restrict__ attn_sink, const bfloat16_t* __restrict__ kv, bfloat16_t* __restrict__ o, const bfloat16_t* __restrict__ q, const int* __restrict__ topk_idxs, int b, int m, int n, int topk, const float* scores, const ds41_attn_kv_source fs) {
+  ds41_pv_body<true>(attn_sink, kv, o, q, topk_idxs, b, m, n, topk, scores, fs);
+}

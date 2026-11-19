@@ -698,6 +698,8 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::unique_ptr<Phase> lookahead_sync;
   int lookahead_layer = -1, lookahead_k = 6;
   bool lookahead_ram_first = false;   // s0ma change 141
+  // s0ma change 143: DS41_EXL3_LPT=1, the widest experts' jobs first in each streamed launch
+  const bool exl3_lpt = [] { const char *v = std::getenv("DS41_EXL3_LPT"); return v && v[0] == '1'; }();
   // s0ma change 11: DS41_LOOKAHEAD_NVME_DEPTH=D (2..3; default 0 = off) also scores layer l+D's router on layer l's
   // input and hands its top DS41_LOOKAHEAD_K a row to the store's NVMe read-ahead (DS41_MOE_SPEC_NVME), so an NVMe
   // read gets D layers of lead instead of one. A transfer hint like the lookahead: routing and outputs are unchanged.

@@ -19,11 +19,21 @@ void bmoe_streamed(const std::string &p,int m,const hotpath::RoutePlan &plan,
     if(readiness) consumer_readiness->arrived(layer,stream);
     std::array<ds41::GemmJob,36> gates{},ups{},downs{};
     std::array<int,36> rows{}; int count=0,n=int(ready.size());
-    for(int i=0;i<n;++i) {
+    // s0ma change 143 (DS41_EXL3_LPT=1): the widest experts' jobs first. A mixed-width launch's CTAs take time in
+    // proportion to their expert's bits, and the GPU hands out CTAs in grid order, so the last wave holds the
+    // narrowest ones (longest-processing-time-first). Each job keeps its own rows and output: the same arithmetic.
+    std::array<int,36> order{};
+    for(int i=0;i<n;++i) order[i]=i;
+    if(exl3_lpt && exl3_mixed && n>1 && n<=36)
+      std::stable_sort(order.begin(),order.begin()+n,[&](int a,int b){
+        return width_of[ready[a]]>width_of[ready[b]];
+      });
+    for(int i0=0;i0<n;++i0) {
+      const int i=order[i0];
       auto it=std::lower_bound(plan.ids.begin(),plan.ids.end(),ready[i]);
       if(it==plan.ids.end() || *it!=ready[i]) throw std::logic_error("foreign ready expert");
       size_t ix=size_t(it-plan.ids.begin());
-      gates[i]=gj[ix]; ups[i]=uj[ix]; downs[i]=dj[ix];
+      gates[i0]=gj[ix]; ups[i0]=uj[ix]; downs[i0]=dj[ix];
       const auto &e=plan.experts[ix];
       for(int j=0;j<e.count;++j) rows[count++]=e.begin+j;
     }

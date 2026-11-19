@@ -75,6 +75,17 @@ void bhc(const std::string &p, const char *kind, Device &target_pre, int m) {
         mixes.as<float>(r*24*4), rstd.as<float>(r*4),
         1, H, 1e-20f, 1e-6f, stream));
 }
+// s0ma change 128 (DS41_HC_FUSED=1, rows 1..8): bhc, ds41_dense_hc_pre, the norm and (f32_out) bf16_float in two
+// launches. The coefficients' long sums in another order (rounding only); the mix, norm and copy bit for bit.
+bool hc_fused_ok(int m) const { return hc_fused && m>=1 && m<=8; }
+void hc_site(const std::string &p,const char *kind,Device &target_pre,const Device &incoming,const std::string &norm,
+             int m,bool f32_out) {
+  const int i=lane_b_active?1:0;
+  CK(ds41_dense_hc_fused_mixes(h.p,w(p+".hc_"+kind+"_fn").data.as<float>(),w(p+".hc_"+kind+"_scale").data.as<float>(),
+      w(p+".hc_"+kind+"_base").data.as<float>(),target_pre.as<float>(),post.as<float>(),comb.as<float>(),
+      hc_part[i].as<float>(),hc_count[i].as<unsigned>(),m,H,1e-20f,1e-6f,stream));
+  CK(ds41_dense_hc_pre_norm(h.p,incoming.as<float>(),w(norm+".weight").data.p,x.p,f32_out?f32.as<float>():nullptr,m,H,stream));
+}
 void bfused_prepare(const std::string &p,const char *kind,Device &new_pre,
                     Device &incoming,const std::string &norm,int m,bool quant) {
   CK(fused->prepare(blas,h.p,w(p+".hc_"+kind+"_fn").data.as<float>(),
@@ -611,6 +622,7 @@ void batch_front(int l,BatchLane &lane) {
       bgate(base+hotpath::GateLayout::Input,h.p,hotpath::GateLayout::hc_bytes,m);
       bgate(base+hotpath::GateLayout::IncomingPre,pre.p,16,m);
       if(fused) bfused_prepare(p,"attn",att_pre,pre,p+".attn_norm",m,true);
+      else if(hc_fused_ok(m)) hc_site(p,"attn",att_pre,pre,p+".attn_norm",m,false);   // s0ma change 128
       else {
         bhc(p,"attn",att_pre,m);
         CK(ds41_dense_hc_pre(h.p,pre.as<float>(),x.p,m,H,stream));
@@ -648,6 +660,7 @@ void batch_front(int l,BatchLane &lane) {
     size_t base=size_t(l)*hotpath::GateLayout::LayerBytes;
     bgate(base+hotpath::GateLayout::AfterAttn,h.p,hotpath::GateLayout::hc_bytes,m);
     if(fused) bfused_prepare(p,"ffn",ffn_pre,att_pre,p+".ffn_norm",m,false);
+    else if(hc_fused_ok(m)) hc_site(p,"ffn",ffn_pre,att_pre,p+".ffn_norm",m,true);   // s0ma change 128
     else {
       bhc(p,"ffn",ffn_pre,m);
       CK(ds41_dense_hc_pre(h.p,att_pre.as<float>(),x.p,m,H,stream));
@@ -684,6 +697,8 @@ void batch_head(BatchLane &lane,int row) {
     bgate(hotpath::GateLayout::final_h,h.p,hotpath::GateLayout::hc_bytes,m);
     bgate(hotpath::GateLayout::final_pre,pre.p,16,m);
     if(fused) CK(fused->norm(h.p,pre.as<float>(),w("norm.weight").data.p,x.p,f32.as<float>(),nullptr,nullptr,m,H,1e-20f,stream));
+    else if(hc_fused_ok(m))   // s0ma change 128: the mix, the final norm and the FP32 copy in one launch (exact)
+      CK(ds41_dense_hc_pre_norm(h.p,pre.as<float>(),w("norm.weight").data.p,x.p,f32.as<float>(),m,H,stream));
     else {
       CK(ds41_dense_hc_pre(h.p,pre.as<float>(),x.p,m,H,stream));
       bnorm("norm",x.p,x.p,H,m);

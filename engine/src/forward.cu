@@ -326,6 +326,10 @@ class Native final : public Forward, public hotpath::GateEvidence {
   static constexpr int l2_slots = 16;
   std::array<cudaStream_t, 2> l2_side{};
   std::array<cudaEvent_t, 2> l2_fork{}, l2_join{};
+  // s0ma change 128 (DS41_HC_FUSED=1): each decode hyper-connection site in two launches (the coefficients; the mix, its
+  // norm and the FP32 copy) instead of five to eleven; per lane, the coefficients' partial sums and arrival count
+  bool hc_fused = false;
+  Device hc_part[2], hc_count[2];
   Device dense_table;
   double dense_extra_gib = 0;                         // VRAM the swap gave back, for expert slots
   // s0ma change 49: the drafter's 384 routed experts as EXL3 records (DS41_MTP_EXL3=DIR), one width for all
@@ -1064,6 +1068,17 @@ public:
     load_sero_dense();
     vram_checkpoint("native_after_sero_dense");
     setup_l2_prefetch();   // s0ma change 127
+    if (const char *v = std::getenv("DS41_HC_FUSED"); v && std::string(v) == "1") {   // s0ma change 128
+      const size_t floats = ds41_dense_hc_fused_floats(H);
+      if (!floats) throw std::runtime_error("DS41_HC_FUSED: the hidden size does not split into the fused launch's chunks");
+      for (int i = 0; i < 2; ++i) {
+        hc_part[i].resize(floats * 4);
+        hc_count[i].resize(4);
+        CK(cudaMemset(hc_count[i].p, 0, 4));
+      }
+      hc_fused = true;
+      std::cerr << "hyper-connections fused (DS41_HC_FUSED=1): two launches a decode site\n";
+    }
     splitk_scratch(0);   // s0ma change 40
     if (fused_head && !dense_of("head")) {   // s0ma change 43: unless Sero's head replaced it
       const auto &head = w("head.weight");

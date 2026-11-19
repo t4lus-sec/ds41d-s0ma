@@ -86,6 +86,7 @@ struct Stats {
     // s0ma change 8 (DS41_MOE_SPEC_NVME=N): predicted NVMe-tier experts read ahead into N pinned slots; demand
     // misses found there (or still being read) upload from them instead of waiting for a fresh read.
     uint64_t spec_reads=0, spec_hits=0, spec_waits=0, spec_dropped=0, spec_queued=0;
+    uint64_t split_uploads=0;   // s0ma change 142: demand RAM uploads made as head and rest (DS41_MOE_SPLIT_UPLOAD)
     // s0ma change 18: decode demands by slot class (a width of a mixed bank; class 0 when the store is uniform).
     std::array<uint64_t,8> class_requests{}, class_hits{}, class_host_hits{}, class_nvme_misses{};
 };

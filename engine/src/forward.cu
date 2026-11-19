@@ -732,7 +732,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::map<ds41::ExpertId, int> prefill_warm_counts;
   std::vector<std::future<void>> retirement_futures;
   size_t retirement_observed=0;
-  uint64_t stream_callbacks=0, stream_hit_batches=0;
+  uint64_t stream_callbacks=0, stream_hit_batches=0, split_callbacks=0;   // split: s0ma change 142
   Device batch_frequencies{12*64*4}, compressed_frequencies{6*64*4},
       lengths1{6*4}, lengths2{6*4}, packed_keys{6*68}, packed_globals{6*288};
   bool hotpath_capturing=false;
@@ -1491,7 +1491,7 @@ public:
     io_ms = route_ms = engram_ms = total_ms = 0;
     measured.clear();prefill_summary=Json::object();
     host_plan_ms=callback_enqueue_ms=0; profile_steps=Json::array();
-    stream_callbacks=stream_hit_batches=0;
+    stream_callbacks=stream_hit_batches=split_callbacks=0;
     gpu_route_layers=gpu_route_mismatches=0;   // s0ma change 83
     initial_stats = sample_expert_stats();
     initial_demand = experts->demand_totals();
@@ -1950,6 +1950,8 @@ public:
               {"expert_spec_hits", s.spec_hits - initial_stats.spec_hits},
               {"expert_spec_waits", s.spec_waits - initial_stats.spec_waits},
               {"expert_spec_dropped", s.spec_dropped - initial_stats.spec_dropped},
+              {"expert_split_uploads", s.split_uploads - initial_stats.split_uploads},   // s0ma change 142
+              {"expert_split_callbacks", split_callbacks},
               {"expert_prefetch_used", s.prefetch_used - initial_stats.prefetch_used},   // s0ma change 141
               {"expert_prefetch_wasted", s.prefetch_wasted - initial_stats.prefetch_wasted},
               {"expert_prefetch_h2d_bytes", s.prefetch_h2d_bytes - initial_stats.prefetch_h2d_bytes},

@@ -1,6 +1,7 @@
 // v0.2 callbacks execute on the store worker. All per-batch scratch is owned by
 // Native and reused only through its ordered consumer stream. Callbacks never
 // reenter the store or wait for GPU work.
+// (s0ma change 142: rest_event is the one store call they make, a worker-local read with no lock or queue.)
 void bmoe_streamed(const std::string &p,int m,const hotpath::RoutePlan &plan,
                   const std::vector<ds41::GemmJob> &gj,
                   const std::vector<ds41::GemmJob> &uj,
@@ -45,14 +46,27 @@ void bmoe_streamed(const std::string &p,int m,const hotpath::RoutePlan &plan,
     }
     // The device job descriptors carry every layer/expert/output address.
     // Reuse this body across layers; dimensions and scratch addresses are fixed.
-    bgraph("experts.stream."+std::to_string(n)+"."+std::to_string(count),m,[&]{
+    // s0ma change 142: an expert uploaded from RAM in two copies (DS41_MOE_SPLIT_UPLOAD=1) reached this callback when
+    // its gate and up landed; its down projection waits for the rest (rest_event: worker-local, takes no store lock)
+    std::array<cudaEvent_t,36> rest{}; int rests=0;
+    for(int i=0;i<n;++i) if(cudaEvent_t e=experts->rest_event(ready[i])) rest[rests++]=e;
+    auto gate_up=[&]{
       CK(expert_gemm_gate_up(work_jobs.as<ds41::GemmJob>(),work_up_jobs.as<ds41::GemmJob>(),n,stream,layer,m));   // s0ma changes 122, 136
       if(exl3) hotpath::activate_routes_bf16(gate.p,up.p,broute.as<float>(),work_rows.as<int>(),
           act.p,count,stream);
       else hotpath::activate_routes(gate.p,up.p,broute.as<float>(),work_rows.as<int>(),
           eq.as<uint8_t>(),es.as<uint8_t>(),count,stream);
+    };
+    auto down_proj=[&]{
       CK(expert_gemm(work_down_jobs.as<ds41::GemmJob>(),n,ds41::Projection::Down,H,I,stream,layer,m));   // s0ma change 136: m rows
-    });
+    };
+    if(!rests) bgraph("experts.stream."+std::to_string(n)+"."+std::to_string(count),m,[&]{ gate_up(); down_proj(); });
+    else {
+      bgraph("experts.stream.gu."+std::to_string(n)+"."+std::to_string(count),m,gate_up);
+      for(int i=0;i<rests;++i) CK(cudaStreamWaitEvent(stream,rest[i],0));
+      bgraph("experts.stream.down."+std::to_string(n),m,down_proj);
+      ++split_callbacks;
+    }
     if(event) {
       CK(cudaEventRecord(event->end,stream));
       consumer_readiness->expert_done(layer,event->end);

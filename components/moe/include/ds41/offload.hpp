@@ -155,6 +155,9 @@ public:
     void place(const Placement& placement); // startup, before graph/consumer submission
     const DeviceExpert* table() const;
     int residency(ExpertId id);
+    // s0ma change 142: inside a ready-batch callback only (the store worker): the event that completes a split upload
+    // of id still in flight, else nullptr. A consumer waits on it before reading the expert's down projection.
+    cudaEvent_t rest_event(ExpertId id);
     Stats stats();
 private:
     PrefetchTicket prefetch_impl(std::vector<ExpertId> ids,PrefetchPriority priority,bool ram_only,size_t max_uploads=SIZE_MAX);

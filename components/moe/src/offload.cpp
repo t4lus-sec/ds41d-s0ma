@@ -100,6 +100,20 @@ struct OffloadStore::Impl {
     DeviceExpert* table=nullptr;
     uint32_t* ready=nullptr;
     std::vector<cudaEvent_t> slot_copy,slot_mapping,staging_copy;
+    // s0ma change 142: DS41_MOE_SPLIT_UPLOAD=1: a demand's RAM upload in two copies, gate and up (with their scales)
+    // first, then down; slot_head marks the first. The ready callback's consumer waits for the head only, and the
+    // engine waits for the rest (rest_event) before its down projection, so the gate+up GEMM overlaps the down copy.
+    // slot_copy still marks the whole upload, so every other wait on a slot (hits, evictions, demotions) is unchanged.
+    const bool split_upload=[]{const char*v=std::getenv("DS41_MOE_SPLIT_UPLOAD");return v&&v[0]=='1';}();
+    std::vector<cudaEvent_t> slot_head;std::vector<uint8_t> slot_split;
+    uint64_t split_uploads=0;
+    static size_t head_bytes(const Record& r){
+        if(!r.down.bytes)return 0;
+        uint64_t split=r.down.offset;if(r.down_scale.bytes)split=std::min(split,r.down_scale.offset);
+        uint64_t head=0;for(auto t:{r.gate,r.gate_scale,r.up,r.up_scale})if(t.bytes)head=std::max(head,t.offset+t.bytes);
+        uint64_t tail=std::max(r.down.offset+r.down.bytes,r.down_scale.bytes?r.down_scale.offset+r.down_scale.bytes:0);
+        return head<=split && split>0 && split<r.bytes && tail<=r.bytes?size_t(split):0;
+    }
     std::vector<bool> known_ready;
     cudaStream_t copy=nullptr, mapping=nullptr;
     // s0ma change 41: DS41_MOE_PREFETCH_STREAM=1 gives prefetch uploads their own lowest-priority stream (pcopy) and
@@ -318,6 +332,8 @@ struct OffloadStore::Impl {
         ck(cudaMalloc(&ready,cfg.slots*sizeof(uint32_t)));ck(cudaMemset(ready,0,cfg.slots*sizeof(uint32_t)));
         slot_copy.resize(cfg.slots,nullptr);slot_mapping.resize(cfg.slots,nullptr);known_ready.resize(cfg.slots,false);
         for(size_t s=0;s<cfg.slots;++s){ck(cudaEventCreateWithFlags(&slot_copy[s],cudaEventDisableTiming));ck(cudaEventCreateWithFlags(&slot_mapping[s],cudaEventDisableTiming));}
+        if(split_upload && !cfg.ready_flags){slot_head.resize(cfg.slots,nullptr);slot_split.resize(cfg.slots,0);
+            for(size_t s=0;s<cfg.slots;++s)ck(cudaEventCreateWithFlags(&slot_head[s],cudaEventDisableTiming));}   // change 142
         staging=std::make_unique<HostBuffer>(slot_bytes*cfg.staging_slots,true);
         staging_copy.resize(cfg.staging_slots,nullptr);
         for(auto& e:staging_copy)ck(cudaEventCreateWithFlags(&e,cudaEventDisableTiming));
@@ -389,7 +405,8 @@ struct OffloadStore::Impl {
         staging_copy.clear();
         for(auto e:slot_copy)if(e)cudaEventDestroy(e);
         for(auto e:slot_mapping)if(e)cudaEventDestroy(e);
-        slot_copy.clear();slot_mapping.clear();
+        for(auto e:slot_head)if(e)cudaEventDestroy(e);
+        slot_copy.clear();slot_mapping.clear();slot_head.clear();slot_split.clear();
         if(vram)cudaFree(vram);
         for(auto& b:lend_base){if(b)cudaFree(b);b=nullptr;}
         if(table)cudaFree(table);
@@ -530,8 +547,10 @@ struct OffloadStore::Impl {
             for(auto a:allocations)if(!a.hit) {
                 auto h=host.find(a.id);if(h==host.end())continue;
                 if(auto d=demoting.find(a.id);d!=demoting.end())ck(cudaStreamWaitEvent(cs,d->second,0));
-                upload(a,static_cast<char*>(host_arena->data())+h->second,records.at(a.id).bytes,is_prefetch,true,cs);
-                if(streaming)notify(a);
+                const bool split=upload(a,static_cast<char*>(host_arena->data())+h->second,records.at(a.id).bytes,is_prefetch,true,cs,
+                                        bool(batch_callback));   // s0ma change 142: only the batch path waits for the rest
+                if(streaming){if(split){order_head(a,consumer);if(callback)callback(a.id,consumer);if(batch_callback)batch_callback({a.id},consumer);}
+                    else notify(a);}
             }
             if(spec_n && !is_prefetch && !disk.empty()) {
                 std::vector<SlotPool::Allocation> rest;
@@ -824,15 +843,31 @@ struct OffloadStore::Impl {
         if(rc==cudaErrorNotReady)ck(cudaStreamWaitEvent(consumer,map,0));else ck(rc);
         if(!cfg.ready_flags){rc=cudaEventQuery(slot_copy[a.slot]);if(rc==cudaErrorNotReady)ck(cudaStreamWaitEvent(consumer,slot_copy[a.slot],0));else ck(rc);}
     }
-    void upload(const SlotPool::Allocation& a,void* src,size_t bytes,bool is_prefetch,bool copy_bytes,cudaStream_t cs) {
+    // s0ma change 142: the consumer of a split upload waits for its mapping and its head only
+    void order_head(const SlotPool::Allocation& a,cudaStream_t consumer) {
+        auto map=slot_mapping[a.slot];auto rc=cudaEventQuery(map);
+        if(rc==cudaErrorNotReady)ck(cudaStreamWaitEvent(consumer,map,0));else ck(rc);
+        rc=cudaEventQuery(slot_head[a.slot]);if(rc==cudaErrorNotReady)ck(cudaStreamWaitEvent(consumer,slot_head[a.slot],0));else ck(rc);
+    }
+    // returns true when the upload was split (change 142: demand uploads from RAM, split on, a record that splits)
+    bool upload(const SlotPool::Allocation& a,void* src,size_t bytes,bool is_prefetch,bool copy_bytes,cudaStream_t cs,bool may_split=false) {
         if(!cs)cs=copy;
         size_t chunk=cfg.h2d_chunk_bytes?cfg.h2d_chunk_bytes:bytes;
-        if(copy_bytes)for(size_t off=0;off<bytes;off+=chunk)ck(cudaMemcpyAsync(sptr(a.slot)+off,static_cast<char*>(src)+off,std::min(chunk,bytes-off),cudaMemcpyHostToDevice,cs));
+        const size_t hb=may_split && !slot_head.empty() && copy_bytes && !is_prefetch?head_bytes(records.at(a.id)):0;
+        if(!slot_split.empty())slot_split[a.slot]=hb?1:0;
+        if(hb){   // the head, its event, then the rest
+            for(size_t off=0;off<hb;off+=chunk)ck(cudaMemcpyAsync(sptr(a.slot)+off,static_cast<char*>(src)+off,std::min(chunk,hb-off),cudaMemcpyHostToDevice,cs));
+            ck(cudaEventRecord(slot_head[a.slot],cs));
+            for(size_t off=hb;off<bytes;off+=chunk)ck(cudaMemcpyAsync(sptr(a.slot)+off,static_cast<char*>(src)+off,std::min(chunk,bytes-off),cudaMemcpyHostToDevice,cs));
+            ++split_uploads;
+        }
+        else if(copy_bytes)for(size_t off=0;off<bytes;off+=chunk)ck(cudaMemcpyAsync(sptr(a.slot)+off,static_cast<char*>(src)+off,std::min(chunk,bytes-off),cudaMemcpyHostToDevice,cs));
         counters.h2d_bytes+=bytes;counters.layers[expert_layer(a.id)].h2d_bytes+=bytes;
         if(is_prefetch)counters.prefetch_h2d_bytes+=bytes;
         if(cfg.ready_flags)ck(cudaMemcpyAsync(ready+a.slot,static_cast<uint32_t*>(generations->data())+a.slot,sizeof(uint32_t),cudaMemcpyHostToDevice,cs));
         ck(cudaEventRecord(slot_copy[a.slot],cs));
         ck(cudaEventRecord(cs==pcopy?pcopy_idle:copy_idle,cs));
+        return hb!=0;
     }
 };
 OffloadStore::OffloadStore(std::vector<Record> r,Config c):impl_(new Impl(std::move(r),c)){}
@@ -1192,6 +1227,12 @@ void OffloadStore::check_error(){if(auto e=impl_->error())std::rethrow_exception
 std::vector<uint8_t> OffloadStore::residency_snapshot(){return impl_->submit([this]{std::vector<uint8_t> result(expert_count);for(auto [id,record]:impl_->records)result[id]=(impl_->pool.residency(id)>=0?1:0)|(impl_->host.count(id)?2:0);return result;}).get();}
 const DeviceExpert* OffloadStore::table()const{return impl_->table;}
 int OffloadStore::residency(ExpertId id){return impl_->submit([this,id]{return impl_->pool.residency(id);}).get();}
+cudaEvent_t OffloadStore::rest_event(ExpertId id){   // s0ma change 142: called on the worker, from a ready callback
+    auto& I=*impl_;if(I.slot_split.empty())return nullptr;
+    const int slot=I.pool.residency(id);if(slot<0 || !I.slot_split[size_t(slot)])return nullptr;
+    auto rc=cudaEventQuery(I.slot_copy[size_t(slot)]);if(rc==cudaSuccess)return nullptr;if(rc!=cudaErrorNotReady)ck(rc);
+    return I.slot_copy[size_t(slot)];
+}
 Stats OffloadStore::stats(){return impl_->submit([this]{auto s=impl_->counters;s.spec_reads=impl_->spec_reads;s.spec_hits=impl_->spec_hits;
-    s.spec_waits=impl_->spec_waits;s.spec_dropped=impl_->spec_dropped;s.spec_queued=impl_->spec_queued;return s;}).get();}
+    s.spec_waits=impl_->spec_waits;s.spec_dropped=impl_->spec_dropped;s.spec_queued=impl_->spec_queued;s.split_uploads=impl_->split_uploads;return s;}).get();}
 } // namespace ds41

@@ -697,6 +697,7 @@ class Native final : public Forward, public hotpath::GateEvidence {
   std::unique_ptr<ds41::HostBuffer> lookahead_host;
   std::unique_ptr<Phase> lookahead_sync;
   int lookahead_layer = -1, lookahead_k = 6;
+  bool lookahead_ram_first = false;   // s0ma change 141
   // s0ma change 11: DS41_LOOKAHEAD_NVME_DEPTH=D (2..3; default 0 = off) also scores layer l+D's router on layer l's
   // input and hands its top DS41_LOOKAHEAD_K a row to the store's NVMe read-ahead (DS41_MOE_SPEC_NVME), so an NVMe
   // read gets D layers of lead instead of one. A transfer hint like the lookahead: routing and outputs are unchanged.
@@ -1029,7 +1030,12 @@ public:
       fused_head = reinterpret_cast<FusedHead>(dlsym(fused_head_handle, "ds41_fuse_head_decode"));
       if (!fused_head) throw std::runtime_error("fused head: missing ds41_fuse_head_decode");
     }
-    if (c.prefetch_lookahead) {
+    // s0ma change 141: DS41_LOOKAHEAD=0 turns the lookahead off (its router GEMVs, copies and prefetch), for an A/B
+    // against --prefetch-lookahead without editing run.py; DS41_LOOKAHEAD_RAM_FIRST=1 caps its uploads, not its
+    // candidates (see streamed.inc)
+    const bool lookahead_off = [] { const char *v = std::getenv("DS41_LOOKAHEAD"); return v && std::string(v) == "0"; }();
+    lookahead_ram_first = [] { const char *v = std::getenv("DS41_LOOKAHEAD_RAM_FIRST"); return v && std::string(v) == "1"; }();
+    if (c.prefetch_lookahead && !lookahead_off) {
       if (!c.streamed_experts)
         throw std::invalid_argument("--prefetch-lookahead requires --streamed-experts");
       if (const char *k = std::getenv("DS41_LOOKAHEAD_K")) lookahead_k = std::stoi(k);
@@ -1452,14 +1458,16 @@ public:
     } catch(...) { poisoned=true; throw; }
   }
   // RAM-resident subset only: a wrong guess costs one host-to-device copy, never an NVMe read.
-  void prefetch_ram_experts(const std::vector<ds41::ExpertId> &ids) {
+  void prefetch_ram_experts(const std::vector<ds41::ExpertId> &ids, size_t max_uploads = SIZE_MAX) {
     try {
       for(auto it=prefetch_tickets.begin();it!=prefetch_tickets.end();) {
         if(it->completion.wait_for(std::chrono::seconds(0))==std::future_status::ready) {
           it->completion.get(); it=prefetch_tickets.erase(it);
         } else ++it;
       }
-      prefetch_tickets.push_back(experts->prefetch_ram(ids,ds41::OffloadStore::PrefetchPriority::NextLayer));
+      prefetch_tickets.push_back(max_uploads == SIZE_MAX
+          ? experts->prefetch_ram(ids,ds41::OffloadStore::PrefetchPriority::NextLayer)
+          : experts->prefetch_ram_capped(ids,max_uploads,ds41::OffloadStore::PrefetchPriority::NextLayer));   // change 141
     } catch(...) { poisoned=true; throw; }
   }
   void cancel_prefetch(uint64_t id) override {
@@ -1942,6 +1950,9 @@ public:
               {"expert_spec_hits", s.spec_hits - initial_stats.spec_hits},
               {"expert_spec_waits", s.spec_waits - initial_stats.spec_waits},
               {"expert_spec_dropped", s.spec_dropped - initial_stats.spec_dropped},
+              {"expert_prefetch_used", s.prefetch_used - initial_stats.prefetch_used},   // s0ma change 141
+              {"expert_prefetch_wasted", s.prefetch_wasted - initial_stats.prefetch_wasted},
+              {"expert_prefetch_h2d_bytes", s.prefetch_h2d_bytes - initial_stats.prefetch_h2d_bytes},
               {"need_host_ms", io_ms},
               {"h1_cut_steps", h1_cuts}, {"h1_rows_cut", h1_rows_cut},   // s0ma change 47
               {"route_wait_ms", route_ms},

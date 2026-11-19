@@ -866,6 +866,7 @@ void OffloadStore::stream_prefill(std::vector<ExpertId> ids,cudaStream_t stream,
 }
 OffloadStore::PrefetchTicket OffloadStore::prefetch(std::vector<ExpertId> ids,PrefetchPriority priority){return prefetch_impl(std::move(ids),priority,false);}
 OffloadStore::PrefetchTicket OffloadStore::prefetch_ram(std::vector<ExpertId> ids,PrefetchPriority priority){return prefetch_impl(std::move(ids),priority,true);}
+OffloadStore::PrefetchTicket OffloadStore::prefetch_ram_capped(std::vector<ExpertId> ids,size_t max_uploads,PrefetchPriority priority){return prefetch_impl(std::move(ids),priority,true,max_uploads);}
 void OffloadStore::read_ahead(std::vector<ExpertId> ids){
     if(!impl_->spec_n || ids.empty())return;
     check_error();
@@ -875,16 +876,17 @@ void OffloadStore::read_ahead(std::vector<ExpertId> ids){
         impl_->spec_enqueue(nvme);
     },int(PrefetchPriority::NextLayer));
 }
-OffloadStore::PrefetchTicket OffloadStore::prefetch_impl(std::vector<ExpertId> ids,PrefetchPriority priority,bool ram_only) {
+OffloadStore::PrefetchTicket OffloadStore::prefetch_impl(std::vector<ExpertId> ids,PrefetchPriority priority,bool ram_only,size_t max_uploads) {
     if(unsigned(priority)>2)throw std::invalid_argument("prefetch priority");
     struct State {
         std::promise<PrefetchResult> promise;
         PrefetchResult result;
         std::exception_ptr error;
         std::shared_ptr<std::atomic<bool>> cancelled=std::make_shared<std::atomic<bool>>(false);
+        size_t uploads_left=SIZE_MAX;   // s0ma change 141 (chunks run one after another on the worker)
     };
     check_error();
-    auto state=std::make_shared<State>();state->result.requested=ids.size();
+    auto state=std::make_shared<State>();state->result.requested=ids.size();state->uploads_left=max_uploads;
     PrefetchTicket ticket{++impl_->ticket_serial,state->promise.get_future().share(),state->cancelled};
     if(ids.empty()){state->promise.set_value(state->result);return ticket;}
     for(size_t first=0;first<ids.size();first+=impl_->cfg.prefetch_batch) {
@@ -895,7 +897,13 @@ OffloadStore::PrefetchTicket OffloadStore::prefetch_impl(std::vector<ExpertId> i
             else try{
                 if(ram_only){auto end=std::remove_if(chunk.begin(),chunk.end(),[this](ExpertId id){impl_->records.at(id);return !impl_->host.count(id) && impl_->pool.residency(id)<0;});size_t n=chunk.end()-end;
                     impl_->spec_enqueue(std::vector<ExpertId>(end,chunk.end()));   // s0ma change 8 (no-op unless DS41_MOE_SPEC_NVME)
-                    chunk.erase(end,chunk.end());state->result.cancelled+=n;impl_->counters.prefetch_cancelled+=n;}
+                    chunk.erase(end,chunk.end());state->result.cancelled+=n;impl_->counters.prefetch_cancelled+=n;
+                    if(state->uploads_left!=SIZE_MAX){   // s0ma change 141: the VRAM-resident ones out too, then the cap
+                        auto vram=std::remove_if(chunk.begin(),chunk.end(),[this](ExpertId id){return impl_->pool.residency(id)>=0;});
+                        chunk.erase(vram,chunk.end());
+                        if(chunk.size()>state->uploads_left){size_t over=chunk.size()-state->uploads_left;chunk.resize(state->uploads_left);
+                            state->result.cancelled+=over;impl_->counters.prefetch_cancelled+=over;}
+                        state->uploads_left-=chunk.size();}}
                 if(auto e=impl_->error())std::rethrow_exception(e);if(!chunk.empty())impl_->load(chunk,nullptr,true);state->result.submitted+=chunk.size();}catch(...){state->error=std::current_exception();}
             if(last){if(state->error)state->promise.set_exception(state->error);else state->promise.set_value(state->result);}
         },int(priority));

@@ -96,9 +96,13 @@ void bmoe_streamed(const std::string &p,int m,const hotpath::RoutePlan &plan,
         for(int e:rank(scores+r*384,lookahead_k)) cand.push_back({scores[r*384+e],e});
       std::stable_sort(cand.begin(),cand.end(),[](const auto &a,const auto &b){return a.first>b.first;});
       std::vector<ds41::ExpertId> predicted; std::set<int> seen;
-      for(auto &c:cand) if(seen.insert(c.second).second && int(predicted.size())<lookahead_n)
+      // s0ma change 141: with DS41_LOOKAHEAD_RAM_FIRST=1 every distinct candidate goes, best first, and the store uploads
+      // at most lookahead_n of those not already in VRAM. Before, the cap took the best lookahead_n candidates, and at
+      // full residency (~93% of demands from VRAM) those were nearly always resident already, so little was uploaded
+      for(auto &c:cand) if(seen.insert(c.second).second && (lookahead_ram_first || int(predicted.size())<lookahead_n))
         predicted.push_back(ds41::ExpertId((layer+1)*384+c.second));
-      prefetch_ram_experts(predicted);
+      if(lookahead_ram_first) prefetch_ram_experts(predicted,size_t(lookahead_n));
+      else prefetch_ram_experts(predicted);
     }
     if(lookahead_far_layer>=0) {
       // s0ma change 11: layer far's predicted experts, NVMe-only ones read ahead into pinned slots

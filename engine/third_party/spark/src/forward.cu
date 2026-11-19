@@ -1,3 +1,4 @@
+#include <cstdlib>
 // s0ma change 32 (N4): a kernel launched behind a programmatic graph edge (DS41_PDL=1) starts before its
 // predecessor has finished and waits here until that predecessor's writes are visible; otherwise a no-op.
 #ifndef DS41_PDL_WAIT
@@ -63,6 +64,10 @@ __global__ void rms_seed(const bf16*x,const bf16*w,bf16*y,int K,int width){DS41_
 struct ds41_spark{
  ds41_spark_config c;cudaStream_t stream;cublasHandle_t blas;int64_t committed=0;bool drafted=false;bool poisoned=false;bool capture=false;
  std::map<std::string,ds41_spark_tensor>w;
+ // s0ma change 140: the fused hyper-connection site's scratch (DS41_SPARK_HC_FUSED=1); its count starts at zero and every
+ // launch leaves it there
+ Buf hcf_part{ds41_dense_hc_fused_floats(H)*4},hcf_count{4};bool hcf_zeroed=false;
+ static bool hcf_on(){static const bool v=[]{const char*e=std::getenv("DS41_SPARK_HC_FUSED");return e&&e[0]=='1';}();return v;}
  Buf h{B*4*H*2},h2{B*4*H*2},x{8*H*2},main{128*H*2},y{B*H*2},pre{B*4*4},ap{B*4*4},fp{B*4*4},post{B*4*4},comb{B*16*4},mix{B*24*4},rstd{B*4},promoted{B*4*H*4};
  Buf qa{B*1280*2},q{B*32768*2},kv{128*512*2},o{B*32768*2},wo{B*8192*2},
      gather{B*133*512*2},idx{B*133*4},aq{8*32768},as{8*1024},
@@ -118,7 +123,18 @@ struct ds41_spark{
    for(int l=0;l<3;++l){std::string p="mtp."+std::to_string(l)+".attn";linear(p+".wkv",main.p,kv.p,1,512,H);norm(p+".kv_norm",kv.p,kv.p,1,512);rope(kv.p,1,1,512,start+i);CK(ds41_attn_roundtrip(kv.p,1,512,DS41_SWA_FP8,stream));
     CK(cudaMemcpyAsync((bf16*)out+(size_t(i)*3+l)*512,kv.p,512*2,cudaMemcpyDeviceToDevice,stream));}}
  }
- void hc(const std::string&p,const std::string&kind,Buf&target){CK(ds41_dense_hc_mixes(blas,h.p,(const float*)ptr(p+".hc_"+kind+"_fn"),(const float*)ptr(p+".hc_"+kind+"_scale"),(const float*)ptr(p+".hc_"+kind+"_base"),target.at<float>(),post.at<float>(),comb.at<float>(),promoted.at<float>(),mix.at<float>(),rstd.at<float>(),B,H,1e-20f,1e-6f,stream));}
+ // s0ma change 140: with DS41_SPARK_HC_FUSED=1 the drafter's six sites take the target's fused launch (change 128, and
+ // change 139's kernels under DS41_HC_FAST): pre, post and comb within rounding of the cuBLAS path (the order of the
+ // 20,480-term sums), so drafts may change in the last bits: a drafter-only change
+ void hc(const std::string&p,const std::string&kind,Buf&target){
+  if(hcf_on()){
+   if(!hcf_zeroed){CK(cudaMemsetAsync(hcf_count.p,0,4,stream));hcf_zeroed=true;}
+   CK(ds41_dense_hc_fused_mixes(h.p,(const float*)ptr(p+".hc_"+kind+"_fn"),(const float*)ptr(p+".hc_"+kind+"_scale"),
+       (const float*)ptr(p+".hc_"+kind+"_base"),target.at<float>(),post.at<float>(),comb.at<float>(),hcf_part.at<float>(),
+       hcf_count.at<unsigned>(),B,H,1e-20f,1e-6f,stream));
+   return;
+  }
+  CK(ds41_dense_hc_mixes(blas,h.p,(const float*)ptr(p+".hc_"+kind+"_fn"),(const float*)ptr(p+".hc_"+kind+"_scale"),(const float*)ptr(p+".hc_"+kind+"_base"),target.at<float>(),post.at<float>(),comb.at<float>(),promoted.at<float>(),mix.at<float>(),rstd.at<float>(),B,H,1e-20f,1e-6f,stream));}
  void attention(int l){std::string p="mtp."+std::to_string(l)+".attn";
   linear(p+".wq_a",x.p,qa.p,B,1280,H);norm(p+".q_norm",qa.p,qa.p,B,1280);linear(p+".wq_b",qa.p,q.p,B,32768,1280);rope(q.p,B,64,512,committed);
   linear(p+".wkv",x.p,kv.p,B,512,H);norm(p+".kv_norm",kv.p,kv.p,B,512);rope(kv.p,B,1,512,committed);CK(ds41_attn_roundtrip(kv.p,B,512,DS41_SWA_FP8,stream));
